@@ -7,6 +7,37 @@ import pytest
 from codex_mac_worker.config import ConfigError, load_worker_config
 
 
+def write_worker_config(
+    path: Path,
+    tmp_path: Path,
+    *,
+    discovery: str = "",
+    repositories: str = "",
+) -> None:
+    path.write_text(
+        f"""
+schema_version = 1
+worker_id = "mac-mini"
+poll_seconds = 60
+heartbeat_seconds = 120
+database_path = "{tmp_path / 'state.sqlite3'}"
+cache_root = "{tmp_path / 'cache'}"
+worktree_root = "{tmp_path / 'worktrees'}"
+output_root = "{tmp_path / 'output'}"
+codex_path = "/tmp/codex"
+codex_home = "{tmp_path / 'codex-home'}"
+github_app_id = "123"
+github_installation_id = "456"
+github_private_key_path = "{tmp_path / 'app.pem'}"
+authorized_users = ["owner"]
+{discovery}
+{repositories}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_load_worker_config_parses_repositories_and_paths(tmp_path: Path) -> None:
     config_path = tmp_path / "worker.toml"
     config_path.write_text(
@@ -72,4 +103,40 @@ clone_url = "url2"
     )
 
     with pytest.raises(ConfigError, match="duplicate"):
+        load_worker_config(config_path)
+
+
+def test_worker_config_allows_installation_discovery_without_static_repositories(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery="discover_installation_repositories = true",
+    )
+
+    config = load_worker_config(config_path)
+
+    assert config.discover_installation_repositories is True
+    assert config.repositories == ()
+
+
+def test_worker_config_requires_one_repository_source(tmp_path: Path) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(config_path, tmp_path)
+
+    with pytest.raises(ConfigError, match="repository source"):
+        load_worker_config(config_path)
+
+
+def test_worker_config_rejects_non_boolean_discovery_flag(tmp_path: Path) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery='discover_installation_repositories = "yes"',
+    )
+
+    with pytest.raises(ConfigError, match="discover_installation_repositories"):
         load_worker_config(config_path)

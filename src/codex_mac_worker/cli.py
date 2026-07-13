@@ -119,6 +119,9 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
                 {
                     "worker_id": config.worker_id,
                     "repositories": [item.name for item in config.repositories],
+                    "discover_installation_repositories": (
+                        config.discover_installation_repositories
+                    ),
                     "database_path": str(config.database_path),
                     "codex_path": str(config.codex_path),
                     "codex_home": str(config.codex_home),

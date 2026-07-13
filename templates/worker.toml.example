@@ -2,6 +2,7 @@ schema_version = 1
 worker_id = "mac-mini-01"
 poll_seconds = 60
 heartbeat_seconds = 120
+discover_installation_repositories = true
 
 database_path = "__HOME__/Library/Application Support/CodexWorker/state/worker.sqlite3"
 cache_root = "__HOME__/Library/Application Support/CodexWorker/cache"

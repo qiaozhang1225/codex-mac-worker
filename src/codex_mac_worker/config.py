@@ -46,6 +46,7 @@ class WorkerConfig:
     authorized_users: tuple[str, ...]
     repositories: tuple[RepositoryConfig, ...]
     codex_home: Path | None = None
+    discover_installation_repositories: bool = False
 
 
 def _positive_int(raw: dict[str, Any], key: str) -> int:
@@ -73,8 +74,16 @@ def _strings(raw: dict[str, Any], key: str) -> tuple[str, ...]:
 
 def load_project_config(path: Path) -> ProjectConfig:
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"unable to read project config: {exc}") from exc
+    return parse_project_config(text)
+
+
+def parse_project_config(text: str) -> ProjectConfig:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"unable to read project config: {exc}") from exc
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be 1")
@@ -128,9 +137,19 @@ def load_worker_config(path: Path) -> WorkerConfig:
         raise ConfigError(f"unable to read worker config: {exc}") from exc
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be 1")
-    repositories_raw = raw.get("repositories")
-    if not isinstance(repositories_raw, list) or not repositories_raw:
-        raise ConfigError("repositories must contain at least one entry")
+    discover_installation_repositories = raw.get(
+        "discover_installation_repositories",
+        False,
+    )
+    if not isinstance(discover_installation_repositories, bool):
+        raise ConfigError("discover_installation_repositories must be a boolean")
+    repositories_raw = raw.get("repositories", [])
+    if not isinstance(repositories_raw, list):
+        raise ConfigError("repositories must be an array of tables")
+    if not repositories_raw and not discover_installation_repositories:
+        raise ConfigError(
+            "at least one repository source is required: static repositories or installation discovery"
+        )
     repositories: list[RepositoryConfig] = []
     seen: set[str] = set()
     for item in repositories_raw:
@@ -160,4 +179,5 @@ def load_worker_config(path: Path) -> WorkerConfig:
         authorized_users=_strings(raw, "authorized_users"),
         repositories=tuple(repositories),
         codex_home=worker_path("codex_home"),
+        discover_installation_repositories=discover_installation_repositories,
     )

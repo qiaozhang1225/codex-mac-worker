@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -9,11 +10,22 @@ from typing import Any, Callable, Protocol
 
 import yaml
 
-from .config import RepositoryConfig, WorkerConfig, load_project_config
+from .config import (
+    RepositoryConfig,
+    WorkerConfig,
+    load_project_config,
+    parse_project_config,
+)
 from .gitops import GitOperations
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .prompting import build_execution_prompt, build_revision_prompt, result_schema
-from .protocol import ProtocolError, parse_command_comment, parse_task_body
+from .protocol import (
+    ProtocolError,
+    parse_command_comment,
+    parse_repository_probe,
+    parse_task_body,
+    render_repository_attestation,
+)
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
 from .store import EventStore
 from .verification import run_commands, run_verification, scan_for_secrets
@@ -33,6 +45,17 @@ class GitHubPort(Protocol):
     def collaborator_permission(self, repo: str, username: str) -> str: ...
     def create_draft_pr(
         self, repo: str, head: str, base: str, title: str, body: str
+    ) -> dict[str, Any]: ...
+    def get_repository(self, repo: str) -> dict[str, Any]: ...
+    def get_commit(self, repo: str, ref: str) -> dict[str, Any]: ...
+    def get_repository_file(self, repo: str, path: str, *, ref: str) -> str: ...
+    def update_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        *,
+        labels: list[str] | None = None,
+        state: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -164,6 +187,73 @@ class WorkerService:
         permission = self.github.collaborator_permission(repo, author) if author else "none"
         if author not in self.config.authorized_users or permission not in AUTHORIZED_PERMISSIONS:
             raise PolicyError(f"issue author {author or '<missing>'} is not authorized")
+
+    def process_repository_probe(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> None:
+        repo = repository.name
+        number = int(issue["number"])
+        try:
+            self._validate_issue_author(repo, issue)
+            probe = parse_repository_probe(str(issue.get("body", "")))
+            repository_payload = self.github.get_repository(repo)
+            default_branch = str(repository_payload.get("default_branch", ""))
+            if not default_branch:
+                raise PolicyError("repository default branch is missing")
+            commit = self.github.get_commit(repo, default_branch)
+            current_head = str(commit.get("sha", "")).lower()
+            if current_head != probe.default_head:
+                raise PolicyError("repository probe default head changed")
+            project_text = self.github.get_repository_file(
+                repo,
+                ".codex-worker/project.toml",
+                ref=current_head,
+            )
+            project = parse_project_config(project_text)
+            if project.default_base_branch != default_branch:
+                raise PolicyError("project config default branch does not match repository")
+            config_hash = hashlib.sha256(project_text.encode("utf-8")).hexdigest()
+            if config_hash != probe.project_config_hash:
+                raise PolicyError("repository probe project config changed")
+            self.github.add_comment(
+                repo,
+                number,
+                render_repository_attestation(
+                    probe_id=probe.probe_id,
+                    worker_id=self.config.worker_id,
+                    default_head=current_head,
+                    project_config_hash=config_hash,
+                    attested_at=iso_now(),
+                ),
+            )
+            labels = [
+                label
+                for label in self._labels(issue)
+                if not label.startswith(STATUS_PREFIX)
+            ]
+            labels.append("codex:completed")
+            self.github.update_issue(repo, number, labels=labels, state="closed")
+        except Exception as exc:
+            labels = [
+                label
+                for label in self._labels(issue)
+                if not label.startswith(STATUS_PREFIX)
+            ]
+            labels.append("codex:needs-attention")
+            self.github.update_issue(repo, number, labels=labels, state="open")
+            self.github.add_comment(
+                repo,
+                number,
+                self._status_body(
+                    task_hash="repository-probe",
+                    state="needs-attention",
+                    branch="",
+                    progress_at=iso_now(),
+                    detail=f"{type(exc).__name__}: {exc}"[:4000],
+                ),
+            )
 
     def _require_completed_result(self, result: RunnerResult) -> None:
         try:

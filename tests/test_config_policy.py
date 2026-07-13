@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_mac_worker.config import ConfigError, load_project_config
+from codex_mac_worker.config import ConfigError, load_project_config, parse_project_config
 from codex_mac_worker.policy import PolicyError, validate_changed_paths, validate_task_policy
 from codex_mac_worker.protocol import parse_task_body
 
@@ -44,6 +44,16 @@ def test_load_project_config_parses_verification_profiles(tmp_path: Path) -> Non
     assert config.max_changed_files == 3
     assert config.preparation == ("python3 -m venv .venv",)
     assert config.verification["fast"] == ("python -m unittest",)
+
+
+def test_parse_project_config_validates_remote_text_without_a_file(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    write_config(config_path)
+
+    config = parse_project_config(config_path.read_text(encoding="utf-8"))
+
+    assert config.default_base_branch == "main"
+    assert config.max_changed_files == 3
 
 
 def test_load_project_config_rejects_unknown_schema(tmp_path: Path) -> None:

@@ -10,6 +10,8 @@ import yaml
 
 TASK_MARKER = "<!-- codex-task:v1 -->"
 COMMAND_MARKER = "<!-- codex-command:v1 -->"
+REPOSITORY_PROBE_MARKER = "<!-- codex-repository-probe:v1 -->"
+REPOSITORY_ATTESTATION_MARKER = "<!-- codex-worker-readiness:v1 -->"
 _BLOCK_RE = re.compile(
     rf"{re.escape(TASK_MARKER)}\s*```yaml\s*(.*?)\s*```",
     re.DOTALL,
@@ -20,6 +22,15 @@ _COMMAND_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _COMMAND_ACTIONS = {"revise", "pause", "resume", "retry", "cancel"}
+_PROBE_BLOCK_RE = re.compile(
+    rf"{re.escape(REPOSITORY_PROBE_MARKER)}\s*```yaml\s*(.*?)\s*```",
+    re.DOTALL,
+)
+_ATTESTATION_BLOCK_RE = re.compile(
+    rf"{re.escape(REPOSITORY_ATTESTATION_MARKER)}\s*```yaml\s*(.*?)\s*```",
+    re.DOTALL,
+)
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class ProtocolError(ValueError):
@@ -49,6 +60,22 @@ class CommandSpec:
     requirements: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RepositoryProbe:
+    probe_id: str
+    default_head: str
+    project_config_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryAttestation:
+    probe_id: str
+    worker_id: str
+    default_head: str
+    project_config_hash: str
+    attested_at: str
+
+
 def _string_list(data: dict[str, Any], key: str, *, required: bool = True) -> tuple[str, ...]:
     value = data.get(key)
     if not isinstance(value, list) or (required and not value):
@@ -63,6 +90,26 @@ def _required_string(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProtocolError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def _machine_mapping(body: str, pattern: re.Pattern[str], resource: str) -> dict[str, Any]:
+    matches = pattern.findall(body)
+    if len(matches) != 1:
+        raise ProtocolError(f"{resource} must contain exactly one machine block")
+    try:
+        raw = yaml.safe_load(matches[0])
+    except yaml.YAMLError as exc:
+        raise ProtocolError(f"invalid {resource} YAML: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ProtocolError(f"{resource} schema_version must be 1")
+    return raw
+
+
+def _full_hex(raw: dict[str, Any], key: str, pattern: re.Pattern[str]) -> str:
+    value = _required_string(raw, key).lower()
+    if not pattern.fullmatch(value):
+        raise ProtocolError(f"{key} has an invalid hexadecimal length")
+    return value
 
 
 def parse_task_body(body: str) -> TaskSpec:
@@ -163,4 +210,60 @@ def parse_command_comment(body: str) -> CommandSpec:
         issue_number=issue_number,
         action=action,
         requirements=tuple(item.strip() for item in requirements_raw),
+    )
+
+
+def render_repository_probe(
+    *,
+    probe_id: str,
+    default_head: str,
+    project_config_hash: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "probe_id": probe_id,
+        "default_head": default_head,
+        "project_config_hash": project_config_hash,
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{REPOSITORY_PROBE_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def parse_repository_probe(body: str) -> RepositoryProbe:
+    raw = _machine_mapping(body, _PROBE_BLOCK_RE, "repository probe")
+    return RepositoryProbe(
+        probe_id=_required_string(raw, "probe_id"),
+        default_head=_full_hex(raw, "default_head", _FULL_SHA_RE),
+        project_config_hash=_full_hex(raw, "project_config_hash", _HASH_RE),
+    )
+
+
+def render_repository_attestation(
+    *,
+    probe_id: str,
+    worker_id: str,
+    default_head: str,
+    project_config_hash: str,
+    attested_at: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "probe_id": probe_id,
+        "worker_id": worker_id,
+        "default_head": default_head,
+        "project_config_hash": project_config_hash,
+        "attested_at": attested_at,
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{REPOSITORY_ATTESTATION_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def parse_repository_attestation(body: str) -> RepositoryAttestation:
+    raw = _machine_mapping(body, _ATTESTATION_BLOCK_RE, "repository attestation")
+    return RepositoryAttestation(
+        probe_id=_required_string(raw, "probe_id"),
+        worker_id=_required_string(raw, "worker_id"),
+        default_head=_full_hex(raw, "default_head", _FULL_SHA_RE),
+        project_config_hash=_full_hex(raw, "project_config_hash", _HASH_RE),
+        attested_at=_required_string(raw, "attested_at"),
     )
