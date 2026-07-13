@@ -1,0 +1,28 @@
+approval_policy = "never"
+default_permissions = "codex-worker"
+web_search = "disabled"
+check_for_update_on_startup = false
+
+[features]
+apps = false
+goals = false
+multi_agent = false
+
+[permissions.codex-worker]
+description = "Workspace-only unattended Worker; host secrets are unreadable."
+extends = ":workspace"
+
+[permissions.codex-worker.filesystem]
+"~" = "deny"
+":minimal" = "read"
+"/opt/homebrew" = "read"
+"/Library/Frameworks/Python.framework" = "read"
+
+[permissions.codex-worker.filesystem.":workspace_roots"]
+".env" = "deny"
+".env.*" = "deny"
+"**/.env" = "deny"
+"**/.env.*" = "deny"
+
+[permissions.codex-worker.network]
+enabled = false

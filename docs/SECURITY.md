@@ -1,0 +1,15 @@
+# 安全边界
+
+- GitHub App 只安装到明确授权仓库；安装令牌按需签发并只存在于 Worker 内存或临时 Git 凭据环境。
+- App 私钥、安装令牌和部署凭据不进入 Codex 子进程、Git remote URL、prompt、Issue 或日志。
+- `codex exec` 使用独立 `CODEX_HOME` 和 `--strict-config`；权限档案默认拒绝读取用户目录，只允许最小系统文件和当前工作区，且关闭网络、apps、多代理与 Goal/“目标”模式。
+- 权限档案只额外开放 `/opt/homebrew` 与 Python.org 的 `/Library/Frameworks/Python.framework` 为只读工具链根；GitHub 私钥所在的 `~/Library/Application Support/CodexWorker/secrets` 仍不可读。
+- Worker 不传旧式 `--sandbox` 或 `sandbox_mode` 覆盖权限档案；目标仓库若包含 `.codex/config.toml`，任务会被拒绝，防止项目配置扩大权限。
+- Issue 只能选择仓库内 `.codex-worker/project.toml` 已审查的测试命令。
+- Worker 在 commit 前检查 Git HEAD、允许路径、敏感路径、文件数、diff 行数、密钥特征和大型二进制文件。
+- Worker 只 push `codex/*` 任务分支并创建 Draft PR；Ruleset 是阻止主线 push、merge 和 force push 的最终边界。
+- Codex 不负责 commit、push、PR、部署或 merge；这些操作由 Worker 执行，其中 merge 永远保留给人。
+- FileVault 关闭是冷启动无人值守的已锁定取舍，因此必须依赖物理安全、最小仓库授权和本地私钥权限降低风险。
+- GitHub Watchdog 只评论告警，不领取、恢复或重复执行任务。
+
+发现私钥泄露时，立即在 GitHub 撤销私钥或删除 App installation，停止 LaunchDaemon，轮换凭据并审计 Issue、分支、PR 与日志。不要通过新的聊天消息发送替代私钥。

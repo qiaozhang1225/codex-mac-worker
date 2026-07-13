@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import tomllib
+from typing import Any
+
+
+class ConfigError(ValueError):
+    """Raised when worker or project configuration is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectConfig:
+    default_base_branch: str
+    allowed_risk_levels: tuple[str, ...]
+    protected_paths: tuple[str, ...]
+    max_changed_files: int
+    max_diff_lines: int
+    codex_attempt_timeout_minutes: int
+    task_hard_timeout_minutes: int
+    max_automatic_attempts: int
+    verification: dict[str, tuple[str, ...]]
+    preparation: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryConfig:
+    name: str
+    clone_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerConfig:
+    worker_id: str
+    poll_seconds: int
+    heartbeat_seconds: int
+    database_path: Path
+    cache_root: Path
+    worktree_root: Path
+    output_root: Path
+    codex_path: Path
+    github_app_id: str
+    github_installation_id: str
+    github_private_key_path: Path
+    authorized_users: tuple[str, ...]
+    repositories: tuple[RepositoryConfig, ...]
+    codex_home: Path | None = None
+
+
+def _positive_int(raw: dict[str, Any], key: str) -> int:
+    value = raw.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigError(f"{key} must be a positive integer")
+    return value
+
+
+def _capped_positive_int(raw: dict[str, Any], key: str, maximum: int) -> int:
+    value = _positive_int(raw, key)
+    if value > maximum:
+        raise ConfigError(f"{key} cannot exceed {maximum}")
+    return value
+
+
+def _strings(raw: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = raw.get(key)
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{key} must be a non-empty string list")
+    if not all(isinstance(item, str) and item.strip() for item in value):
+        raise ConfigError(f"{key} must be a non-empty string list")
+    return tuple(item.strip() for item in value)
+
+
+def load_project_config(path: Path) -> ProjectConfig:
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"unable to read project config: {exc}") from exc
+    if raw.get("schema_version") != 1:
+        raise ConfigError("schema_version must be 1")
+
+    verification_raw = raw.get("verification")
+    if not isinstance(verification_raw, dict) or not verification_raw:
+        raise ConfigError("verification must define at least one profile")
+    verification: dict[str, tuple[str, ...]] = {}
+    for name, profile in verification_raw.items():
+        if not isinstance(profile, dict):
+            raise ConfigError(f"verification.{name} must be a table")
+        verification[name] = _strings(profile, "commands")
+
+    preparation: tuple[str, ...] = ()
+    preparation_raw = raw.get("preparation")
+    if preparation_raw is not None:
+        if not isinstance(preparation_raw, dict):
+            raise ConfigError("preparation must be a table")
+        preparation = _strings(preparation_raw, "commands")
+
+    base = raw.get("default_base_branch")
+    if not isinstance(base, str) or not base.strip():
+        raise ConfigError("default_base_branch must be a non-empty string")
+    return ProjectConfig(
+        default_base_branch=base.strip(),
+        allowed_risk_levels=_strings(raw, "allowed_risk_levels"),
+        protected_paths=_strings(raw, "protected_paths"),
+        max_changed_files=_positive_int(raw, "max_changed_files"),
+        max_diff_lines=_positive_int(raw, "max_diff_lines"),
+        codex_attempt_timeout_minutes=_capped_positive_int(
+            raw, "codex_attempt_timeout_minutes", 45
+        ),
+        task_hard_timeout_minutes=_capped_positive_int(raw, "task_hard_timeout_minutes", 120),
+        max_automatic_attempts=_capped_positive_int(raw, "max_automatic_attempts", 2),
+        verification=verification,
+        preparation=preparation,
+    )
+
+
+def _worker_string(raw: dict[str, Any], key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def load_worker_config(path: Path) -> WorkerConfig:
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"unable to read worker config: {exc}") from exc
+    if raw.get("schema_version") != 1:
+        raise ConfigError("schema_version must be 1")
+    repositories_raw = raw.get("repositories")
+    if not isinstance(repositories_raw, list) or not repositories_raw:
+        raise ConfigError("repositories must contain at least one entry")
+    repositories: list[RepositoryConfig] = []
+    seen: set[str] = set()
+    for item in repositories_raw:
+        if not isinstance(item, dict):
+            raise ConfigError("repository entries must be tables")
+        name = _worker_string(item, "name")
+        if name in seen:
+            raise ConfigError(f"duplicate repository: {name}")
+        seen.add(name)
+        repositories.append(RepositoryConfig(name, _worker_string(item, "clone_url")))
+
+    def worker_path(key: str) -> Path:
+        return Path(_worker_string(raw, key)).expanduser()
+
+    return WorkerConfig(
+        worker_id=_worker_string(raw, "worker_id"),
+        poll_seconds=_positive_int(raw, "poll_seconds"),
+        heartbeat_seconds=_positive_int(raw, "heartbeat_seconds"),
+        database_path=worker_path("database_path"),
+        cache_root=worker_path("cache_root"),
+        worktree_root=worker_path("worktree_root"),
+        output_root=worker_path("output_root"),
+        codex_path=worker_path("codex_path"),
+        github_app_id=_worker_string(raw, "github_app_id"),
+        github_installation_id=_worker_string(raw, "github_installation_id"),
+        github_private_key_path=worker_path("github_private_key_path"),
+        authorized_users=_strings(raw, "authorized_users"),
+        repositories=tuple(repositories),
+        codex_home=worker_path("codex_home"),
+    )

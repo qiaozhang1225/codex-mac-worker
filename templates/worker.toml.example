@@ -1,0 +1,20 @@
+schema_version = 1
+worker_id = "mac-mini-01"
+poll_seconds = 60
+heartbeat_seconds = 120
+
+database_path = "__HOME__/Library/Application Support/CodexWorker/state/worker.sqlite3"
+cache_root = "__HOME__/Library/Application Support/CodexWorker/cache"
+worktree_root = "__HOME__/Library/Application Support/CodexWorker/worktrees"
+output_root = "__HOME__/Library/Application Support/CodexWorker/outputs"
+codex_path = "/Applications/ChatGPT.app/Contents/Resources/codex"
+codex_home = "__HOME__/Library/Application Support/CodexWorker/codex-home"
+
+github_app_id = "REPLACE_WITH_APP_ID"
+github_installation_id = "REPLACE_WITH_INSTALLATION_ID"
+github_private_key_path = "__HOME__/Library/Application Support/CodexWorker/secrets/github-app.pem"
+authorized_users = ["__OWNER__"]
+
+[[repositories]]
+name = "__OWNER__/EaseWise"
+clone_url = "https://github.com/__OWNER__/EaseWise.git"

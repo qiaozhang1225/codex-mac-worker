@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-mac-worker"
+version = "0.1.0"
+description = "Bounded, unattended Codex task execution for a single macOS worker"
+requires-python = ">=3.12"
+dependencies = [
+  "cryptography>=45,<50",
+  "httpx>=0.28,<1",
+  "PyJWT>=2.9,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8"]
+
+[project.scripts]
+codex-worker = "codex_mac_worker.cli:worker_main"
+codexctl = "codex_mac_worker.cli:ctl_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
