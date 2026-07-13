@@ -379,3 +379,18 @@ def test_client_gets_creates_and_updates_rulesets() -> None:
     assert client.create_ruleset("owner/repo", payload)["id"] == 7
     assert client.update_ruleset("owner/repo", 7, payload)["target"] == "branch"
     assert seen[-1] == ("PUT", "/repos/owner/repo/rulesets/7", payload)
+
+
+def test_client_lists_repository_issues_with_state_and_labels() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/owner/repo/issues"
+        assert request.url.params["state"] == "all"
+        assert request.url.params["labels"] == "codex:queued"
+        return httpx.Response(200, json=[])
+
+    client = GitHubClient(
+        token_provider=lambda: "token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.list_issues("owner/repo", state="all", labels="codex:queued") == []

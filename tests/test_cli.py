@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import os
+import json
 
-from codex_mac_worker.cli import build_ctl_parser, personal_github_token
+import codex_mac_worker.cli as cli
+from codex_mac_worker.cli import build_ctl_parser, ctl_main, personal_github_token
+from codex_mac_worker.repository_onboarding import OnboardingSnapshot, ReadinessReport
 
 
 def test_personal_token_prefers_environment(monkeypatch) -> None:
@@ -25,3 +27,109 @@ def test_ctl_parser_supports_create_status_and_control_commands() -> None:
     assert create.yes is True
     assert status.action == "status"
     assert pause.action == "pause"
+
+
+def test_ctl_parser_supports_repository_lifecycle() -> None:
+    parser = build_ctl_parser()
+    onboard = parser.parse_args(
+        ["repo", "onboard", "--repo", "owner/repo", "--adopt-pr", "1"]
+    )
+    status = parser.parse_args(["repo", "status", "owner/repo"])
+    finalize = parser.parse_args(
+        [
+            "repo",
+            "finalize",
+            "https://github.com/owner/repo/pull/1",
+            "--expected-head",
+            "a" * 40,
+        ]
+    )
+
+    assert (onboard.resource, onboard.action, onboard.adopt_pr) == ("repo", "onboard", 1)
+    assert status.action == "status"
+    assert finalize.expected_head == "a" * 40
+
+
+def test_repo_status_prints_structured_readiness(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "personal_github_token", lambda: "token")
+    monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "repository_status",
+        lambda github, repo: ReadinessReport(
+            repo=repo,
+            phase="ready",
+            default_branch="main",
+            default_head="a" * 40,
+            files_valid=True,
+            labels_valid=True,
+            ruleset_valid=True,
+            worker_attested=True,
+            worker_login="worker[bot]",
+            blockers=(),
+        ),
+    )
+
+    assert ctl_main(["repo", "status", "owner/repo"]) == 0
+    assert json.loads(capsys.readouterr().out)["phase"] == "ready"
+
+
+def test_repo_onboard_adopts_existing_pr(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "personal_github_token", lambda: "token")
+    monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
+    snapshot = OnboardingSnapshot(
+        repo="owner/repo",
+        pr_number=1,
+        url="https://github.com/owner/repo/pull/1",
+        base_branch="main",
+        base_sha="a" * 40,
+        head_branch="codex/onboard-worker",
+        head_sha="b" * 40,
+        changed_paths=(".codex-worker/project.toml",),
+        project_config_hash="c" * 64,
+        is_draft=True,
+        mergeable=True,
+    )
+    seen: dict = {}
+
+    def fake_prepare(github, repo, **kwargs):
+        seen.update({"repo": repo, **kwargs})
+        return snapshot
+
+    monkeypatch.setattr(cli, "prepare_onboarding", fake_prepare)
+
+    assert ctl_main(["repo", "onboard", "--repo", "owner/repo", "--adopt-pr", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["head_sha"] == "b" * 40
+    assert seen["adopt_pr"] == 1
+
+
+def test_repo_finalize_uses_local_operation_ledger(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setenv("CODEXCTL_STATE_PATH", str(tmp_path / "state.db"))
+    monkeypatch.setattr(cli, "personal_github_token", lambda: "token")
+    monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
+    seen: dict = {}
+
+    def fake_finalize(github, state, reference, *, expected_head):
+        seen.update({"reference": reference, "expected_head": expected_head})
+        return ReadinessReport(
+            repo=reference.repo,
+            phase="awaiting-worker",
+            default_branch="main",
+            default_head="c" * 40,
+            files_valid=True,
+            labels_valid=True,
+            ruleset_valid=True,
+            worker_attested=False,
+            worker_login=None,
+            blockers=("worker attestation pending",),
+        )
+
+    monkeypatch.setattr(cli, "finalize_onboarding", fake_finalize)
+
+    assert ctl_main([
+        "repo", "finalize", "https://github.com/owner/repo/pull/1",
+        "--expected-head", "b" * 40,
+    ]) == 0
+    assert seen["reference"].number == 1
+    assert seen["expected_head"] == "b" * 40
+    assert json.loads(capsys.readouterr().out)["phase"] == "awaiting-worker"

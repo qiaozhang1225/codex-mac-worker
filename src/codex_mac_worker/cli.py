@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -11,13 +12,26 @@ from typing import Sequence
 
 from .config import load_worker_config
 from .control import create_task, parse_issue_reference, send_command
+from .control_state import ControlState
 from .daemon import SingleInstanceLock, WorkerDaemon
 from .durable_github import DurableGitHub
 from .github import GitHubAppAuth, GitHubClient
 from .gitops import GitOperations
 from .runner import CodexRunner
+from .references import parse_pull_request_reference
+from .repository_onboarding import (
+    finalize_onboarding,
+    prepare_onboarding,
+    repository_status,
+)
 from .store import EventStore
 from .worker import WorkerService
+
+
+def full_sha(value: str) -> str:
+    if len(value) != 40 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        raise argparse.ArgumentTypeError("expected a full 40-character Git SHA")
+    return value.lower()
 
 
 def personal_github_token() -> str:
@@ -48,6 +62,13 @@ def codex_version(path: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def control_state_path() -> Path:
+    configured = os.environ.get("CODEXCTL_STATE_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Library/Application Support/CodexCtl/state/codexctl.sqlite3"
+
+
 def build_ctl_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codexctl")
     top = parser.add_subparsers(dest="resource", required=True)
@@ -70,6 +91,21 @@ def build_ctl_parser() -> argparse.ArgumentParser:
     revise = actions.add_parser("revise")
     revise.add_argument("reference")
     revise.add_argument("--requirements", required=True, type=Path)
+
+    repo = top.add_parser("repo")
+    repo_actions = repo.add_subparsers(dest="action", required=True)
+
+    onboard = repo_actions.add_parser("onboard")
+    onboard.add_argument("--repo", required=True)
+    onboard.add_argument("--adopt-pr", type=int)
+    onboard.add_argument("--project-config", type=Path)
+
+    repo_status = repo_actions.add_parser("status")
+    repo_status.add_argument("repo")
+
+    finalize = repo_actions.add_parser("finalize")
+    finalize.add_argument("reference")
+    finalize.add_argument("--expected-head", required=True, type=full_sha)
     return parser
 
 
@@ -77,6 +113,35 @@ def ctl_main(argv: Sequence[str] | None = None) -> int:
     args = build_ctl_parser().parse_args(argv)
     token = personal_github_token()
     github = GitHubClient(token_provider=lambda: token)
+    if args.resource == "repo":
+        if args.action == "onboard":
+            snapshot = prepare_onboarding(
+                github,
+                args.repo,
+                adopt_pr=args.adopt_pr,
+                project_config_path=args.project_config,
+                token=token,
+            )
+            print(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2))
+            return 0
+        if args.action == "status":
+            report = repository_status(github, args.repo)
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            return 0
+        reference = parse_pull_request_reference(args.reference)
+        state = ControlState(control_state_path())
+        try:
+            report = finalize_onboarding(
+                github,
+                state,
+                reference,
+                expected_head=args.expected_head,
+            )
+        finally:
+            state.close()
+        print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+        return 0
+
     if args.action == "create":
         preview = args.spec.read_text(encoding="utf-8")
         if not args.yes:

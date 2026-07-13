@@ -209,6 +209,18 @@ class GitHubClient:
             params={"state": "open", "labels": "codex:queued", "per_page": 100},
         )
 
+    def list_issues(
+        self,
+        repo: str,
+        *,
+        state: str = "open",
+        labels: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"state": state}
+        if labels is not None:
+            params["labels"] = labels
+        return self._paginate(f"/repos/{repo}/issues", params=params)
+
     def get_issue(self, repo: str, issue_number: int) -> dict[str, Any]:
         return self._request("GET", f"/repos/{repo}/issues/{issue_number}")
 
