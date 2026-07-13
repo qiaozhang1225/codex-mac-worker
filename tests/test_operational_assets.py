@@ -91,3 +91,22 @@ def test_shell_scripts_parse_and_docs_cover_manual_boundaries() -> None:
         assert required in operations
     assert "dispatch-codex-task" in macbook
     assert "codexctl" in macbook
+    combined = "\n".join((setup, operations, macbook, (ROOT / "docs" / "SECURITY.md").read_text()))
+    for required in (
+        "discover_installation_repositories",
+        "codexctl repo status",
+        "codexctl repo onboard",
+        "codexctl repo finalize",
+        "awaiting-worker",
+        "codexctl task review",
+        "codexctl task merge",
+        "--expected-head",
+        "explicit",
+        "future PR",
+        "Goal",
+    ):
+        assert required in combined
+
+    bootstrap = (ROOT / "scripts" / "bootstrap_repository.sh").read_text(encoding="utf-8")
+    assert "codexctl repo status" in bootstrap
+    assert "gh label create" not in bootstrap

@@ -26,8 +26,22 @@ def test_dispatch_skill_enforces_human_confirmed_bounded_tasks() -> None:
         "confirmation",
         "Goal",
         "merge",
+        "codexctl repo status",
+        "codexctl repo onboard",
+        "codexctl repo finalize",
+        "codexctl task review",
+        "codexctl task merge",
+        "expected-head",
+        "head SHA",
+        "explicit",
+        "future PR",
+        "automatic merge",
     ):
         assert required in body
 
+    assert "设计" in body
+    assert "看起来可以" in body
+
     agent = yaml.safe_load((SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8"))
     assert "$dispatch-codex-task" in agent["interface"]["default_prompt"]
+    assert "review" in agent["interface"]["short_description"].lower()

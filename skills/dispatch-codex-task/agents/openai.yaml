@@ -1,4 +1,4 @@
 interface:
   display_name: "派发 Codex Worker 任务"
-  short_description: "将清晰、低风险的工作派发给 Mac mini Worker"
-  default_prompt: "Use $dispatch-codex-task to prepare a bounded task for the Mac mini Worker."
+  short_description: "Mac mini 派单、onboarding、review 与受控合并"
+  default_prompt: "Use $dispatch-codex-task to onboard, dispatch, review, or explicitly merge one bounded Mac mini Worker task."
