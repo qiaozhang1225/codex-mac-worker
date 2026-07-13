@@ -1,0 +1,112 @@
+name: Codex Worker Watchdog
+
+on:
+  schedule:
+    - cron: "3/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Check queued and active Codex tasks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const now = Date.now();
+            const queuedLimitMs = 15 * 60 * 1000;
+            const heartbeatLimitMs = 12 * 60 * 1000;
+            const dedupeWindowMs = 60 * 60 * 1000;
+            const phaseLimitsMs = new Map([
+              ["codex:claimed", 20 * 60 * 1000],
+              ["codex:running", 50 * 60 * 1000],
+              ["codex:verifying", 35 * 60 * 1000],
+              ["codex:retrying", 50 * 60 * 1000],
+            ]);
+            const active = new Set([
+              "codex:claimed",
+              "codex:running",
+              "codex:verifying",
+              "codex:retrying",
+            ]);
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "open",
+              per_page: 100,
+            });
+
+            for (const issue of issues) {
+              if (issue.pull_request) continue;
+              const labels = issue.labels.map((item) => typeof item === "string" ? item : item.name);
+              let condition = null;
+              let detail = null;
+
+              if (labels.includes("codex:queued")) {
+                const age = now - Date.parse(issue.created_at);
+                if (age > queuedLimitMs) {
+                  condition = "queued-unclaimed";
+                  detail = `Task has remained queued for ${Math.floor(age / 60000)} minutes.`;
+                }
+              } else if (labels.some((label) => active.has(label))) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  per_page: 100,
+                });
+                const status = [...comments].reverse().find((comment) =>
+                  comment.body?.includes("<!-- codex-worker-status:v1 -->")
+                );
+                const heartbeat = status?.body?.match(/^heartbeat_at:\s*['"]?([^'"\n]+)['"]?$/m)?.[1];
+                const progress = status?.body?.match(/^progress_at:\s*['"]?([^'"\n]+)['"]?$/m)?.[1];
+                const hardDeadline = status?.body?.match(/^hard_deadline_at:\s*['"]?([^'"\n]+)['"]?$/m)?.[1];
+                const heartbeatAge = heartbeat ? now - Date.parse(heartbeat) : now - Date.parse(issue.updated_at);
+                if (!Number.isFinite(heartbeatAge) || heartbeatAge > heartbeatLimitMs) {
+                  condition = "heartbeat-stale";
+                  detail = heartbeat
+                    ? `Worker heartbeat is ${Math.floor(heartbeatAge / 60000)} minutes old.`
+                    : "No parseable worker heartbeat was found.";
+                } else if (hardDeadline && Number.isFinite(Date.parse(hardDeadline)) && now > Date.parse(hardDeadline)) {
+                  condition = "hard-deadline-expired";
+                  detail = `Task hard deadline expired at ${hardDeadline}.`;
+                } else {
+                  const phase = labels.find((label) => phaseLimitsMs.has(label));
+                  const progressAge = progress ? now - Date.parse(progress) : NaN;
+                  const limit = phase ? phaseLimitsMs.get(phase) : null;
+                  if (limit && Number.isFinite(progressAge) && progressAge > limit) {
+                    condition = "phase-stalled";
+                    detail = `${phase} has made no material progress for ${Math.floor(progressAge / 60000)} minutes.`;
+                  }
+                }
+              }
+
+              if (!condition) continue;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number: issue.number,
+                per_page: 100,
+              });
+              const marker = `<!-- codex-watchdog:${condition}:v1 -->`;
+              const recentlyReported = comments.some((comment) =>
+                comment.body?.includes(marker) && now - Date.parse(comment.created_at) < dedupeWindowMs
+              );
+              if (recentlyReported) continue;
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body: `${marker}\n⚠️ Codex Worker Watchdog: ${detail}\n\nCheck the Mac mini through the configured remote-maintenance channel.`,
+              });
+            }
+

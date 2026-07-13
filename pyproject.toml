@@ -24,7 +24,9 @@ codexctl = "codex_mac_worker.cli:ctl_main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+codex_mac_worker = ["assets/*.yml"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
-

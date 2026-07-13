@@ -1,0 +1,47 @@
+name: Codex Mac Worker task
+description: Queue one bounded, reviewable task for the unattended Mac mini worker.
+title: "[Codex] "
+labels:
+  - codex:queued
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use `codexctl task create` whenever possible. This form is the manual fallback.
+        Commit and push every referenced context file before creating the issue.
+  - type: textarea
+    id: machine_task
+    attributes:
+      label: Immutable task block
+      description: Replace every example value. Do not add a second machine block.
+      value: |
+        <!-- codex-task:v1 -->
+        ```yaml
+        schema_version: 1
+        context_commit: 0000000000000000000000000000000000000000
+        base_branch: main
+        objective: Replace with one bounded delivery outcome
+        acceptance:
+          - Replace with an observable acceptance criterion
+        context_files:
+          - product/docs/product-spec.md
+        allowed_paths:
+          - product/backend/
+          - product/backend/api/tests/
+        verification_profile: fast
+        risk: low
+        ```
+    validations:
+      required: true
+  - type: checkboxes
+    id: operator_checks
+    attributes:
+      label: Operator checks
+      options:
+        - label: The context commit and context files are pushed to GitHub.
+          required: true
+        - label: The task does not deploy, modify production data, or require destructive operations.
+          required: true
+        - label: The allowed paths are narrower than the whole repository.
+          required: true
+
