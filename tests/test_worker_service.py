@@ -8,6 +8,7 @@ import pytest
 
 from codex_mac_worker.config import RepositoryConfig, WorkerConfig
 from codex_mac_worker.gitops import GitOperations
+from codex_mac_worker.protocol import parse_delivery_block, parse_task_body
 from codex_mac_worker.runner import RunnerResult
 from codex_mac_worker.store import EventStore
 from codex_mac_worker.verification import VerificationResult
@@ -65,7 +66,17 @@ commands = ["{sys.executable} -c 'print(123)'"]
 class FakeRunner:
     def run(self, worktree: Path, prompt: str, output_schema: Path, **kwargs: object) -> RunnerResult:
         (worktree / "src" / "result.txt").write_text("implemented\n", encoding="utf-8")
-        return RunnerResult(0, "session-1", (), '{"status":"completed"}', "")
+        return RunnerResult(
+            0,
+            "session-1",
+            (),
+            '{"status":"completed","summary":"done","changed_files":["src/result.txt"],'
+            '"acceptance_results":[{"criterion":"Unit tests pass","status":"met",'
+            '"evidence":"fast verification"}],"risks":[],"needs_human":[]}',
+            "",
+            model="gpt-test",
+            cli_version="codex-test",
+        )
 
 
 class FakeGitHub:
@@ -74,6 +85,7 @@ class FakeGitHub:
         self.labels: list[list[str]] = []
         self.comments: list[str] = []
         self.prs: list[dict] = []
+        self.updated_prs: list[dict] = []
 
     def get_issue(self, repo: str, issue_number: int) -> dict:
         return self.issue
@@ -100,6 +112,12 @@ class FakeGitHub:
     def create_draft_pr(self, repo: str, head: str, base: str, title: str, body: str) -> dict:
         payload = {"number": 44, "html_url": "https://example/pr/44", "head": head, "body": body}
         self.prs.append(payload)
+        return payload
+
+    def update_pull_request(self, repo: str, pr_number: int, *, body: str) -> dict:
+        payload = {"number": pr_number, "body": body}
+        self.updated_prs.append(payload)
+        self.prs[0]["body"] = body
         return payload
 
 
@@ -147,6 +165,15 @@ def test_worker_processes_bounded_task_into_draft_pr(tmp_path: Path) -> None:
     assert task["state"] == "awaiting-review"
     assert task["pr_number"] == 44
     assert github.prs[0]["head"] == "codex/12-bounded-task"
+    delivery = parse_delivery_block(github.prs[0]["body"])
+    assert delivery.issue_number == 12
+    assert delivery.task_hash == parse_task_body(body).task_hash
+    assert delivery.context_commit == sha
+    assert delivery.delivery_commit == git(tmp_path / "remote.git", "rev-parse", "codex/12-bounded-task")
+    assert delivery.verification_passed is True
+    assert delivery.model == "gpt-test"
+    assert delivery.cli_version == "codex-test"
+    assert delivery.acceptance_results[0]["criterion"] == "Unit tests pass"
     assert github.labels[-1] == ["priority:p1", "codex:awaiting-review"]
     assert git(tmp_path / "remote.git", "show", "codex/12-bounded-task:src/result.txt") == "implemented"
     assert len(store.list_runs("owner/repo", 12)) == 1
@@ -386,7 +413,17 @@ def test_worker_revises_existing_branch_without_creating_second_pr(tmp_path: Pat
         ) -> RunnerResult:
             assert "Rename the result" in prompt
             (worktree / "src" / "result.txt").write_text("revised\n", encoding="utf-8")
-            return RunnerResult(0, "session-2", (), '{"status":"completed"}', "")
+            return RunnerResult(
+                0,
+                "session-2",
+                (),
+                '{"status":"completed","summary":"revised","changed_files":["src/result.txt"],'
+                '"acceptance_results":[{"criterion":"Unit tests pass","status":"met",'
+                '"evidence":"fast verification after revision"}],"risks":[],"needs_human":[]}',
+                "",
+                model="gpt-revision",
+                cli_version="codex-revision",
+            )
 
     service.runner = RevisionRunner()
     service.revise_issue(
@@ -398,6 +435,12 @@ def test_worker_revises_existing_branch_without_creating_second_pr(tmp_path: Pat
 
     assert store.get_task("owner/repo", 12)["state"] == "awaiting-review"
     assert len(github.prs) == 1
+    assert len(github.updated_prs) == 1
+    revised_delivery = parse_delivery_block(github.updated_prs[0]["body"])
+    assert revised_delivery.delivery_commit == git(
+        tmp_path / "remote.git", "rev-parse", "codex/12-bounded-task"
+    )
+    assert revised_delivery.model == "gpt-revision"
     assert git(tmp_path / "remote.git", "show", "codex/12-bounded-task:src/result.txt") == "revised"
     assert git(tmp_path / "remote.git", "rev-list", "--count", "codex/12-bounded-task") == "3"
     assert len(store.list_runs("owner/repo", 12)) == 2

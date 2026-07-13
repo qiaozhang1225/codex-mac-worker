@@ -5,11 +5,14 @@ import hashlib
 import pytest
 
 from codex_mac_worker.protocol import (
+    DeliveryMetadata,
     ProtocolError,
+    parse_delivery_block,
     parse_repository_attestation,
     parse_repository_probe,
     parse_task_body,
     render_repository_attestation,
+    render_delivery_block,
     render_repository_probe,
 )
 
@@ -114,3 +117,23 @@ def test_repository_probe_rejects_invalid_hashes(old: str, new: str, message: st
 
     with pytest.raises(ProtocolError, match=message):
         parse_repository_probe(body)
+
+
+def test_delivery_metadata_round_trip_binds_latest_commit() -> None:
+    metadata = DeliveryMetadata(
+        issue_number=12,
+        task_hash="b" * 64,
+        context_commit="a" * 40,
+        delivery_commit="c" * 40,
+        verification_profile="fast",
+        verification_passed=True,
+        model="gpt-5",
+        cli_version="codex 1.2.3",
+        acceptance_results=(
+            {"criterion": "Tests pass", "status": "met", "evidence": "pytest"},
+        ),
+        risks=(),
+        needs_human=(),
+    )
+
+    assert parse_delivery_block(render_delivery_block(metadata)) == metadata

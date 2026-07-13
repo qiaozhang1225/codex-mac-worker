@@ -74,3 +74,20 @@ def test_outbox_stops_after_initial_attempt_and_two_retries(tmp_path: Path) -> N
     assert row is not None
     assert row["attempts"] == 3
     assert row["failed_at"] is not None
+
+
+def test_durable_github_persists_pull_request_body_updates(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+
+    class Remote:
+        def update_pull_request(self, repo: str, pr_number: int, *, body: str) -> dict:
+            return {"id": pr_number, "number": pr_number, "body": body}
+
+    github = DurableGitHub(Remote(), store)
+
+    first = github.update_pull_request("owner/repo", 44, body="new evidence")
+    second = github.update_pull_request("owner/repo", 44, body="new evidence")
+
+    assert first["body"] == "new evidence"
+    assert second == {"id": 44}
+    assert store.pending_outbox() == []

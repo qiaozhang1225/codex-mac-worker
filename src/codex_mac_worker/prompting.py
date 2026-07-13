@@ -11,13 +11,36 @@ def result_schema() -> dict[str, Any]:
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": False,
-        "required": ["status", "summary", "changed_files", "risks", "needs_human"],
+        "required": [
+            "status",
+            "summary",
+            "changed_files",
+            "risks",
+            "needs_human",
+            "acceptance_results",
+        ],
         "properties": {
             "status": {"type": "string", "enum": ["completed", "blocked"]},
             "summary": {"type": "string", "minLength": 1},
             "changed_files": {"type": "array", "items": {"type": "string"}},
             "risks": {"type": "array", "items": {"type": "string"}},
             "needs_human": {"type": "array", "items": {"type": "string"}},
+            "acceptance_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["criterion", "status", "evidence"],
+                    "properties": {
+                        "criterion": {"type": "string", "minLength": 1},
+                        "status": {
+                            "type": "string",
+                            "enum": ["met", "not_met", "needs_review"],
+                        },
+                        "evidence": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
         },
     }
 
@@ -75,4 +98,3 @@ def write_result_schema(path: str) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(result_schema(), handle, ensure_ascii=False, indent=2)
         handle.write("\n")
-

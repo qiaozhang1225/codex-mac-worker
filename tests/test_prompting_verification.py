@@ -33,7 +33,20 @@ def test_execution_prompt_is_bounded_and_never_mentions_goal_mode(tmp_path: Path
     assert "Only modify these paths" in prompt
     assert "/goal" not in prompt.lower()
     assert "goal mode" not in prompt.lower()
-    assert result_schema()["required"] == ["status", "summary", "changed_files", "risks", "needs_human"]
+    assert result_schema()["required"] == [
+        "status",
+        "summary",
+        "changed_files",
+        "risks",
+        "needs_human",
+        "acceptance_results",
+    ]
+    acceptance = result_schema()["properties"]["acceptance_results"]
+    assert acceptance["items"]["properties"]["status"]["enum"] == [
+        "met",
+        "not_met",
+        "needs_review",
+    ]
 
 
 def test_revision_prompt_starts_new_bounded_attempt() -> None:

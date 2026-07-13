@@ -20,10 +20,12 @@ from .gitops import GitOperations
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .prompting import build_execution_prompt, build_revision_prompt, result_schema
 from .protocol import (
+    DeliveryMetadata,
     ProtocolError,
     parse_command_comment,
     parse_repository_probe,
     parse_task_body,
+    render_delivery_block,
     render_repository_attestation,
 )
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
@@ -45,6 +47,9 @@ class GitHubPort(Protocol):
     def collaborator_permission(self, repo: str, username: str) -> str: ...
     def create_draft_pr(
         self, repo: str, head: str, base: str, title: str, body: str
+    ) -> dict[str, Any]: ...
+    def update_pull_request(
+        self, repo: str, pr_number: int, *, body: str
     ) -> dict[str, Any]: ...
     def get_repository(self, repo: str) -> dict[str, Any]: ...
     def get_commit(self, repo: str, ref: str) -> dict[str, Any]: ...
@@ -255,13 +260,91 @@ class WorkerService:
                 ),
             )
 
-    def _require_completed_result(self, result: RunnerResult) -> None:
+    def _require_completed_result(self, result: RunnerResult, spec: Any) -> dict[str, Any]:
         try:
             payload = json.loads(result.last_message)
         except json.JSONDecodeError as exc:
             raise PolicyError("Codex returned an invalid structured result") from exc
         if not isinstance(payload, dict) or payload.get("status") != "completed":
             raise PolicyError("Codex reported blocked instead of completed")
+
+        acceptance_results = payload.get("acceptance_results")
+        if not isinstance(acceptance_results, list) or len(acceptance_results) != len(
+            spec.acceptance
+        ):
+            raise PolicyError("Codex acceptance results do not match the frozen task")
+        for criterion, result_item in zip(spec.acceptance, acceptance_results, strict=True):
+            if not isinstance(result_item, dict) or result_item.get("criterion") != criterion:
+                raise PolicyError("Codex acceptance results do not match the frozen task")
+            status = result_item.get("status")
+            evidence = result_item.get("evidence")
+            if status not in {"met", "not_met", "needs_review"}:
+                raise PolicyError("Codex returned an invalid acceptance status")
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise PolicyError("Codex acceptance evidence must not be empty")
+            if status == "not_met":
+                raise PolicyError(f"Codex did not meet acceptance criterion: {criterion}")
+        for key in ("risks", "needs_human"):
+            value = payload.get(key)
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) and item.strip() for item in value
+            ):
+                raise PolicyError(f"Codex result field {key} must be a string list")
+        return payload
+
+    def _delivery_pr_body(
+        self,
+        *,
+        issue_number: int,
+        spec: Any,
+        task_hash: str,
+        commit_sha: str,
+        runner_result: RunnerResult,
+        structured_result: dict[str, Any],
+        verification_result: Any,
+    ) -> str:
+        acceptance_results = tuple(structured_result["acceptance_results"])
+        risks = tuple(structured_result["risks"])
+        needs_human = tuple(structured_result["needs_human"])
+        metadata = DeliveryMetadata(
+            issue_number=issue_number,
+            task_hash=task_hash,
+            context_commit=spec.context_commit,
+            delivery_commit=commit_sha,
+            verification_profile=spec.verification_profile,
+            verification_passed=bool(verification_result.passed),
+            model=runner_result.model,
+            cli_version=runner_result.cli_version,
+            acceptance_results=acceptance_results,
+            risks=risks,
+            needs_human=needs_human,
+        )
+        acceptance_text = "\n".join(
+            f"- [{'x' if item['status'] == 'met' else ' '}] {item['criterion']} "
+            f"— {item['status']}: {item['evidence']}"
+            for item in acceptance_results
+        )
+        risk_text = "\n".join(f"- {item}" for item in risks) or "- None reported"
+        human_text = "\n".join(f"- {item}" for item in needs_human) or "- None"
+        return f"""{render_delivery_block(metadata)}
+Relates to #{issue_number}
+
+## Acceptance
+{acceptance_text}
+
+## Verification
+```text
+{self._verification_detail(verification_result)}
+```
+
+## Risks
+{risk_text}
+
+## Human dependencies
+{human_text}
+
+This PR was created as a draft. The worker cannot merge it.
+"""
 
     def _validate_delivery_diff(
         self,
@@ -445,6 +528,7 @@ class WorkerService:
             prompt = build_execution_prompt(spec, issue_number=number)
             verification_result = None
             runner_result = None
+            structured_result = None
             for attempt in range(1, project_config.max_automatic_attempts + 1):
                 remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
                 if remaining <= 0:
@@ -517,7 +601,7 @@ class WorkerService:
                     heartbeat()
                     continue
 
-                self._require_completed_result(runner_result)
+                structured_result = self._require_completed_result(runner_result, spec)
                 self._validate_delivery_diff(
                     prepared.path, prepared.baseline_head, spec, project_config
                 )
@@ -588,7 +672,11 @@ class WorkerService:
                     self._verification_detail(verification_result),
                 )
 
-            assert runner_result is not None and verification_result is not None
+            assert (
+                runner_result is not None
+                and verification_result is not None
+                and structured_result is not None
+            )
             latest_issue = self.github.get_issue(repo, number)
             if parse_task_body(str(latest_issue.get("body", ""))).task_hash != task_hash:
                 raise PolicyError("task body changed after claim")
@@ -609,23 +697,15 @@ class WorkerService:
                 clone_url=repository.clone_url,
                 token=self.token_provider(),
             )
-            verification_text = self._verification_detail(verification_result)
-            pr_body = f"""Relates to #{number}
-
-Context commit: `{spec.context_commit}`
-Task hash: `{task_hash}`
-Commit: `{commit_sha}`
-
-## Acceptance
-{chr(10).join(f'- [ ] {item}' for item in spec.acceptance)}
-
-## Verification
-```text
-{verification_text}
-```
-
-This PR was created as a draft. The worker cannot merge it.
-"""
+            pr_body = self._delivery_pr_body(
+                issue_number=number,
+                spec=spec,
+                task_hash=task_hash,
+                commit_sha=commit_sha,
+                runner_result=runner_result,
+                structured_result=structured_result,
+                verification_result=verification_result,
+            )
             pr = self.github.create_draft_pr(
                 repo,
                 branch,
@@ -781,6 +861,7 @@ This PR was created as a draft. The worker cannot merge it.
             )
             runner_result = None
             verification_result = None
+            structured_result = None
             for attempt in range(1, project_config.max_automatic_attempts + 1):
                 remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
                 if remaining <= 0:
@@ -857,7 +938,7 @@ This PR was created as a draft. The worker cannot merge it.
                     heartbeat()
                     continue
 
-                self._require_completed_result(runner_result)
+                structured_result = self._require_completed_result(runner_result, spec)
                 self._validate_delivery_diff(worktree, baseline_head, spec, project_config)
                 self._set_state(repo, issue, "verifying")
                 status_state = "verifying"
@@ -931,7 +1012,11 @@ This PR was created as a draft. The worker cannot merge it.
                     self._verification_detail(verification_result),
                 )
 
-            assert runner_result is not None and verification_result is not None
+            assert (
+                runner_result is not None
+                and verification_result is not None
+                and structured_result is not None
+            )
             latest_issue = self.github.get_issue(repo, number)
             if parse_task_body(str(latest_issue.get("body", ""))).task_hash != task_hash:
                 raise PolicyError("task body changed during revision")
@@ -947,6 +1032,19 @@ This PR was created as a draft. The worker cannot merge it.
                 branch=branch,
                 clone_url=repository.clone_url,
                 token=self.token_provider(),
+            )
+            self.github.update_pull_request(
+                repo,
+                int(task["pr_number"]),
+                body=self._delivery_pr_body(
+                    issue_number=number,
+                    spec=spec,
+                    task_hash=task_hash,
+                    commit_sha=commit_sha,
+                    runner_result=runner_result,
+                    structured_result=structured_result,
+                    verification_result=verification_result,
+                ),
             )
             self.store.upsert_task(
                 repo=repo,

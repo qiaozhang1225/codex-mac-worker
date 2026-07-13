@@ -83,6 +83,12 @@ class DurableGitHub:
                 labels=payload.get("labels"),
                 state=payload.get("state"),
             )
+        if operation == "update_pull_request":
+            return self.remote.update_pull_request(
+                payload["repo"],
+                payload["pr_number"],
+                body=payload["body"],
+            )
         raise ValueError(f"unsupported durable GitHub operation: {operation}")
 
     def flush(self) -> None:
@@ -158,5 +164,21 @@ class DurableGitHub:
                 "issue_number": issue_number,
                 "labels": labels,
                 "state": state,
+            }
+        )
+
+    def update_pull_request(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        body: str,
+    ) -> dict[str, Any]:
+        return self._write(
+            {
+                "operation": "update_pull_request",
+                "repo": repo,
+                "pr_number": pr_number,
+                "body": body,
             }
         )
