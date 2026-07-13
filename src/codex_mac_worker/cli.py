@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Sequence
 
+from .assisted_merge import review_task
 from .config import load_worker_config
 from .control import create_task, parse_issue_reference, send_command
 from .control_state import ControlState
@@ -18,7 +19,7 @@ from .durable_github import DurableGitHub
 from .github import GitHubAppAuth, GitHubClient
 from .gitops import GitOperations
 from .runner import CodexRunner
-from .references import parse_pull_request_reference
+from .references import IssueReference, parse_pull_request_reference
 from .repository_onboarding import (
     finalize_onboarding,
     prepare_onboarding,
@@ -92,6 +93,9 @@ def build_ctl_parser() -> argparse.ArgumentParser:
     revise.add_argument("reference")
     revise.add_argument("--requirements", required=True, type=Path)
 
+    review = actions.add_parser("review")
+    review.add_argument("reference")
+
     repo = top.add_parser("repo")
     repo_actions = repo.add_subparsers(dest="action", required=True)
 
@@ -154,6 +158,10 @@ def ctl_main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     repo, issue_number = parse_issue_reference(args.reference)
+    if args.action == "review":
+        snapshot = review_task(github, IssueReference(repo, issue_number))
+        print(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2))
+        return 0 if snapshot.gates.allowed else 2
     if args.action == "status":
         issue = github.get_issue(repo, issue_number)
         summary = {

@@ -7,6 +7,33 @@ from codex_mac_worker.cli import build_ctl_parser, ctl_main, personal_github_tok
 from codex_mac_worker.repository_onboarding import OnboardingSnapshot, ReadinessReport
 
 
+def test_ctl_parser_supports_task_review() -> None:
+    args = build_ctl_parser().parse_args(
+        ["task", "review", "https://github.com/owner/repo/issues/12"]
+    )
+
+    assert (args.resource, args.action) == ("task", "review")
+
+
+def test_task_review_returns_two_when_gates_block(monkeypatch, capsys) -> None:
+    from codex_mac_worker.assisted_merge import GateResult, ReviewSnapshot
+
+    monkeypatch.setattr(cli, "personal_github_token", lambda: "token")
+    monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
+    snapshot = ReviewSnapshot(
+        repo="owner/repo", issue_number=12, pr_number=44, pr_url="https://example/pr/44",
+        base_branch="main", base_sha="a" * 40, head_sha="c" * 40, is_draft=True,
+        task_hash="b" * 64, context_commit="a" * 40, changed_paths=("src/a.py",),
+        additions=1, deletions=0, checks=(), acceptance_results=(), model=None,
+        cli_version=None, risks=(), needs_human=(), unresolved_threads=(),
+        gates=GateResult(False, ("checks pending",)), approval_fingerprint="d" * 64,
+    )
+    monkeypatch.setattr(cli, "review_task", lambda github, reference: snapshot)
+
+    assert ctl_main(["task", "review", "owner/repo#12"]) == 2
+    assert json.loads(capsys.readouterr().out)["gates"]["allowed"] is False
+
+
 def test_personal_token_prefers_environment(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "token-from-env")
 
