@@ -82,7 +82,8 @@ class MergeResult:
 APPROVAL_MARKER = "<!-- codex-human-approval:v1 -->"
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _UNSAFE_RISK_RE = re.compile(
-    r"\b(high|credential|secret|password|production|deploy|migration|irreversible)\b|"
+    r"\b(high|credentials?|secrets?|passwords?|prod(?:uction)?|"
+    r"deploy(?:ment|ed|ing)?|migrations?|irreversible)\b|"
     r"高风险|凭据|密钥|生产|部署|迁移|不可逆",
     re.IGNORECASE,
 )
@@ -141,7 +142,9 @@ def _matching_delivery(github: Any, reference: IssueReference) -> tuple[dict[str
     return pull, delivery
 
 
-def _authoritative_worker_login(github: Any, repo: str) -> str | None:
+def _authoritative_worker_identity(
+    github: Any, repo: str
+) -> tuple[str, int] | None:
     repository = github.get_repository(repo)
     default_branch = str(repository.get("default_branch", ""))
     default_head = str(github.get_commit(repo, default_branch).get("sha", "")).lower()
@@ -177,7 +180,9 @@ def _authoritative_worker_login(github: Any, repo: str) -> str | None:
                 and attestation.project_config_hash == project_hash
             ):
                 login = str(user.get("login", ""))
-                return login or None
+                app_id = comment.get("performed_via_github_app", {}).get("id")
+                if login and isinstance(app_id, int) and app_id > 0:
+                    return login, app_id
     return None
 
 
@@ -270,12 +275,17 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
 
     if not head_branch.startswith("codex/"):
         blockers.append("source branch must begin with codex/")
-    worker_login = _authoritative_worker_login(github, reference.repo)
+    worker_identity = _authoritative_worker_identity(github, reference.repo)
     author_login = str(pull.get("user", {}).get("login", ""))
-    if worker_login is None:
+    pull_app_id = pull.get("performed_via_github_app", {}).get("id")
+    if worker_identity is None:
         blockers.append("Worker identity has no current readiness attestation")
-    elif author_login != worker_login:
-        blockers.append("PR author does not match the attested Worker identity")
+    else:
+        worker_login, worker_app_id = worker_identity
+        if author_login != worker_login:
+            blockers.append("PR author does not match the attested Worker identity")
+        if pull_app_id != worker_app_id:
+            blockers.append("PR was not created by the attested Worker GitHub App")
     if delivery.task_hash != spec.task_hash:
         blockers.append("delivery task hash differs from the frozen Issue task hash")
     if delivery.context_commit != spec.context_commit:
@@ -384,14 +394,35 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
 def render_approval_audit(
     *, snapshot: ReviewSnapshot, actor_login: str, approved_at: str
 ) -> str:
-    payload = {
-        "schema_version": 1,
-        "approval_fingerprint": snapshot.approval_fingerprint,
-        "actor_login": actor_login,
+    return _render_approval_context(
+        _approval_context(snapshot, actor_login), approved_at=approved_at
+    )
+
+
+def _approval_context(
+    snapshot: ReviewSnapshot,
+    actor_login: str,
+) -> dict[str, Any]:
+    return {
+        "repo": snapshot.repo,
         "issue_number": snapshot.issue_number,
         "pr_number": snapshot.pr_number,
         "task_hash": snapshot.task_hash,
         "approved_head": snapshot.head_sha,
+        "approval_fingerprint": snapshot.approval_fingerprint,
+        "actor_login": actor_login,
+    }
+
+
+def _render_approval_context(context: dict[str, Any], *, approved_at: str) -> str:
+    payload = {
+        "schema_version": 1,
+        "approval_fingerprint": context["approval_fingerprint"],
+        "actor_login": context["actor_login"],
+        "issue_number": context["issue_number"],
+        "pr_number": context["pr_number"],
+        "task_hash": context["task_hash"],
+        "approved_head": context["approved_head"],
         "approved_at": approved_at,
     }
     machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
@@ -428,75 +459,21 @@ def _merge_result(raw: dict[str, Any]) -> MergeResult:
     )
 
 
-def _snapshot_for_audit(
-    github: Any,
-    reference: IssueReference,
-    pull: dict[str, Any],
-) -> ReviewSnapshot:
-    spec = parse_task_body(
-        str(github.get_issue(reference.repo, reference.number).get("body", ""))
-    )
-    delivery = parse_delivery_block(str(pull.get("body", "")))
-    base = pull.get("base", {})
-    head = pull.get("head", {})
-    base_sha = str(base.get("sha", "")).lower()
-    head_sha = str(head.get("sha", "")).lower()
-    if (
-        delivery.issue_number != reference.number
-        or delivery.task_hash != spec.task_hash
-        or delivery.context_commit != spec.context_commit
-        or delivery.delivery_commit != head_sha
-    ):
-        raise MergeBlocked("merged PR metadata no longer matches the frozen task")
-    fingerprint = approval_fingerprint(
-        repo=reference.repo,
-        issue_number=reference.number,
-        pr_number=int(pull["number"]),
-        task_hash=spec.task_hash,
-        context_commit=spec.context_commit,
-        base_sha=base_sha,
-        head_sha=head_sha,
-    )
-    return ReviewSnapshot(
-        repo=reference.repo,
-        issue_number=reference.number,
-        pr_number=int(pull["number"]),
-        pr_url=str(pull.get("html_url", "")),
-        base_branch=str(base.get("ref", "")),
-        base_sha=base_sha,
-        head_sha=head_sha,
-        is_draft=bool(pull.get("draft")),
-        task_hash=spec.task_hash,
-        context_commit=spec.context_commit,
-        changed_paths=(),
-        additions=0,
-        deletions=0,
-        checks=(),
-        acceptance_results=delivery.acceptance_results,
-        model=delivery.model,
-        cli_version=delivery.cli_version,
-        risks=delivery.risks,
-        needs_human=delivery.needs_human,
-        unresolved_threads=(),
-        gates=GateResult(True, ()),
-        approval_fingerprint=fingerprint,
-    )
-
-
-def _audit_once(github: Any, snapshot: ReviewSnapshot, actor_login: str) -> None:
+def _audit_once(github: Any, context: dict[str, Any]) -> None:
     expected = (
         APPROVAL_MARKER in str(comment.get("body", ""))
-        and snapshot.approval_fingerprint in str(comment.get("body", ""))
-        for comment in github.list_comments(snapshot.repo, snapshot.pr_number)
+        and str(context["approval_fingerprint"]) in str(comment.get("body", ""))
+        for comment in github.list_comments(
+            str(context["repo"]), int(context["pr_number"])
+        )
     )
     if any(expected):
         return
     github.add_comment(
-        snapshot.repo,
-        snapshot.pr_number,
-        render_approval_audit(
-            snapshot=snapshot,
-            actor_login=actor_login,
+        str(context["repo"]),
+        int(context["pr_number"]),
+        _render_approval_context(
+            context,
             approved_at=datetime.now(UTC).isoformat(),
         ),
     )
@@ -545,8 +522,12 @@ def merge_task(
         raise MergeBlocked("PR was already merged outside this approval operation")
     if merged_at and existing is not None:
         user = github.get_authenticated_user()
-        actor_login = str(user.get("login", ""))
-        permission = github.collaborator_permission(reference.repo, actor_login)
+        current_login = str(user.get("login", ""))
+        permission = github.collaborator_permission(reference.repo, current_login)
+        context = existing.get("result")
+        if not isinstance(context, dict):
+            raise MergeBlocked("approved merge context is missing from the ledger")
+        actor_login = str(context.get("actor_login", ""))
         approved = any(
             str(review.get("state", "")).upper() == "APPROVED"
             and str(review.get("user", {}).get("login", "")) == actor_login
@@ -555,8 +536,13 @@ def merge_task(
         )
         if permission not in {"admin", "maintain"} or not approved:
             raise MergeBlocked("unable to reconcile the original approved merge actor")
-        snapshot = _snapshot_for_audit(github, reference, candidate)
-        if snapshot.approval_fingerprint != expected_fingerprint:
+        if (
+            context.get("repo") != reference.repo
+            or int(context.get("issue_number", 0)) != reference.number
+            or int(context.get("pr_number", 0)) != pr_number
+            or context.get("approved_head") != expected_head
+            or context.get("approval_fingerprint") != expected_fingerprint
+        ):
             raise MergeBlocked("approval fingerprint no longer matches the merged PR")
         result = MergeResult(
             repo=reference.repo,
@@ -565,10 +551,10 @@ def merge_task(
             approved_head=expected_head,
             merge_commit_sha=str(candidate.get("merge_commit_sha", "")),
             actor_login=actor_login,
-            approval_fingerprint=snapshot.approval_fingerprint,
+            approval_fingerprint=expected_fingerprint,
             merged=True,
         )
-        _audit_once(github, snapshot, actor_login)
+        _audit_once(github, context)
         state.complete(key, asdict(result))
         return result
 
@@ -594,6 +580,8 @@ def merge_task(
         f"{reference.repo}#{pr_number}:{expected_fingerprint}",
         expected_head,
     )
+    approval_context = _approval_context(snapshot, actor_login)
+    state.record_context(key, approval_context)
 
     if snapshot.is_draft:
         github.mark_pull_request_ready(reference.repo, pr_number)
@@ -649,6 +637,6 @@ def merge_task(
         approval_fingerprint=snapshot.approval_fingerprint,
         merged=True,
     )
-    _audit_once(github, snapshot, actor_login)
+    _audit_once(github, approval_context)
     state.complete(key, asdict(result))
     return result

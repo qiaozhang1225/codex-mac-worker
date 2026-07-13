@@ -539,6 +539,9 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
                     user = comment.get("user", {})
                     if user.get("type") != "Bot":
                         continue
+                    app_id = comment.get("performed_via_github_app", {}).get("id")
+                    if not isinstance(app_id, int) or app_id <= 0:
+                        continue
                     try:
                         attestation = parse_repository_attestation(str(comment["body"]))
                     except ProtocolError:
@@ -631,6 +634,34 @@ def _ensure_probe(
     )
 
 
+def _validate_onboarding_review_gates(
+    github: Any,
+    snapshot: OnboardingSnapshot,
+) -> None:
+    for check in github.list_check_runs(snapshot.repo, snapshot.head_sha):
+        status = str(check.get("status") or "")
+        conclusion = str(check.get("conclusion") or "")
+        if status != "completed" or conclusion not in {"success", "neutral"}:
+            raise OnboardingError(
+                f"onboarding check {check.get('name', 'unnamed')} is not successful"
+            )
+    combined = github.get_combined_status(snapshot.repo, snapshot.head_sha)
+    for status in combined.get("statuses", []):
+        if status.get("state") != "success":
+            raise OnboardingError(
+                f"onboarding legacy check {status.get('context', 'unnamed')} is not successful"
+            )
+    unresolved = [
+        thread
+        for thread in github.list_review_threads(snapshot.repo, snapshot.pr_number)
+        if thread.get("isResolved") is not True
+    ]
+    if unresolved:
+        raise OnboardingError(
+            f"onboarding PR has {len(unresolved)} unresolved review threads"
+        )
+
+
 def finalize_onboarding(
     github: Any,
     state: ControlState,
@@ -652,6 +683,7 @@ def finalize_onboarding(
     existing_operation = state.get(key)
     if existing_operation and existing_operation.get("state") == "completed":
         return repository_status(github, reference.repo)
+    _validate_onboarding_review_gates(github, snapshot)
     state.begin(
         key,
         "repo-finalize",
@@ -667,6 +699,7 @@ def finalize_onboarding(
             snapshot = inspect_onboarding_pr(github, reference.repo, reference.number)
             if snapshot.head_sha != expected_head.lower():
                 raise OnboardingError("approval expired while marking the PR ready")
+        _validate_onboarding_review_gates(github, snapshot)
         try:
             result = github.merge_pull_request(
                 reference.repo,

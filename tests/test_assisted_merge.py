@@ -87,6 +87,7 @@ class ReviewGitHub:
             "base": {"ref": "main", "sha": "a" * 40},
             "head": {"ref": "codex/12-bounded", "sha": "c" * 40},
             "user": {"login": "worker-app[bot]"},
+            "performed_via_github_app": {"id": 777, "slug": "worker-app"},
             "draft": True,
             "mergeable": True,
         }
@@ -106,6 +107,7 @@ class ReviewGitHub:
         self.merge_payload: dict[str, str] | None = None
         self.comments: list[str] = []
         self.reviews: list[dict] = []
+        self.authenticated_login = "qiaoz"
 
     @classmethod
     def happy_path(cls) -> "ReviewGitHub":
@@ -153,8 +155,10 @@ class ReviewGitHub:
             github.issue["state"] = "closed"
         elif mutation == "credential_risk":
             github.pull["body"] = github.pull["body"].replace(
-                "risks: []", "risks:\n- Requires production credentials"
+                "risks: []", "risks:\n- Credentials may be exposed during deployment"
             )
+        elif mutation == "different_app":
+            github.pull["performed_via_github_app"]["id"] = 999
         else:
             raise AssertionError(mutation)
         return github
@@ -229,6 +233,7 @@ class ReviewGitHub:
         return [
             {
                 "user": {"login": "worker-app[bot]", "type": "Bot"},
+                "performed_via_github_app": {"id": 777, "slug": "worker-app"},
                 "body": render_repository_attestation(
                     probe_id="probe-1",
                     worker_id="mac-mini",
@@ -240,7 +245,7 @@ class ReviewGitHub:
         ]
 
     def get_authenticated_user(self) -> dict:
-        return {"login": "qiaoz"}
+        return {"login": self.authenticated_login}
 
     def collaborator_permission(self, repo: str, username: str) -> str:
         return "admin"
@@ -330,6 +335,7 @@ def test_review_keeps_attested_worker_identity_after_default_branch_advances() -
         ("missing_required_check", "required checks"),
         ("wrong_issue_state", "Issue"),
         ("credential_risk", "risks"),
+        ("different_app", "GitHub App"),
     ],
 )
 def test_review_blocks_each_unsafe_state(mutation: str, blocker: str) -> None:
@@ -455,6 +461,7 @@ def test_merge_recovers_after_audit_comment_failure(tmp_path: Path) -> None:
             expected_fingerprint=fingerprint,
         )
 
+    github.authenticated_login = "maintainer-2"
     result = merge_task(
         github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
         expected_fingerprint=fingerprint,
@@ -462,6 +469,7 @@ def test_merge_recovers_after_audit_comment_failure(tmp_path: Path) -> None:
     state.close()
 
     assert result.merged is True
+    assert result.actor_login == "qiaoz"
     assert github.writes.count("merge") == 1
     assert len(github.comments) == 1
 

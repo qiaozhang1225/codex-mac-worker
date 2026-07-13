@@ -56,6 +56,15 @@ class ControlState:
         )
         self.connection.commit()
 
+    def record_context(self, key: str, context: dict[str, Any]) -> None:
+        cursor = self.connection.execute(
+            "UPDATE operations SET result_json=? WHERE operation_id=? AND state='started'",
+            (json.dumps(context, sort_keys=True), key),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError(f"started operation not found: {key}")
+
     def get(self, key: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM operations WHERE operation_id=?",

@@ -12,6 +12,8 @@ def test_operation_ledger_survives_reopen(tmp_path: Path) -> None:
     assert state.journal_mode == "wal"
     assert state.begin(key, "task-merge", "owner/repo#44", "a" * 40) is True
     assert state.begin(key, "task-merge", "owner/repo#44", "a" * 40) is False
+    state.record_context(key, {"actor_login": "owner", "fingerprint": "f" * 64})
+    assert state.get(key)["result"]["actor_login"] == "owner"
     state.complete(key, {"merged": True, "sha": "b" * 40})
     state.close()
 

@@ -138,6 +138,9 @@ class FinalizeGitHub(OnboardingGitHub):
         self.issues: list[dict] = []
         self.comments: dict[int, list[dict]] = {}
         self.default_head = "c" * 40
+        self.check_runs: list[dict] = []
+        self.commit_statuses: list[dict] = []
+        self.review_threads: list[dict] = []
 
     def get_pull_request(self, repo: str, pr_number: int) -> dict:
         payload = super().get_pull_request(repo, pr_number)
@@ -213,11 +216,37 @@ class FinalizeGitHub(OnboardingGitHub):
     def list_comments(self, repo: str, issue_number: int) -> list[dict]:
         return self.comments.get(issue_number, [])
 
+    def list_check_runs(self, repo: str, sha: str) -> list[dict]:
+        return self.check_runs
+
+    def get_combined_status(self, repo: str, sha: str) -> dict:
+        return {"statuses": self.commit_statuses}
+
+    def list_review_threads(self, repo: str, pr_number: int) -> list[dict]:
+        return self.review_threads
+
 
 def test_finalize_rejects_head_drift_before_any_write(tmp_path: Path) -> None:
     github = FinalizeGitHub(head_sha="d" * 40)
 
     with pytest.raises(OnboardingError, match="approval expired"):
+        finalize_onboarding(
+            github,
+            ControlState(tmp_path / "state.db"),
+            PullRequestReference("owner/repo", 1),
+            expected_head="b" * 40,
+        )
+
+    assert github.writes == []
+
+
+def test_finalize_rejects_failed_check_before_any_github_write(tmp_path: Path) -> None:
+    github = FinalizeGitHub()
+    github.check_runs = [
+        {"name": "test", "status": "completed", "conclusion": "failure"}
+    ]
+
+    with pytest.raises(OnboardingError, match="check"):
         finalize_onboarding(
             github,
             ControlState(tmp_path / "state.db"),
@@ -302,6 +331,7 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
                 attested_at="2026-07-14T10:00:00+00:00",
             ),
             "user": {"login": "coworker-app[bot]", "type": "Bot"},
+            "performed_via_github_app": {"id": 777, "slug": "coworker-app"},
         }
     ]
 
