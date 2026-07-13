@@ -53,6 +53,7 @@ class OnboardingError(RuntimeError):
 
 
 class OnboardingGitHub(Protocol):
+    def get_repository(self, repo: str) -> dict[str, Any]: ...
     def get_pull_request(self, repo: str, pr_number: int) -> dict[str, Any]: ...
     def list_pull_files(self, repo: str, pr_number: int) -> list[dict[str, Any]]: ...
     def get_repository_file(self, repo: str, path: str, *, ref: str) -> str: ...
@@ -103,6 +104,7 @@ def inspect_onboarding_pr(
     pr_number: int,
 ) -> OnboardingSnapshot:
     pull = github.get_pull_request(repo, pr_number)
+    repository = github.get_repository(repo)
     files = github.list_pull_files(repo, pr_number)
     paths = {str(item.get("filename", "")) for item in files}
     if paths != ONBOARDING_PATHS or len(files) != len(ONBOARDING_PATHS):
@@ -112,6 +114,15 @@ def inspect_onboarding_pr(
 
     base = pull.get("base", {})
     head = pull.get("head", {})
+    default_branch = str(repository.get("default_branch", ""))
+    if pull.get("state") != "open" and not pull.get("merged_at"):
+        raise OnboardingError("onboarding PR must be open")
+    if str(base.get("ref", "")) != default_branch:
+        raise OnboardingError("onboarding PR must target the current default branch")
+    if str(base.get("repo", {}).get("full_name", "")) != repo:
+        raise OnboardingError("onboarding PR base must be the target repository")
+    if str(head.get("repo", {}).get("full_name", "")) != repo:
+        raise OnboardingError("onboarding PR head must be in the same repository")
     base_branch = str(base.get("ref", ""))
     base_sha = str(base.get("sha", "")).lower()
     head_branch = str(head.get("ref", ""))
@@ -244,46 +255,76 @@ def prepare_onboarding(
                 check=False,
             )
             if remote_branch.returncode == 0:
-                raise OnboardingError(
-                    f"remote branch {branch} exists without an open onboarding PR"
+                _run_git(
+                    checkout,
+                    "fetch",
+                    "origin",
+                    f"refs/heads/{branch}:refs/remotes/origin/{branch}",
+                    env=auth_env,
                 )
-            _run_git(checkout, "switch", "-c", branch)
-            for path in ONBOARDING_PATHS:
-                target = checkout / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if path == ".codex-worker/project.toml":
-                    target.write_text(project_text, encoding="utf-8")
-                else:
-                    target.write_text(load_asset(Path(path).name), encoding="utf-8")
-            _run_git(checkout, "add", *sorted(ONBOARDING_PATHS))
-            staged = set(
-                _run_git(checkout, "diff", "--cached", "--name-only").stdout.splitlines()
-            )
-            if staged != ONBOARDING_PATHS:
-                raise OnboardingError("onboarding commit does not contain the exact standard paths")
-            user = github.get_authenticated_user()
-            login = str(user.get("login", "codexctl"))
-            user_id = str(user.get("id", ""))
-            commit_env = {
-                "GIT_AUTHOR_NAME": login,
-                "GIT_COMMITTER_NAME": login,
-                "GIT_AUTHOR_EMAIL": f"{user_id}+{login}@users.noreply.github.com",
-                "GIT_COMMITTER_EMAIL": f"{user_id}+{login}@users.noreply.github.com",
-            }
-            _run_git(
-                checkout,
-                "commit",
-                "-m",
-                "chore: onboard repository to Codex Worker",
-                env=commit_env,
-            )
-            _run_git(
-                checkout,
-                "push",
-                "origin",
-                f"HEAD:refs/heads/{branch}",
-                env=auth_env,
-            )
+                _run_git(checkout, "switch", "-c", branch, f"refs/remotes/origin/{branch}")
+                changed = set(
+                    _run_git(
+                        checkout,
+                        "diff",
+                        "--name-only",
+                        f"{default_branch}...{branch}",
+                    ).stdout.splitlines()
+                )
+                if changed != ONBOARDING_PATHS:
+                    raise OnboardingError(
+                        f"remote branch {branch} does not contain the exact onboarding paths"
+                    )
+                for path in ONBOARDING_PATHS:
+                    expected = (
+                        project_text
+                        if path == ".codex-worker/project.toml"
+                        else load_asset(Path(path).name)
+                    )
+                    if (checkout / path).read_text(encoding="utf-8") != expected:
+                        raise OnboardingError(
+                            f"remote branch {branch} onboarding content differs: {path}"
+                        )
+            else:
+                _run_git(checkout, "switch", "-c", branch)
+                for path in ONBOARDING_PATHS:
+                    target = checkout / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if path == ".codex-worker/project.toml":
+                        target.write_text(project_text, encoding="utf-8")
+                    else:
+                        target.write_text(load_asset(Path(path).name), encoding="utf-8")
+                _run_git(checkout, "add", *sorted(ONBOARDING_PATHS))
+                staged = set(
+                    _run_git(checkout, "diff", "--cached", "--name-only").stdout.splitlines()
+                )
+                if staged != ONBOARDING_PATHS:
+                    raise OnboardingError(
+                        "onboarding commit does not contain the exact standard paths"
+                    )
+                user = github.get_authenticated_user()
+                login = str(user.get("login", "codexctl"))
+                user_id = str(user.get("id", ""))
+                commit_env = {
+                    "GIT_AUTHOR_NAME": login,
+                    "GIT_COMMITTER_NAME": login,
+                    "GIT_AUTHOR_EMAIL": f"{user_id}+{login}@users.noreply.github.com",
+                    "GIT_COMMITTER_EMAIL": f"{user_id}+{login}@users.noreply.github.com",
+                }
+                _run_git(
+                    checkout,
+                    "commit",
+                    "-m",
+                    "chore: onboard repository to Codex Worker",
+                    env=commit_env,
+                )
+                _run_git(
+                    checkout,
+                    "push",
+                    "origin",
+                    f"HEAD:refs/heads/{branch}",
+                    env=auth_env,
+                )
 
     pull = github.create_draft_pr(
         repo,
@@ -393,14 +434,11 @@ def _ruleset_valid(payload: dict[str, Any]) -> bool:
     if "~DEFAULT_BRANCH" not in conditions.get("include", []):
         return False
     bypass = payload.get("bypass_actors", [])
-    if any(item.get("actor_type") == "Integration" for item in bypass):
-        return False
-    if not any(
-        item.get("actor_type") == "RepositoryRole"
-        and item.get("actor_id") == 5
-        and item.get("bypass_mode") == "pull_request"
-        for item in bypass
-    ):
+    if len(bypass) != 1 or (
+        bypass[0].get("actor_type"),
+        bypass[0].get("actor_id"),
+        bypass[0].get("bypass_mode"),
+    ) != ("RepositoryRole", 5, "pull_request"):
         return False
     rules = {item.get("type"): item for item in payload.get("rules", [])}
     if not {"deletion", "non_fast_forward", "update", "pull_request"}.issubset(rules):
@@ -490,8 +528,7 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
                 except ProtocolError:
                     continue
                 if (
-                    probe.default_head != default_head
-                    or probe.project_config_hash != project_hash
+                    probe.project_config_hash != project_hash
                 ):
                     continue
                 for comment in reversed(
@@ -508,7 +545,7 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
                         continue
                     if (
                         attestation.probe_id == probe.probe_id
-                        and attestation.default_head == default_head
+                        and attestation.default_head == probe.default_head
                         and attestation.project_config_hash == project_hash
                     ):
                         worker_attested = True
@@ -642,6 +679,13 @@ def finalize_onboarding(
             reconciled = github.get_pull_request(reference.repo, reference.number)
             if not reconciled.get("merged_at"):
                 raise
+            reconciled_head = str(
+                reconciled.get("head", {}).get("sha", "")
+            ).lower()
+            if reconciled_head != expected_head.lower():
+                raise OnboardingError(
+                    "onboarding merge completed with an unexpected head"
+                )
 
     default_branch, default_head, project_hash, files_valid, blockers = (
         _default_repository_state(github, reference.repo)

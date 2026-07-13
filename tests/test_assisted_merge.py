@@ -54,7 +54,12 @@ class ReviewGitHub:
     def __init__(self) -> None:
         body = task_body()
         task_hash = parse_task_body(body).task_hash
-        self.issue = {"number": 12, "body": body}
+        self.issue = {
+            "number": 12,
+            "body": body,
+            "state": "open",
+            "labels": [{"name": "codex:awaiting-review"}],
+        }
         self.pull = {
             "number": 44,
             "html_url": "https://github.com/owner/repo/pull/44",
@@ -95,6 +100,7 @@ class ReviewGitHub:
         self.threads: list[dict] = []
         self.ruleset = ruleset_payload() | {"id": 1}
         self.default_head = "a" * 40
+        self.attested_head = "a" * 40
         self.writes: list[str] = []
         self.ready_calls = 0
         self.merge_payload: dict[str, str] | None = None
@@ -134,6 +140,21 @@ class ReviewGitHub:
             github.pull["head"]["ref"] = "feature/untrusted"
         elif mutation == "ruleset_drift":
             github.ruleset["enforcement"] = "disabled"
+        elif mutation == "missing_required_check":
+            github.ruleset["rules"].append(
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [{"context": "required-ci"}]
+                    },
+                }
+            )
+        elif mutation == "wrong_issue_state":
+            github.issue["state"] = "closed"
+        elif mutation == "credential_risk":
+            github.pull["body"] = github.pull["body"].replace(
+                "risks: []", "risks:\n- Requires production credentials"
+            )
         else:
             raise AssertionError(mutation)
         return github
@@ -144,7 +165,11 @@ class ReviewGitHub:
     def list_pull_requests(self, repo: str, *, state: str = "open", **kwargs: object) -> list[dict]:
         if state == "open" and self.pull.get("merged_at"):
             return []
-        return [deepcopy(self.pull)]
+        summary = deepcopy(self.pull)
+        summary.pop("mergeable", None)
+        summary.pop("merged_at", None)
+        summary.pop("merge_commit_sha", None)
+        return [summary]
 
     def get_pull_request(self, repo: str, pr_number: int) -> dict:
         return deepcopy(self.pull)
@@ -186,7 +211,7 @@ class ReviewGitHub:
                 "number": 99,
                 "body": render_repository_probe(
                     probe_id="probe-1",
-                    default_head=self.default_head,
+                    default_head=self.attested_head,
                     project_config_hash=config_hash,
                 ),
             }
@@ -207,7 +232,7 @@ class ReviewGitHub:
                 "body": render_repository_attestation(
                     probe_id="probe-1",
                     worker_id="mac-mini",
-                    default_head=self.default_head,
+                    default_head=self.attested_head,
                     project_config_hash=config_hash,
                     attested_at="2026-07-14T00:00:00+00:00",
                 ),
@@ -256,6 +281,14 @@ class ReviewGitHub:
         return {"id": len(self.comments)}
 
 
+def reviewed_fingerprint(github: ReviewGitHub) -> str:
+    from codex_mac_worker.assisted_merge import review_task
+
+    return review_task(
+        github, IssueReference("owner/repo", 12)
+    ).approval_fingerprint
+
+
 def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
     from codex_mac_worker.assisted_merge import review_task
 
@@ -267,6 +300,17 @@ def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
     assert snapshot.gates.allowed is True
     assert len(snapshot.approval_fingerprint) == 64
     assert snapshot.model == "gpt-test"
+
+
+def test_review_keeps_attested_worker_identity_after_default_branch_advances() -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.default_head = "d" * 40
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is True
 
 
 @pytest.mark.parametrize(
@@ -283,6 +327,9 @@ def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
         ("delivery_sha_drift", "delivery commit"),
         ("non_worker_branch", "codex/"),
         ("ruleset_drift", "Ruleset"),
+        ("missing_required_check", "required checks"),
+        ("wrong_issue_state", "Issue"),
+        ("credential_risk", "risks"),
     ],
 )
 def test_review_blocks_each_unsafe_state(mutation: str, blocker: str) -> None:
@@ -309,6 +356,7 @@ def test_merge_rechecks_head_and_writes_nothing_after_drift(tmp_path: Path) -> N
             state,
             IssueReference("owner/repo", 12),
             expected_head="c" * 40,
+            expected_fingerprint="f" * 64,
         )
     state.close()
 
@@ -320,12 +368,14 @@ def test_merge_approves_squashes_and_records_audit(tmp_path: Path) -> None:
     from codex_mac_worker.control_state import ControlState
 
     github = ReviewGitHub.happy_path()
+    fingerprint = reviewed_fingerprint(github)
     state = ControlState(tmp_path / "state.db")
     result = merge_task(
         github,
         state,
         IssueReference("owner/repo", 12),
         expected_head="c" * 40,
+        expected_fingerprint=fingerprint,
     )
     state.close()
 
@@ -340,12 +390,15 @@ def test_merge_is_idempotent_after_confirmed_success(tmp_path: Path) -> None:
     from codex_mac_worker.control_state import ControlState
 
     github = ReviewGitHub.happy_path()
+    fingerprint = reviewed_fingerprint(github)
     state = ControlState(tmp_path / "state.db")
     first = merge_task(
-        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40
+        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
+        expected_fingerprint=fingerprint,
     )
     second = merge_task(
-        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40
+        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
+        expected_fingerprint=fingerprint,
     )
     state.close()
 
@@ -365,12 +418,68 @@ def test_merge_reconciles_uncertain_response_without_retrying(tmp_path: Path) ->
             raise RuntimeError("connection dropped after GitHub accepted merge")
 
     github = UncertainGitHub()
+    fingerprint = reviewed_fingerprint(github)
     state = ControlState(tmp_path / "state.db")
     result = merge_task(
-        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40
+        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
+        expected_fingerprint=fingerprint,
     )
     state.close()
 
     assert result.merged is True
     assert result.merge_commit_sha == "e" * 40
     assert github.writes.count("merge") == 1
+
+
+def test_merge_recovers_after_audit_comment_failure(tmp_path: Path) -> None:
+    from codex_mac_worker.assisted_merge import merge_task
+    from codex_mac_worker.control_state import ControlState
+
+    class AuditFailureGitHub(ReviewGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_audit_once = True
+
+        def add_comment(self, repo: str, issue_number: int, body: str) -> dict:
+            if issue_number == 44 and self.fail_audit_once:
+                self.fail_audit_once = False
+                raise RuntimeError("comment connection failed")
+            return super().add_comment(repo, issue_number, body)
+
+    github = AuditFailureGitHub()
+    fingerprint = reviewed_fingerprint(github)
+    state = ControlState(tmp_path / "state.db")
+    with pytest.raises(RuntimeError, match="comment connection failed"):
+        merge_task(
+            github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
+            expected_fingerprint=fingerprint,
+        )
+
+    result = merge_task(
+        github, state, IssueReference("owner/repo", 12), expected_head="c" * 40,
+        expected_fingerprint=fingerprint,
+    )
+    state.close()
+
+    assert result.merged is True
+    assert github.writes.count("merge") == 1
+    assert len(github.comments) == 1
+
+
+def test_merge_rejects_stale_fingerprint_before_any_write(tmp_path: Path) -> None:
+    from codex_mac_worker.assisted_merge import MergeBlocked, merge_task
+    from codex_mac_worker.control_state import ControlState
+
+    github = ReviewGitHub.happy_path()
+    state = ControlState(tmp_path / "state.db")
+    with pytest.raises(MergeBlocked, match="fingerprint"):
+        merge_task(
+            github,
+            state,
+            IssueReference("owner/repo", 12),
+            expected_head="c" * 40,
+            expected_fingerprint="f" * 64,
+        )
+    state.close()
+
+    assert github.writes == []

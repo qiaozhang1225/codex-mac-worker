@@ -81,6 +81,11 @@ class MergeResult:
 
 APPROVAL_MARKER = "<!-- codex-human-approval:v1 -->"
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_UNSAFE_RISK_RE = re.compile(
+    r"\b(high|credential|secret|password|production|deploy|migration|irreversible)\b|"
+    r"高风险|凭据|密钥|生产|部署|迁移|不可逆",
+    re.IGNORECASE,
+)
 
 
 def evaluate_merge_gates(blockers: Iterable[str]) -> GateResult:
@@ -128,7 +133,12 @@ def _matching_delivery(github: Any, reference: IssueReference) -> tuple[dict[str
         raise AssistedMergeError(
             f"expected exactly one open Worker PR for Issue #{reference.number}; found {len(matches)}"
         )
-    return matches[0]
+    summary, _ = matches[0]
+    pull = github.get_pull_request(reference.repo, int(summary["number"]))
+    delivery = parse_delivery_block(str(pull.get("body", "")))
+    if delivery.issue_number != reference.number:
+        raise AssistedMergeError("full PR delivery metadata changed during review")
+    return pull, delivery
 
 
 def _authoritative_worker_login(github: Any, repo: str) -> str | None:
@@ -147,7 +157,7 @@ def _authoritative_worker_login(github: Any, repo: str) -> str | None:
             probe = parse_repository_probe(body)
         except ProtocolError:
             continue
-        if probe.default_head != default_head or probe.project_config_hash != project_hash:
+        if probe.project_config_hash != project_hash:
             continue
         for comment in reversed(github.list_comments(repo, int(issue["number"]))):
             comment_body = str(comment.get("body", ""))
@@ -163,7 +173,7 @@ def _authoritative_worker_login(github: Any, repo: str) -> str | None:
                 continue
             if (
                 attestation.probe_id == probe.probe_id
-                and attestation.default_head == default_head
+                and attestation.default_head == probe.default_head
                 and attestation.project_config_hash == project_hash
             ):
                 login = str(user.get("login", ""))
@@ -204,8 +214,10 @@ def _collect_checks(
     blockers: list[str],
 ) -> tuple[dict[str, str], ...]:
     checks: list[dict[str, str]] = []
+    observed: set[str] = set()
     for item in github.list_check_runs(repo, head_sha):
         name = str(item.get("name", ""))
+        observed.add(name)
         status = str(item.get("status") or "")
         conclusion = str(item.get("conclusion") or "")
         checks.append({"name": name, "status": status, "conclusion": conclusion})
@@ -222,10 +234,14 @@ def _collect_checks(
     status_payload = github.get_combined_status(repo, head_sha)
     for item in status_payload.get("statuses", []):
         name = str(item.get("context", ""))
+        observed.add(name)
         state = str(item.get("state") or "")
         checks.append({"name": name, "status": "completed" if state == "success" else state, "conclusion": state})
         if state != "success":
             blockers.append(f"checks: legacy status {name or 'unnamed status'} is {state or 'pending'}")
+    missing = sorted(required - observed)
+    if missing:
+        blockers.append("required checks are missing: " + ", ".join(missing))
     return tuple(checks)
 
 
@@ -234,6 +250,15 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
     spec = parse_task_body(str(issue.get("body", "")))
     pull, delivery = _matching_delivery(github, reference)
     blockers: list[str] = []
+    if issue.get("state") != "open":
+        blockers.append("Issue must remain open while awaiting review")
+    status_labels: set[str] = set()
+    for item in issue.get("labels", []):
+        label = str(item.get("name", "")) if isinstance(item, dict) else str(item)
+        if label.startswith("codex:"):
+            status_labels.add(label)
+    if status_labels != {"codex:awaiting-review"}:
+        blockers.append("Issue must have exactly the codex:awaiting-review lifecycle label")
 
     base = pull.get("base", {})
     head = pull.get("head", {})
@@ -317,6 +342,8 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
                 blockers.append(f"acceptance criterion still needs review: {criterion}")
     if delivery.needs_human:
         blockers.append("human dependencies remain unresolved")
+    if any(_UNSAFE_RISK_RE.search(item) for item in delivery.risks):
+        blockers.append("delivery risks mention high-risk or operational work")
 
     fingerprint = approval_fingerprint(
         repo=reference.repo,
@@ -382,7 +409,9 @@ def _delivery_pulls(github: Any, reference: IssueReference) -> list[dict[str, An
         except ProtocolError:
             continue
         if delivery.issue_number == reference.number:
-            matches.append(pull)
+            matches.append(
+                github.get_pull_request(reference.repo, int(pull["number"]))
+            )
     return matches
 
 
@@ -396,6 +425,61 @@ def _merge_result(raw: dict[str, Any]) -> MergeResult:
         actor_login=str(raw["actor_login"]),
         approval_fingerprint=str(raw["approval_fingerprint"]),
         merged=bool(raw["merged"]),
+    )
+
+
+def _snapshot_for_audit(
+    github: Any,
+    reference: IssueReference,
+    pull: dict[str, Any],
+) -> ReviewSnapshot:
+    spec = parse_task_body(
+        str(github.get_issue(reference.repo, reference.number).get("body", ""))
+    )
+    delivery = parse_delivery_block(str(pull.get("body", "")))
+    base = pull.get("base", {})
+    head = pull.get("head", {})
+    base_sha = str(base.get("sha", "")).lower()
+    head_sha = str(head.get("sha", "")).lower()
+    if (
+        delivery.issue_number != reference.number
+        or delivery.task_hash != spec.task_hash
+        or delivery.context_commit != spec.context_commit
+        or delivery.delivery_commit != head_sha
+    ):
+        raise MergeBlocked("merged PR metadata no longer matches the frozen task")
+    fingerprint = approval_fingerprint(
+        repo=reference.repo,
+        issue_number=reference.number,
+        pr_number=int(pull["number"]),
+        task_hash=spec.task_hash,
+        context_commit=spec.context_commit,
+        base_sha=base_sha,
+        head_sha=head_sha,
+    )
+    return ReviewSnapshot(
+        repo=reference.repo,
+        issue_number=reference.number,
+        pr_number=int(pull["number"]),
+        pr_url=str(pull.get("html_url", "")),
+        base_branch=str(base.get("ref", "")),
+        base_sha=base_sha,
+        head_sha=head_sha,
+        is_draft=bool(pull.get("draft")),
+        task_hash=spec.task_hash,
+        context_commit=spec.context_commit,
+        changed_paths=(),
+        additions=0,
+        deletions=0,
+        checks=(),
+        acceptance_results=delivery.acceptance_results,
+        model=delivery.model,
+        cli_version=delivery.cli_version,
+        risks=delivery.risks,
+        needs_human=delivery.needs_human,
+        unresolved_threads=(),
+        gates=GateResult(True, ()),
+        approval_fingerprint=fingerprint,
     )
 
 
@@ -424,10 +508,14 @@ def merge_task(
     reference: IssueReference,
     *,
     expected_head: str,
+    expected_fingerprint: str,
 ) -> MergeResult:
     expected_head = expected_head.lower()
+    expected_fingerprint = expected_fingerprint.lower()
     if not _FULL_SHA_RE.fullmatch(expected_head):
         raise MergeBlocked("expected_head must be a full 40-character Git SHA")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint):
+        raise MergeBlocked("expected_fingerprint must be a full 64-character hash")
 
     candidates = _delivery_pulls(github, reference)
     if len(candidates) != 1:
@@ -437,21 +525,58 @@ def merge_task(
     candidate = candidates[0]
     pr_number = int(candidate["number"])
     current_head = str(candidate.get("head", {}).get("sha", "")).lower()
-    key = operation_id("task-merge", f"{reference.repo}#{pr_number}", expected_head)
+    key = operation_id(
+        "task-merge",
+        f"{reference.repo}#{pr_number}:{expected_fingerprint}",
+        expected_head,
+    )
     existing = state.get(key)
     merged_at = candidate.get("merged_at")
     if existing is not None and existing["state"] == "completed":
         if not merged_at or current_head != expected_head:
             raise MergeBlocked("completed merge ledger does not match GitHub state")
-        return _merge_result(existing["result"])
+        completed = _merge_result(existing["result"])
+        if completed.approval_fingerprint != expected_fingerprint:
+            raise MergeBlocked("completed merge fingerprint does not match approval")
+        return completed
     if current_head != expected_head:
         raise MergeBlocked("approval expired because the PR head changed")
     if merged_at and existing is None:
         raise MergeBlocked("PR was already merged outside this approval operation")
+    if merged_at and existing is not None:
+        user = github.get_authenticated_user()
+        actor_login = str(user.get("login", ""))
+        permission = github.collaborator_permission(reference.repo, actor_login)
+        approved = any(
+            str(review.get("state", "")).upper() == "APPROVED"
+            and str(review.get("user", {}).get("login", "")) == actor_login
+            and str(review.get("commit_id", "")).lower() == expected_head
+            for review in github.list_reviews(reference.repo, pr_number)
+        )
+        if permission not in {"admin", "maintain"} or not approved:
+            raise MergeBlocked("unable to reconcile the original approved merge actor")
+        snapshot = _snapshot_for_audit(github, reference, candidate)
+        if snapshot.approval_fingerprint != expected_fingerprint:
+            raise MergeBlocked("approval fingerprint no longer matches the merged PR")
+        result = MergeResult(
+            repo=reference.repo,
+            issue_number=reference.number,
+            pr_number=pr_number,
+            approved_head=expected_head,
+            merge_commit_sha=str(candidate.get("merge_commit_sha", "")),
+            actor_login=actor_login,
+            approval_fingerprint=snapshot.approval_fingerprint,
+            merged=True,
+        )
+        _audit_once(github, snapshot, actor_login)
+        state.complete(key, asdict(result))
+        return result
 
     snapshot = review_task(github, reference)
     if snapshot.head_sha != expected_head:
         raise MergeBlocked("approval expired because the PR head changed")
+    if snapshot.approval_fingerprint != expected_fingerprint:
+        raise MergeBlocked("approval fingerprint no longer matches the reviewed task")
     if not snapshot.gates.allowed:
         raise MergeBlocked("merge gates blocked: " + "; ".join(snapshot.gates.blockers))
 
@@ -466,7 +591,7 @@ def merge_task(
     state.begin(
         key,
         "task-merge",
-        f"{reference.repo}#{pr_number}",
+        f"{reference.repo}#{pr_number}:{expected_fingerprint}",
         expected_head,
     )
 
@@ -475,6 +600,8 @@ def merge_task(
         snapshot = review_task(github, reference)
         if snapshot.head_sha != expected_head:
             raise MergeBlocked("approval expired because the PR head changed after Ready")
+        if snapshot.approval_fingerprint != expected_fingerprint:
+            raise MergeBlocked("approval fingerprint changed after Ready")
         if not snapshot.gates.allowed:
             raise MergeBlocked(
                 "merge gates blocked after Ready: " + "; ".join(snapshot.gates.blockers)

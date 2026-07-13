@@ -35,4 +35,4 @@ codexctl task merge --help
 
 先运行 `codexctl repo status OWNER/REPO`。未接入时用 `codexctl repo onboard --repo OWNER/REPO --project-config project.toml` 创建接入 PR；只有明确批准该 PR 后，才运行 `codexctl repo finalize OWNER/REPO#PR --expected-head SHA`。`awaiting-worker` 表示默认分支已配置、正在等待 Mac mini 探针证明访问能力；变为 `ready` 后才能派单。
 
-Worker 交付后先运行 `codexctl task review ISSUE_URL`。它只读并显示门禁与审批指纹。只有针对当前 PR 和当前 head SHA 的 explicit approval，才能运行 `codexctl task merge ISSUE_URL --expected-head SHA`。设计通过、仓库级授权、旧对话或任何 future PR 授权都无效。
+Worker 交付后先运行 `codexctl task review ISSUE_URL`。它只读并显示门禁与审批指纹。只有针对当前 PR、head SHA 和 fingerprint 的 explicit approval，才能运行 `codexctl task merge ISSUE_URL --expected-head SHA --expected-fingerprint FINGERPRINT`。设计通过、仓库级授权、旧对话或任何 future PR 授权都无效。

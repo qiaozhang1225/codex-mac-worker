@@ -172,7 +172,7 @@ codex:cancelled
 
 ```text
 codexctl task review ISSUE_URL
-codexctl task merge ISSUE_URL --expected-head SHA
+codexctl task merge ISSUE_URL --expected-head SHA --expected-fingerprint FINGERPRINT
 ```
 
 `task review` 只读；`task merge` 只在对话层收到当前 PR 的明确批准后执行。
@@ -209,7 +209,7 @@ codexctl task merge ISSUE_URL --expected-head SHA
 
 1. PR 来源分支为 `codex/*`，且由已授权 Worker 身份创建或更新。
 2. PR 与唯一的 Worker Issue、任务哈希和 context commit 一致。
-3. 当前 head SHA 等于 `--expected-head`，并等于用户看到的审查摘要。
+3. 当前 head SHA 等于 `--expected-head`，审批指纹等于 `--expected-fingerprint`，两者都等于用户看到的审查摘要。
 4. PR 已不再是 Draft，或命令在复核成功后先将其标记为 Ready for review。
 5. GitHub Checks 全部通过，required checks 没有 pending、skipped 异常或 failure。
 6. Worker 记录的仓库验证命令全部成功。

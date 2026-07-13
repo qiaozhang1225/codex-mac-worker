@@ -32,6 +32,7 @@ def test_dispatch_skill_enforces_human_confirmed_bounded_tasks() -> None:
         "codexctl task review",
         "codexctl task merge",
         "expected-head",
+        "expected-fingerprint",
         "head SHA",
         "explicit",
         "future PR",

@@ -37,10 +37,15 @@ def test_task_review_returns_two_when_gates_block(monkeypatch, capsys) -> None:
 def test_ctl_parser_requires_full_head_for_task_merge() -> None:
     parser = build_ctl_parser()
     args = parser.parse_args(
-        ["task", "merge", "owner/repo#12", "--expected-head", "c" * 40]
+        [
+            "task", "merge", "owner/repo#12",
+            "--expected-head", "c" * 40,
+            "--expected-fingerprint", "f" * 64,
+        ]
     )
 
     assert args.expected_head == "c" * 40
+    assert args.expected_fingerprint == "f" * 64
 
 
 def test_task_merge_uses_local_operation_ledger(monkeypatch, tmp_path, capsys) -> None:
@@ -51,8 +56,12 @@ def test_task_merge_uses_local_operation_ledger(monkeypatch, tmp_path, capsys) -
     monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
     seen: dict = {}
 
-    def fake_merge(github, state, reference, *, expected_head):
-        seen.update(reference=reference, expected_head=expected_head)
+    def fake_merge(github, state, reference, *, expected_head, expected_fingerprint):
+        seen.update(
+            reference=reference,
+            expected_head=expected_head,
+            expected_fingerprint=expected_fingerprint,
+        )
         return MergeResult(
             repo=reference.repo,
             issue_number=reference.number,
@@ -67,9 +76,14 @@ def test_task_merge_uses_local_operation_ledger(monkeypatch, tmp_path, capsys) -
     monkeypatch.setattr(cli, "merge_task", fake_merge)
 
     assert ctl_main(
-        ["task", "merge", "owner/repo#12", "--expected-head", "c" * 40]
+        [
+            "task", "merge", "owner/repo#12",
+            "--expected-head", "c" * 40,
+            "--expected-fingerprint", "f" * 64,
+        ]
     ) == 0
     assert seen["reference"].number == 12
+    assert seen["expected_fingerprint"] == "f" * 64
     assert json.loads(capsys.readouterr().out)["merged"] is True
 
 

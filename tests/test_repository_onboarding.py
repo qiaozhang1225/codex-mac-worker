@@ -49,10 +49,18 @@ class OnboardingGitHub:
             "number": pr_number,
             "html_url": f"https://github.com/{repo}/pull/{pr_number}",
             "draft": True,
+            "state": "open",
             "mergeable": True,
-            "base": {"ref": "main", "sha": "a" * 40},
-            "head": {"ref": "codex/onboard-worker", "sha": "b" * 40},
+            "base": {"ref": "main", "sha": "a" * 40, "repo": {"full_name": repo}},
+            "head": {
+                "ref": "codex/onboard-worker",
+                "sha": "b" * 40,
+                "repo": {"full_name": repo},
+            },
         }
+
+    def get_repository(self, repo: str) -> dict:
+        return {"default_branch": "main"}
 
     def list_pull_files(self, repo: str, pr_number: int) -> list[dict]:
         files = [{"filename": path, "status": "added"} for path in sorted(ONBOARDING_PATHS)]
@@ -92,6 +100,17 @@ def test_onboarding_snapshot_rejects_standard_asset_drift() -> None:
         inspect_onboarding_pr(OnboardingGitHub(asset_drift=True), "owner/repo", 1)
 
 
+def test_onboarding_snapshot_rejects_foreign_head_repository() -> None:
+    class ForeignHeadGitHub(OnboardingGitHub):
+        def get_pull_request(self, repo: str, pr_number: int) -> dict:
+            pull = super().get_pull_request(repo, pr_number)
+            pull["head"]["repo"]["full_name"] = "attacker/fork"
+            return pull
+
+    with pytest.raises(OnboardingError, match="same repository"):
+        inspect_onboarding_pr(ForeignHeadGitHub(), "owner/repo", 1)
+
+
 def test_project_config_renderer_requires_explicit_fast_commands() -> None:
     with pytest.raises(OnboardingError, match="fast verification"):
         render_project_config(default_branch="main", fast_commands=(), full_commands=())
@@ -118,6 +137,7 @@ class FinalizeGitHub(OnboardingGitHub):
         self.rulesets: list[dict] = []
         self.issues: list[dict] = []
         self.comments: dict[int, list[dict]] = {}
+        self.default_head = "c" * 40
 
     def get_pull_request(self, repo: str, pr_number: int) -> dict:
         payload = super().get_pull_request(repo, pr_number)
@@ -146,7 +166,7 @@ class FinalizeGitHub(OnboardingGitHub):
         return {"full_name": repo, "default_branch": "main"}
 
     def get_commit(self, repo: str, ref: str) -> dict:
-        return {"sha": "c" * 40}
+        return {"sha": self.default_head}
 
     def list_labels(self, repo: str) -> list[dict]:
         return list(self.labels.values())
@@ -236,6 +256,26 @@ def test_finalize_merges_reconciles_policy_and_creates_one_probe(tmp_path: Path)
     assert len(github.issues) == 1
 
 
+def test_finalize_rejects_uncertain_merge_with_changed_head(tmp_path: Path) -> None:
+    class UncertainGitHub(FinalizeGitHub):
+        def merge_pull_request(
+            self, repo: str, pr_number: int, *, expected_head: str
+        ) -> dict:
+            self.writes.append("merge")
+            self.merged = True
+            self.head_sha = "d" * 40
+            raise RuntimeError("connection dropped")
+
+    github = UncertainGitHub()
+    with pytest.raises(OnboardingError, match="head"):
+        finalize_onboarding(
+            github,
+            ControlState(tmp_path / "state.db"),
+            PullRequestReference("owner/repo", 1),
+            expected_head="b" * 40,
+        )
+
+
 def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> None:
     github = FinalizeGitHub()
     github.merged = True
@@ -270,6 +310,18 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
     assert report.phase == "ready"
     assert report.worker_attested is True
     assert report.worker_login == "coworker-app[bot]"
+
+    github.default_head = "d" * 40
+    after_product_merge = repository_status(github, "owner/repo")
+    assert after_product_merge.phase == "ready"
+    assert after_product_merge.worker_login == "coworker-app[bot]"
+
+    github.rulesets[0]["bypass_actors"].append(
+        {"actor_id": 123, "actor_type": "User", "bypass_mode": "always"}
+    )
+    unsafe_bypass = repository_status(github, "owner/repo")
+    assert unsafe_bypass.phase == "blocked"
+    assert unsafe_bypass.ruleset_valid is False
 
 
 def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: Path) -> None:
@@ -312,11 +364,17 @@ def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: P
                 "number": 1,
                 "html_url": "https://github.com/owner/repo/pull/1",
                 "draft": True,
+                "state": "open",
                 "mergeable": True,
-                "base": {"ref": "main", "sha": self._git("rev-parse", "main")},
+                "base": {
+                    "ref": "main",
+                    "sha": self._git("rev-parse", "main"),
+                    "repo": {"full_name": repo},
+                },
                 "head": {
                     "ref": "codex/onboard-worker",
                     "sha": self._git("rev-parse", "codex/onboard-worker"),
+                    "repo": {"full_name": repo},
                 },
             }
 
@@ -347,3 +405,11 @@ def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: P
 
     assert snapshot.changed_paths == tuple(sorted(ONBOARDING_PATHS))
     assert snapshot.head_branch == "codex/onboard-worker"
+
+    recovered = prepare_onboarding(
+        LocalGitHub(),
+        "owner/repo",
+        project_config_path=project,
+        token="not-used-by-local-remote",
+    )
+    assert recovered.head_sha == snapshot.head_sha

@@ -35,6 +35,12 @@ def full_sha(value: str) -> str:
     return value.lower()
 
 
+def full_hash(value: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdefABCDEF" for character in value):
+        raise argparse.ArgumentTypeError("expected a full 64-character approval fingerprint")
+    return value.lower()
+
+
 def personal_github_token() -> str:
     token = os.environ.get("GITHUB_TOKEN")
     if token:
@@ -99,6 +105,7 @@ def build_ctl_parser() -> argparse.ArgumentParser:
     merge = actions.add_parser("merge")
     merge.add_argument("reference")
     merge.add_argument("--expected-head", required=True, type=full_sha)
+    merge.add_argument("--expected-fingerprint", required=True, type=full_hash)
 
     repo = top.add_parser("repo")
     repo_actions = repo.add_subparsers(dest="action", required=True)
@@ -174,6 +181,7 @@ def ctl_main(argv: Sequence[str] | None = None) -> int:
                 state,
                 IssueReference(repo, issue_number),
                 expected_head=args.expected_head,
+                expected_fingerprint=args.expected_fingerprint,
             )
         finally:
             state.close()

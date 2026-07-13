@@ -65,9 +65,9 @@ codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 
 ```bash
 codexctl task review ISSUE_URL
-codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA
+codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA --expected-fingerprint APPROVAL_FINGERPRINT
 ```
 
-`task review` 永远只读。展示 Checks、测试证据、acceptance、风险、review threads、审批指纹和 head SHA 后停止。明确批准当前 PR/head 才执行 merge；SHA、Checks 或 Ruleset 改变就必须重新 review 和批准。不存在 automatic merge、仓库级永久批准或 future PR 授权。
+`task review` 永远只读。展示 Checks、测试证据、acceptance、风险、review threads、审批指纹和 head SHA 后停止。明确批准当前 PR/head/fingerprint 才执行 merge；任一值、Checks 或 Ruleset 改变就必须重新 review 和批准。不存在 automatic merge、仓库级永久批准或 future PR 授权。
 
 MacBook 使用个人 `gh` token 做 review/approval/squash merge；Mac mini 不持有该 token。

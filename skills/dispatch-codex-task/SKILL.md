@@ -68,7 +68,7 @@ A revision stays bounded on the original branch and Draft PR.
 2. Stop. Only explicit approval naming that PR or current snapshot authorizes:
 
    ```bash
-   codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA
+   codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA --expected-fingerprint APPROVAL_FINGERPRINT
    ```
 
 3. Any SHA, check, task, thread, or Ruleset change requires fresh review and approval.

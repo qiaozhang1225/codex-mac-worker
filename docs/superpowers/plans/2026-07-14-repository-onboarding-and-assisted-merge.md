@@ -13,7 +13,7 @@
 - Do not use Codex Goal/“目标” mode anywhere in code, documentation, tests, or rollout.
 - The Worker never calls the merge API and never receives the MacBook user's GitHub credential.
 - A merge authorization applies to one repository, one PR, one task hash, and one 40-character head SHA.
-- `--expected-head` is mandatory for `repo finalize` and `task merge`; remote drift invalidates approval.
+- `--expected-head` is mandatory for `repo finalize` and `task merge`; `task merge` also requires the displayed `--expected-fingerprint`. Remote metadata drift invalidates approval.
 - Onboarding PRs may modify only `.codex-worker/project.toml`, `.github/ISSUE_TEMPLATE/codex-task.yml`, and `.github/workflows/codex-worker-watchdog.yml`.
 - Worker discovery accepts only repositories returned by the configured GitHub App installation and having a valid schema-version-1 project configuration on the default branch.
 - Normal task merge gates reject high risk, protected/out-of-scope paths, excessive file/line counts, failed or pending checks, conflicts, unresolved review threads, and stale task metadata.
@@ -895,7 +895,7 @@ git commit -m "feat: add immutable Worker PR review gates"
 
 **Interfaces:**
 - Produces: `merge_task(...) -> MergeResult` and `render_approval_audit(...)`.
-- Produces CLI: `codexctl task merge ISSUE_URL --expected-head SHA`.
+- Produces CLI: `codexctl task merge ISSUE_URL --expected-head SHA --expected-fingerprint FINGERPRINT`.
 - Consumes: `review_task`, `ControlState`, authenticated user identity, and merge API from Task 2.
 
 - [ ] **Step 1: Write failing stale-approval and successful-merge tests**
@@ -937,7 +937,7 @@ Render marker `<!-- codex-human-approval:v1 -->` with schema version, approval f
 
 - [ ] **Step 5: Add the CLI command with mandatory SHA validation**
 
-`argparse` must reject a missing `--expected-head`; runtime must reject anything not matching `[0-9a-fA-F]{40}` before obtaining a token or contacting GitHub. The CLI must not contain `--yes`, `--latest`, `--force`, or repository-wide approval options for merge.
+`argparse` must reject a missing `--expected-head` or `--expected-fingerprint`; runtime validates a 40-character SHA and 64-character fingerprint before obtaining a token or contacting GitHub. The CLI must not contain `--yes`, `--latest`, `--force`, or repository-wide approval options for merge.
 
 - [ ] **Step 6: Run merge tests and ensure Worker imports no merge method**
 

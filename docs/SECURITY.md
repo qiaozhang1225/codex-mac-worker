@@ -9,7 +9,7 @@
 - Worker 在 commit 前检查 Git HEAD、允许路径、敏感路径、文件数、diff 行数、密钥特征和大型二进制文件。
 - Worker 只 push `codex/*` 任务分支并创建 Draft PR；Ruleset 是阻止主线 push、merge 和 force push 的最终边界。
 - Codex 不负责 commit、push、PR、部署或 merge。Worker App 以 Contents/Issues/Pull requests 写权限创建分支和产物，但 Ruleset 阻止它更新默认分支；Worker 永不调用 merge API。
-- MacBook 的个人 `gh` token 不进入 Mac mini。`codexctl task merge` 只接受当前 PR 的 explicit approval 和完整 `--expected-head`；接入 bootstrap 是唯一允许自审的例外。
+- MacBook 的个人 `gh` token 不进入 Mac mini。`codexctl task merge` 只接受当前 PR 的 explicit approval、完整 `--expected-head` 和 `--expected-fingerprint`；接入 bootstrap 是唯一允许自审的例外。
 - Goal/“目标”模式、生产部署、automatic merge、仓库级永久批准和任何 future PR 授权都被排除。
 - FileVault 关闭是冷启动无人值守的已锁定取舍，因此必须依赖物理安全、最小仓库授权和本地私钥权限降低风险。
 - GitHub Watchdog 只评论告警，不领取、恢复或重复执行任务。
