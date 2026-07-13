@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 import yaml
 
 from .config import (
+    ProjectConfig,
     RepositoryConfig,
     WorkerConfig,
     load_project_config,
@@ -187,6 +188,35 @@ class WorkerService:
                 "project Codex config is forbidden because it can override Worker permissions"
             )
 
+    def _validate_project_worker_app(self, project: ProjectConfig) -> None:
+        if project.worker_github_app_id != int(self.config.github_app_id):
+            raise PolicyError(
+                "project config is not bound to this trusted GitHub App"
+            )
+
+    def validate_repository_authority(
+        self, repository: RepositoryConfig
+    ) -> ProjectConfig:
+        payload = self.github.get_repository(repository.name)
+        default_branch = str(payload.get("default_branch", ""))
+        if not default_branch:
+            raise PolicyError("repository default branch is missing")
+        current_head = str(
+            self.github.get_commit(repository.name, default_branch).get("sha", "")
+        ).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", current_head):
+            raise PolicyError("repository default branch head is invalid")
+        project_text = self.github.get_repository_file(
+            repository.name,
+            ".codex-worker/project.toml",
+            ref=current_head,
+        )
+        project = parse_project_config(project_text)
+        if project.default_base_branch != default_branch:
+            raise PolicyError("project config default branch does not match repository")
+        self._validate_project_worker_app(project)
+        return project
+
     def _validate_issue_author(self, repo: str, issue: dict[str, Any]) -> None:
         author = str(issue.get("user", {}).get("login", ""))
         permission = self.github.collaborator_permission(repo, author) if author else "none"
@@ -219,6 +249,7 @@ class WorkerService:
             project = parse_project_config(project_text)
             if project.default_base_branch != default_branch:
                 raise PolicyError("project config default branch does not match repository")
+            self._validate_project_worker_app(project)
             config_hash = hashlib.sha256(project_text.encode("utf-8")).hexdigest()
             if config_hash != probe.project_config_hash:
                 raise PolicyError("repository probe project config changed")
@@ -414,6 +445,7 @@ This PR was created as a draft. The worker cannot merge it.
         try:
             self._validate_issue_author(repo, issue)
             spec = parse_task_body(str(issue.get("body", "")))
+            self.validate_repository_authority(repository)
             task_hash = spec.task_hash
             branch = f"codex/{number}-{_slug(str(issue.get('title', 'task')))}"
             self.store.upsert_task(
@@ -449,6 +481,7 @@ This PR was created as a draft. The worker cannot merge it.
             )
             branch = prepared.branch
             project_config = load_project_config(prepared.path / ".codex-worker/project.toml")
+            self._validate_project_worker_app(project_config)
             self._validate_runtime_policy(prepared.path)
             validate_task_policy(spec, project_config)
             self._validate_context_files(prepared.path, spec.context_files)
@@ -684,6 +717,7 @@ This PR was created as a draft. The worker cannot merge it.
             self._validate_delivery_diff(
                 prepared.path, prepared.baseline_head, spec, project_config
             )
+            self.validate_repository_authority(repository)
 
             commit_sha = self.git.commit(
                 prepared.path,
@@ -752,6 +786,7 @@ This PR was created as a draft. The worker cannot merge it.
         branch = str(task.get("branch") or "")
         try:
             spec = parse_task_body(str(issue.get("body", "")))
+            self.validate_repository_authority(repository)
             if spec.task_hash != task_hash:
                 raise PolicyError("task body changed after claim")
             if not requirements:
@@ -768,6 +803,7 @@ This PR was created as a draft. The worker cannot merge it.
                 raise PolicyError("revision worktree has uncommitted changes")
 
             project_config = load_project_config(worktree / ".codex-worker/project.toml")
+            self._validate_project_worker_app(project_config)
             self._validate_runtime_policy(worktree)
             validate_task_policy(spec, project_config)
             self._validate_context_files(worktree, spec.context_files)
@@ -1021,6 +1057,7 @@ This PR was created as a draft. The worker cannot merge it.
             if parse_task_body(str(latest_issue.get("body", ""))).task_hash != task_hash:
                 raise PolicyError("task body changed during revision")
             self._validate_delivery_diff(worktree, baseline_head, spec, project_config)
+            self.validate_repository_authority(repository)
             commit_sha = self.git.commit(
                 worktree,
                 f"fix: revise codex task #{number}",

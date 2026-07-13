@@ -151,6 +151,7 @@ def _authoritative_worker_identity(
     project_text = github.get_repository_file(
         repo, ".codex-worker/project.toml", ref=default_head
     )
+    project = parse_project_config(project_text)
     project_hash = hashlib.sha256(project_text.encode("utf-8")).hexdigest()
     for issue in reversed(github.list_issues(repo, state="all")):
         body = str(issue.get("body", ""))
@@ -178,11 +179,16 @@ def _authoritative_worker_identity(
                 attestation.probe_id == probe.probe_id
                 and attestation.default_head == probe.default_head
                 and attestation.project_config_hash == project_hash
-            ):
-                login = str(user.get("login", ""))
-                app_id = comment.get("performed_via_github_app", {}).get("id")
-                if login and isinstance(app_id, int) and app_id > 0:
-                    return login, app_id
+                ):
+                    login = str(user.get("login", ""))
+                    app_metadata = comment.get("performed_via_github_app")
+                    app_id = (
+                        app_metadata.get("id")
+                        if isinstance(app_metadata, dict)
+                        else None
+                    )
+                    if login and app_id == project.worker_github_app_id:
+                        return login, app_id
     return None
 
 
@@ -277,9 +283,16 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         blockers.append("source branch must begin with codex/")
     worker_identity = _authoritative_worker_identity(github, reference.repo)
     author_login = str(pull.get("user", {}).get("login", ""))
-    pull_app_id = pull.get("performed_via_github_app", {}).get("id")
+    pull_app_metadata = pull.get("performed_via_github_app")
+    pull_app_id = (
+        pull_app_metadata.get("id")
+        if isinstance(pull_app_metadata, dict)
+        else None
+    )
     if worker_identity is None:
-        blockers.append("Worker identity has no current readiness attestation")
+        blockers.append(
+            "Worker identity has no current attestation from the trusted Worker GitHub App"
+        )
     else:
         worker_login, worker_app_id = worker_identity
         if author_login != worker_login:

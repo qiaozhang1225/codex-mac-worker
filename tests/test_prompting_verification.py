@@ -63,8 +63,9 @@ def test_run_verification_uses_only_configured_commands(tmp_path: Path) -> None:
     config_path = tmp_path / "project.toml"
     config_path.write_text(
         f"""
-schema_version = 1
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 777
 allowed_risk_levels = ["low"]
 protected_paths = [".codex-worker"]
 max_changed_files = 3

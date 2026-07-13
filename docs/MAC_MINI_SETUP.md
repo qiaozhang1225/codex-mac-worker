@@ -98,7 +98,9 @@ chmod 600 "$HOME/Library/Application Support/CodexWorker/secrets/github-app.pem"
 codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 ```
 
-该命令负责接入 bootstrap 的唯一自审例外、标准标签和默认分支 Ruleset。Worker App 不在 bypass 名单；用 Worker 身份负向验证直接 push 主线和 merge 均失败。随后状态进入 `awaiting-worker`，Mac mini 只处理探针且不运行 Codex；匹配的 Bot attestation 出现后状态才是 `ready`。
+`.codex-worker/project.toml` 必须使用 `schema_version = 2`，包含 `worker_github_app_id = <数字 App ID>`，并与 Mac mini `worker.toml` 的 `github_app_id` 完全一致。旧 v1 配置和保留 worktree 会安全停止；合并 v2 配置后重新派单，不恢复旧 v1 会话。
+
+该命令负责接入 bootstrap 的唯一自审例外、标准标签和默认分支 Ruleset。Worker App 不在 bypass 名单；用 Worker 身份负向验证直接 push 主线和 merge 均失败。随后状态进入 `awaiting-worker`，Mac mini 只处理探针且不运行 Codex；只有由配置中指定 App 写出的匹配 Bot attestation 出现后状态才是 `ready`。
 
 ## 5. 写入 Worker 配置
 
@@ -108,7 +110,7 @@ codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 ./scripts/install_macos.sh
 ```
 
-将生成的 `worker.toml.example` 复制为 `worker.toml`，填写 GitHub 登录名、App ID 和 Installation ID，并启用 `discover_installation_repositories = true`。升级旧安装时保留已有 `[[repositories]]`，先启用发现并验证，再逐步移除静态项。Worker 只发现 App installation 返回且默认分支配置有效的仓库。验证 `codex_path` 与本机实际路径一致。
+将生成的 `worker.toml.example` 复制为 `worker.toml`，填写 GitHub 登录名、数字 App ID 和数字 Installation ID，并启用 `discover_installation_repositories = true`。升级旧安装时保留已有 `[[repositories]]`，先启用发现并验证，再逐步移除静态项。Worker 只发现 App installation 返回、默认分支配置有效且 `worker_github_app_id` 匹配本机 App 的仓库。验证 `codex_path` 与本机实际路径一致。
 
 再次运行安装：
 

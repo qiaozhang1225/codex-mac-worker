@@ -50,10 +50,14 @@ class FakeService:
     def __init__(self) -> None:
         self.processed: list[int] = []
         self.resumed: list[str | None] = []
+        self.validated: list[str] = []
         self.stopped = False
 
     def stop(self) -> None:
         self.stopped = True
+
+    def validate_repository_authority(self, repository: RepositoryConfig) -> None:
+        self.validated.append(repository.name)
 
     def process_issue(
         self,
@@ -92,6 +96,58 @@ def test_daemon_processes_only_oldest_queued_issue(tmp_path: Path) -> None:
 
     assert daemon.run_once() is True
     assert service.processed == [10]
+    assert service.validated == ["owner/repo"]
+
+
+def test_daemon_isolates_invalid_static_repository_and_processes_valid_one(
+    tmp_path: Path,
+) -> None:
+    from codex_mac_worker.config import ConfigError
+
+    settings = config(tmp_path)
+    settings = WorkerConfig(
+        settings.worker_id,
+        settings.poll_seconds,
+        settings.heartbeat_seconds,
+        settings.database_path,
+        settings.cache_root,
+        settings.worktree_root,
+        settings.output_root,
+        settings.codex_path,
+        settings.github_app_id,
+        settings.github_installation_id,
+        settings.github_private_key_path,
+        settings.authorized_users,
+        (
+            RepositoryConfig("owner/legacy-v1", "legacy-url"),
+            RepositoryConfig("owner/ready", "ready-url"),
+        ),
+    )
+
+    class PartiallyInvalidService(FakeService):
+        def validate_repository_authority(
+            self, repository: RepositoryConfig
+        ) -> None:
+            super().validate_repository_authority(repository)
+            if repository.name == "owner/legacy-v1":
+                raise ConfigError("project schema_version 1 must be migrated to 2")
+
+    service = PartiallyInvalidService()
+    store = EventStore(settings.database_path)
+    daemon = WorkerDaemon(
+        settings,
+        FakeGitHub([{"number": 21, "created_at": "2026-01-01T00:00:00Z"}]),
+        store,
+        service,
+    )
+
+    assert daemon.run_once() is True
+    assert service.validated == ["owner/legacy-v1", "owner/ready"]
+    assert service.processed == [21]
+    assert store.get_worker_state("repository_eligibility:owner/legacy-v1") == {
+        "eligible": False,
+        "error": "ConfigError: project schema_version 1 must be migrated to 2",
+    }
 
 
 def test_daemon_does_not_claim_new_issue_with_active_local_task(tmp_path: Path) -> None:

@@ -16,8 +16,9 @@ from codex_mac_worker.references import IssueReference
 from codex_mac_worker.repository_onboarding import ruleset_payload
 
 
-PROJECT_CONFIG = """schema_version = 1
+PROJECT_CONFIG = """schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 777
 allowed_risk_levels = ["low", "medium"]
 protected_paths = [".github/workflows", ".env", "product/deploy"]
 max_changed_files = 30
@@ -102,6 +103,7 @@ class ReviewGitHub:
         self.ruleset = ruleset_payload() | {"id": 1}
         self.default_head = "a" * 40
         self.attested_head = "a" * 40
+        self.attestation_app_id = 777
         self.writes: list[str] = []
         self.ready_calls = 0
         self.merge_payload: dict[str, str] | None = None
@@ -159,6 +161,11 @@ class ReviewGitHub:
             )
         elif mutation == "different_app":
             github.pull["performed_via_github_app"]["id"] = 999
+        elif mutation == "alternate_app":
+            github.pull["performed_via_github_app"]["id"] = 999
+            github.attestation_app_id = 999
+        elif mutation == "nullable_app_metadata":
+            github.attestation_app_id = None
         else:
             raise AssertionError(mutation)
         return github
@@ -233,7 +240,11 @@ class ReviewGitHub:
         return [
             {
                 "user": {"login": "worker-app[bot]", "type": "Bot"},
-                "performed_via_github_app": {"id": 777, "slug": "worker-app"},
+                "performed_via_github_app": (
+                    None
+                    if self.attestation_app_id is None
+                    else {"id": self.attestation_app_id, "slug": "worker-app"}
+                ),
                 "body": render_repository_attestation(
                     probe_id="probe-1",
                     worker_id="mac-mini",
@@ -336,6 +347,8 @@ def test_review_keeps_attested_worker_identity_after_default_branch_advances() -
         ("wrong_issue_state", "Issue"),
         ("credential_risk", "risks"),
         ("different_app", "GitHub App"),
+        ("alternate_app", "trusted Worker GitHub App"),
+        ("nullable_app_metadata", "trusted Worker GitHub App"),
     ],
 )
 def test_review_blocks_each_unsafe_state(mutation: str, blocker: str) -> None:

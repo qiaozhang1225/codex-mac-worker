@@ -450,7 +450,7 @@ def test_probe_is_attested_without_invoking_runner() -> None:
 2. If discovery is enabled, list App installation repositories.
 3. For each candidate, read `.codex-worker/project.toml` at its reported default branch.
 4. Parse it with `load_project_config` using a secure temporary file or a new `parse_project_config(text)` helper.
-5. Require `default_base_branch` to equal the GitHub default branch.
+5. Require `default_base_branch` to equal the GitHub default branch and `worker_github_app_id` to equal the configured Worker App ID.
 6. Deduplicate and sort by `full_name`.
 7. Cache the result in `worker_state` for at most five minutes; on GitHub failure use the last persisted list but do not add a new repository.
 
@@ -543,12 +543,12 @@ class OnboardingSnapshot:
 Expose:
 
 ```python
-def render_project_config(*, default_branch: str, fast_commands: tuple[str, ...], full_commands: tuple[str, ...]) -> str:
+def render_project_config(*, default_branch: str, worker_github_app_id: int, fast_commands: tuple[str, ...], full_commands: tuple[str, ...]) -> str:
     if not fast_commands:
         raise OnboardingError("at least one repository-approved fast verification command is required")
 ```
 
-Render schema version 1, risks `low` and `medium`, protected paths `.codex`, `.codex-worker`, `.github/workflows`, `.env`, `.env.local`, and `product/deploy`, limits 30 files/3000 lines/45 minutes/120 minutes/two attempts, and the supplied commands. Never infer commands from package-manager files.
+Render schema version 2, the trusted numeric Worker GitHub App ID, risks `low` and `medium`, protected paths `.codex`, `.codex-worker`, `.github/workflows`, `.env`, `.env.local`, and `product/deploy`, limits 30 files/3000 lines/45 minutes/120 minutes/two attempts, and the supplied commands. V1 repositories and retained tasks stop safely and are re-dispatched after migration. Never infer commands from package-manager files.
 
 - [ ] **Step 5: Run packaging and onboarding tests**
 

@@ -27,17 +27,11 @@ def git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def make_project_remote(tmp_path: Path) -> tuple[Path, str]:
-    source = tmp_path / "source"
-    source.mkdir()
-    git(source, "init", "-b", "main")
-    git(source, "config", "user.name", "Test")
-    git(source, "config", "user.email", "test@example.com")
-    (source / ".codex-worker").mkdir()
-    (source / ".codex-worker" / "project.toml").write_text(
-        f"""
-schema_version = 1
+def project_config_text(*, worker_github_app_id: int = 123) -> str:
+    return f"""
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = {worker_github_app_id}
 allowed_risk_levels = ["low", "medium"]
 protected_paths = [".codex-worker", ".github/workflows", ".env"]
 max_changed_files = 10
@@ -47,9 +41,18 @@ task_hard_timeout_minutes = 2
 max_automatic_attempts = 2
 [verification.fast]
 commands = ["{sys.executable} -c 'print(123)'"]
-""".strip()
-        + "\n",
-        encoding="utf-8",
+""".strip() + "\n"
+
+
+def make_project_remote(tmp_path: Path) -> tuple[Path, str]:
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "-b", "main")
+    git(source, "config", "user.name", "Test")
+    git(source, "config", "user.email", "test@example.com")
+    (source / ".codex-worker").mkdir()
+    (source / ".codex-worker" / "project.toml").write_text(
+        project_config_text(), encoding="utf-8"
     )
     (source / "docs").mkdir()
     (source / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
@@ -82,6 +85,7 @@ class FakeRunner:
 class FakeGitHub:
     def __init__(self, issue: dict) -> None:
         self.issue = issue
+        self.current_project_config = project_config_text()
         self.labels: list[list[str]] = []
         self.comments: list[str] = []
         self.prs: list[dict] = []
@@ -108,6 +112,16 @@ class FakeGitHub:
 
     def collaborator_permission(self, repo: str, username: str) -> str:
         return "write"
+
+    def get_repository(self, repo: str) -> dict:
+        return {"default_branch": "main"}
+
+    def get_commit(self, repo: str, ref: str) -> dict:
+        return {"sha": parse_task_body(self.issue["body"]).context_commit}
+
+    def get_repository_file(self, repo: str, path: str, *, ref: str) -> str:
+        assert path == ".codex-worker/project.toml"
+        return self.current_project_config
 
     def create_draft_pr(self, repo: str, head: str, base: str, title: str, body: str) -> dict:
         payload = {"number": 44, "html_url": "https://example/pr/44", "head": head, "body": body}
@@ -209,6 +223,39 @@ def test_worker_rejects_unauthorized_issue_author(tmp_path: Path) -> None:
     assert store.get_task("owner/repo", 14)["state"] == "needs-attention"
     assert github.prs == []
     assert "not authorized" in github.comments[-1]
+
+
+def test_worker_rejects_task_after_trusted_app_rotation(tmp_path: Path) -> None:
+    remote, sha = make_project_remote(tmp_path)
+    issue = {
+        "number": 17,
+        "title": "Stale Worker authority",
+        "body": task_body(sha=sha),
+        "labels": [{"name": "codex:queued"}],
+        "user": {"login": "owner"},
+    }
+    github = FakeGitHub(issue)
+    github.current_project_config = project_config_text(worker_github_app_id=999)
+    config = WorkerConfig(
+        "mac-mini", 60, 120, tmp_path / "state.sqlite3", tmp_path / "cache",
+        tmp_path / "worktrees", tmp_path / "outputs", Path("/tmp/codex"), "123", "456",
+        tmp_path / "app.pem", ("owner",), (RepositoryConfig("owner/repo", str(remote)),),
+    )
+    store = EventStore(config.database_path)
+    service = WorkerService(
+        config=config,
+        github=github,
+        token_provider=lambda: "token",
+        store=store,
+        git=GitOperations(cache_root=config.cache_root, worktree_root=config.worktree_root),
+        runner=FakeRunner(),
+    )
+
+    service.process_issue(config.repositories[0], issue)
+
+    assert store.get_task("owner/repo", 17)["state"] == "needs-attention"
+    assert github.prs == []
+    assert "trusted GitHub App" in github.comments[-1]
 
 
 def test_worker_treats_structured_blocked_result_as_attention(tmp_path: Path) -> None:
@@ -444,6 +491,16 @@ def test_worker_revises_existing_branch_without_creating_second_pr(tmp_path: Pat
     assert git(tmp_path / "remote.git", "show", "codex/12-bounded-task:src/result.txt") == "revised"
     assert git(tmp_path / "remote.git", "rev-list", "--count", "codex/12-bounded-task") == "3"
     assert len(store.list_runs("owner/repo", 12)) == 2
+
+    github.current_project_config = project_config_text(worker_github_app_id=999)
+    service.revise_issue(
+        config.repositories[0],
+        issue,
+        store.get_task("owner/repo", 12),
+        ("Another revision",),
+    )
+    assert store.get_task("owner/repo", 12)["state"] == "needs-attention"
+    assert len(github.updated_prs) == 1
 
 
 def test_worker_restart_cannot_extend_original_hard_deadline(tmp_path: Path) -> None:

@@ -106,6 +106,24 @@ clone_url = "url2"
         load_worker_config(config_path)
 
 
+def test_worker_config_requires_numeric_github_identifiers(tmp_path: Path) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery="discover_installation_repositories = true",
+    )
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'github_app_id = "123"', 'github_app_id = "worker-app"'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="github_app_id"):
+        load_worker_config(config_path)
+
+
 def test_worker_config_allows_installation_discovery_without_static_repositories(
     tmp_path: Path,
 ) -> None:

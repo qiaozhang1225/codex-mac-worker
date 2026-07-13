@@ -11,7 +11,7 @@ Manage one repository or bounded task at a time. Each mutation has an immutable 
 
 ## Repository Readiness
 
-1. Run `codexctl repo status OWNER/REPO`; refuse dispatch unless `phase` is `ready`.
+1. Run `codexctl repo status OWNER/REPO`; refuse dispatch unless `phase` is `ready` and the reviewed project config uses schema v2 and pins the intended numeric `worker_github_app_id`. Re-dispatch retained v1 tasks after migration; never resume them.
 2. Otherwise use `codexctl repo onboard`, then show PR, head SHA, paths, and blockers.
 3. Stop. Only explicit approval naming that PR authorizes:
 

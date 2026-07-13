@@ -347,11 +347,18 @@ def _toml_array(values: tuple[str, ...], *, indent: str = "") -> str:
 def render_project_config(
     *,
     default_branch: str,
+    worker_github_app_id: int,
     fast_commands: tuple[str, ...],
     full_commands: tuple[str, ...],
 ) -> str:
     if not default_branch.strip():
         raise OnboardingError("default branch is required")
+    if (
+        not isinstance(worker_github_app_id, int)
+        or isinstance(worker_github_app_id, bool)
+        or worker_github_app_id <= 0
+    ):
+        raise OnboardingError("Worker GitHub App ID must be a positive integer")
     if not fast_commands or any(not item.strip() for item in fast_commands):
         raise OnboardingError("at least one repository-approved fast verification command is required")
     if any(not item.strip() for item in full_commands):
@@ -365,8 +372,9 @@ def render_project_config(
         "product/deploy",
     )
     parts = [
-        "schema_version = 1",
+        "schema_version = 2",
         f"default_base_branch = {json.dumps(default_branch.strip())}",
+        f"worker_github_app_id = {worker_github_app_id}",
         'allowed_risk_levels = ["low", "medium"]',
         f"protected_paths = {_toml_array(protected)}",
         "max_changed_files = 30",
@@ -456,7 +464,7 @@ def _ruleset_valid(payload: dict[str, Any]) -> bool:
 def _default_repository_state(
     github: Any,
     repo: str,
-) -> tuple[str, str, str, bool, list[str]]:
+) -> tuple[str, str, str, int | None, bool, list[str]]:
     blockers: list[str] = []
     try:
         repository = github.get_repository(repo)
@@ -478,16 +486,28 @@ def _default_repository_state(
             if content != load_asset(Path(path).name):
                 raise OnboardingError(f"standard asset content differs: {path}")
         project_hash = hashlib.sha256(project_text.encode("utf-8")).hexdigest()
-        return default_branch, default_head, project_hash, True, blockers
+        return (
+            default_branch,
+            default_head,
+            project_hash,
+            project.worker_github_app_id,
+            True,
+            blockers,
+        )
     except Exception as exc:
         blockers.append(f"onboarding files: {type(exc).__name__}: {exc}")
-        return "", "", "", False, blockers
+        return "", "", "", None, False, blockers
 
 
 def repository_status(github: Any, repo: str) -> ReadinessReport:
-    default_branch, default_head, project_hash, files_valid, blockers = (
-        _default_repository_state(github, repo)
-    )
+    (
+        default_branch,
+        default_head,
+        project_hash,
+        worker_github_app_id,
+        files_valid,
+        blockers,
+    ) = _default_repository_state(github, repo)
 
     labels_valid = False
     try:
@@ -539,8 +559,13 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
                     user = comment.get("user", {})
                     if user.get("type") != "Bot":
                         continue
-                    app_id = comment.get("performed_via_github_app", {}).get("id")
-                    if not isinstance(app_id, int) or app_id <= 0:
+                    app_metadata = comment.get("performed_via_github_app")
+                    app_id = (
+                        app_metadata.get("id")
+                        if isinstance(app_metadata, dict)
+                        else None
+                    )
+                    if app_id != worker_github_app_id:
                         continue
                     try:
                         attestation = parse_repository_attestation(str(comment["body"]))
@@ -720,7 +745,7 @@ def finalize_onboarding(
                     "onboarding merge completed with an unexpected head"
                 )
 
-    default_branch, default_head, project_hash, files_valid, blockers = (
+    default_branch, default_head, project_hash, _, files_valid, blockers = (
         _default_repository_state(github, reference.repo)
     )
     if not files_valid:

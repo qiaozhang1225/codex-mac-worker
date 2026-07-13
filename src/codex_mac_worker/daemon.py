@@ -138,6 +138,8 @@ class WorkerDaemon:
                     continue
                 if project.default_base_branch != default_branch:
                     continue
+                if project.worker_github_app_id != int(self.config.github_app_id):
+                    continue
                 discovered.append(RepositoryConfig(name, clone_url))
         except Exception:
             if not isinstance(cached, dict) or not cached.get("repositories"):
@@ -171,6 +173,13 @@ class WorkerDaemon:
                 labels.append(value)
         labels.append(f"codex:{state}")
         self.github.set_labels(repo, int(issue["number"]), labels)  # type: ignore[attr-defined]
+
+    def _record_repository_eligibility(
+        self, repo: str, value: dict[str, Any]
+    ) -> None:
+        key = f"repository_eligibility:{repo}"
+        if self.store.get_worker_state(key) != value:
+            self.store.set_worker_state(key, value)
 
     def recover_active_tasks(self) -> bool:
         recovered = False
@@ -350,6 +359,21 @@ class WorkerDaemon:
             return False
         queued: list[tuple[RepositoryConfig, dict[str, Any]]] = []
         for repository in self.repositories():
+            try:
+                self.service.validate_repository_authority(repository)
+            except Exception as exc:
+                self._record_repository_eligibility(
+                    repository.name,
+                    {
+                        "eligible": False,
+                        "error": f"{type(exc).__name__}: {exc}"[:1000],
+                    },
+                )
+                continue
+            self._record_repository_eligibility(
+                repository.name,
+                {"eligible": True},
+            )
             for issue in self.github.list_queued_issues(repository.name):
                 if "pull_request" in issue:
                     continue

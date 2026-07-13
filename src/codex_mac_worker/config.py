@@ -13,6 +13,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     default_base_branch: str
+    worker_github_app_id: int
     allowed_risk_levels: tuple[str, ...]
     protected_paths: tuple[str, ...]
     max_changed_files: int
@@ -85,8 +86,14 @@ def parse_project_config(text: str) -> ProjectConfig:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"unable to read project config: {exc}") from exc
-    if raw.get("schema_version") != 1:
-        raise ConfigError("schema_version must be 1")
+    schema_version = raw.get("schema_version")
+    if schema_version == 1:
+        raise ConfigError(
+            "project schema_version 1 must be migrated to 2 and define "
+            "worker_github_app_id; re-dispatch retained v1 tasks after migration"
+        )
+    if schema_version != 2:
+        raise ConfigError("project schema_version must be 2")
 
     verification_raw = raw.get("verification")
     if not isinstance(verification_raw, dict) or not verification_raw:
@@ -109,6 +116,7 @@ def parse_project_config(text: str) -> ProjectConfig:
         raise ConfigError("default_base_branch must be a non-empty string")
     return ProjectConfig(
         default_base_branch=base.strip(),
+        worker_github_app_id=_positive_int(raw, "worker_github_app_id"),
         allowed_risk_levels=_strings(raw, "allowed_risk_levels"),
         protected_paths=_strings(raw, "protected_paths"),
         max_changed_files=_positive_int(raw, "max_changed_files"),
@@ -128,6 +136,13 @@ def _worker_string(raw: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def _worker_numeric_string(raw: dict[str, Any], key: str) -> str:
+    value = _worker_string(raw, key)
+    if not value.isdigit() or int(value) <= 0:
+        raise ConfigError(f"{key} must be a positive numeric identifier")
+    return value
 
 
 def load_worker_config(path: Path) -> WorkerConfig:
@@ -173,8 +188,8 @@ def load_worker_config(path: Path) -> WorkerConfig:
         worktree_root=worker_path("worktree_root"),
         output_root=worker_path("output_root"),
         codex_path=worker_path("codex_path"),
-        github_app_id=_worker_string(raw, "github_app_id"),
-        github_installation_id=_worker_string(raw, "github_installation_id"),
+        github_app_id=_worker_numeric_string(raw, "github_app_id"),
+        github_installation_id=_worker_numeric_string(raw, "github_installation_id"),
         github_private_key_path=worker_path("github_private_key_path"),
         authorized_users=_strings(raw, "authorized_users"),
         repositories=tuple(repositories),

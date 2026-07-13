@@ -46,7 +46,12 @@ clone_url = "https://github.com/owner/repo.git"
 
 def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
     example = (ROOT / "templates" / "worker.toml.example").read_text(encoding="utf-8")
-    rendered = example.replace("__HOME__", str(tmp_path)).replace("__OWNER__", "owner")
+    rendered = (
+        example.replace("__HOME__", str(tmp_path))
+        .replace("__OWNER__", "owner")
+        .replace("REPLACE_WITH_APP_ID", "123")
+        .replace("REPLACE_WITH_INSTALLATION_ID", "456")
+    )
     config_path = tmp_path / "worker.toml"
     config_path.write_text(rendered, encoding="utf-8")
     config = load_worker_config(config_path)

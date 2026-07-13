@@ -12,8 +12,9 @@ from codex_mac_worker.worker import WorkerService
 
 
 PROJECT_TOML = """
-schema_version = 1
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 123
 allowed_risk_levels = ["low", "medium"]
 protected_paths = [".codex-worker", ".github/workflows", ".env"]
 max_changed_files = 10
@@ -72,12 +73,28 @@ class DiscoveryGitHub:
                 "clone_url": "https://github.com/owner/mismatch.git",
                 "default_branch": "develop",
             },
+            {
+                "full_name": "owner/wrong-app",
+                "clone_url": "https://github.com/owner/wrong-app.git",
+                "default_branch": "main",
+            },
+            {
+                "full_name": "owner/legacy-v1",
+                "clone_url": "https://github.com/owner/legacy-v1.git",
+                "default_branch": "main",
+            },
         ]
 
     def get_repository_file(self, repo: str, path: str, *, ref: str) -> str:
         assert path == ".codex-worker/project.toml"
         if repo == "owner/missing":
             raise GitHubError("missing", status_code=404, retryable=False)
+        if repo == "owner/wrong-app":
+            return PROJECT_TOML.replace(
+                "worker_github_app_id = 123", "worker_github_app_id = 999"
+            )
+        if repo == "owner/legacy-v1":
+            return PROJECT_TOML.replace("schema_version = 2", "schema_version = 1")
         return PROJECT_TOML
 
     def list_queued_issues(self, repo: str) -> list[dict]:
@@ -192,6 +209,39 @@ def test_probe_is_attested_without_invoking_runner(tmp_path: Path) -> None:
     ]
 
 
+def test_probe_rejects_project_bound_to_another_github_app(tmp_path: Path) -> None:
+    repository = RepositoryConfig("owner/ready", "https://github.com/owner/ready.git")
+    settings = worker_config(tmp_path, repositories=(repository,))
+    project = PROJECT_TOML.replace(
+        "worker_github_app_id = 123", "worker_github_app_id = 999"
+    )
+    github = ProbeGitHub(project)
+    issue = {
+        "number": 8,
+        "body": render_repository_probe(
+            probe_id="probe-wrong-app",
+            default_head="a" * 40,
+            project_config_hash=hashlib.sha256(project.encode()).hexdigest(),
+        ),
+        "labels": [{"name": "codex:queued"}],
+        "user": {"login": "owner"},
+    }
+    service = WorkerService(
+        config=settings,
+        github=github,
+        token_provider=lambda: "token",
+        store=EventStore(settings.database_path),
+        git=object(),
+        runner=RunnerMustNotRun(),
+    )
+
+    service.process_repository_probe(repository, issue)
+
+    assert github.comments
+    assert "trusted GitHub App" in github.comments[-1]
+    assert github.updates[-1]["labels"] == ["codex:needs-attention"]
+
+
 def test_daemon_routes_probe_before_normal_task_processing(tmp_path: Path) -> None:
     repository = RepositoryConfig("owner/ready", "https://github.com/owner/ready.git")
     settings = worker_config(
@@ -216,6 +266,9 @@ def test_daemon_routes_probe_before_normal_task_processing(tmp_path: Path) -> No
     class RoutingService:
         def __init__(self) -> None:
             self.probes: list[int] = []
+
+        def validate_repository_authority(self, repository: RepositoryConfig) -> None:
+            return None
 
         def process_repository_probe(self, repository: RepositoryConfig, queued: dict) -> None:
             self.probes.append(queued["number"])

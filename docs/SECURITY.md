@@ -6,6 +6,7 @@
 - 权限档案只额外开放 `/opt/homebrew` 与 Python.org 的 `/Library/Frameworks/Python.framework` 为只读工具链根；GitHub 私钥所在的 `~/Library/Application Support/CodexWorker/secrets` 仍不可读。
 - Worker 不传旧式 `--sandbox` 或 `sandbox_mode` 覆盖权限档案；目标仓库若包含 `.codex/config.toml`，任务会被拒绝，防止项目配置扩大权限。
 - Issue 只能选择仓库内 `.codex-worker/project.toml` 已审查的测试命令。
+- `.codex-worker/project.toml` schema v2 必须固定可信的数字 `worker_github_app_id`；仓库发现、执行前校验、就绪证明和交付审查都拒绝其他 GitHub App。v1 任务安全停止，升级后重新派单。
 - Worker 在 commit 前检查 Git HEAD、允许路径、敏感路径、文件数、diff 行数、密钥特征和大型二进制文件。
 - Worker 只 push `codex/*` 任务分支并创建 Draft PR；Ruleset 是阻止主线 push、merge 和 force push 的最终边界。
 - Codex 不负责 commit、push、PR、部署或 merge。Worker App 以 Contents/Issues/Pull requests 写权限创建分支和产物，但 Ruleset 阻止它更新默认分支；Worker 永不调用 merge API。

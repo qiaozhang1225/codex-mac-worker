@@ -92,7 +92,7 @@ codexctl repo finalize PR_URL --expected-head SHA
 .github/workflows/codex-worker-watchdog.yml
 ```
 
-`project.toml` 必须明确默认分支、允许风险、受保护路径、diff 上限、时间上限以及来自仓库的验证命令。Issue 模板只负责人工备用派单。Watchdog 只告警，不执行任务。
+`project.toml` schema v2 必须明确默认分支、可信 Worker 的数字 GitHub App ID、允许风险、受保护路径、diff 上限、时间上限以及来自仓库的验证命令。v1 配置和保留任务安全停止，升级后重新派单。Issue 模板只负责人工备用派单。Watchdog 只告警，不执行任务。
 
 ### 4.3 `repo onboard` 流程
 

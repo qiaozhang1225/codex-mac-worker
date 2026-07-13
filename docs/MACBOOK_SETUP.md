@@ -33,6 +33,6 @@ codexctl task merge --help
 
 ## 仓库接入与一次性批准
 
-先运行 `codexctl repo status OWNER/REPO`。未接入时用 `codexctl repo onboard --repo OWNER/REPO --project-config project.toml` 创建接入 PR；只有明确批准该 PR 后，才运行 `codexctl repo finalize OWNER/REPO#PR --expected-head SHA`。`awaiting-worker` 表示默认分支已配置、正在等待 Mac mini 探针证明访问能力；变为 `ready` 后才能派单。
+先运行 `codexctl repo status OWNER/REPO`。未接入时，在 `project.toml` 使用 `schema_version = 2`，并写入与 Mac mini `worker.toml` 一致的数字 `worker_github_app_id`，再用 `codexctl repo onboard --repo OWNER/REPO --project-config project.toml` 创建接入 PR；只有明确批准该 PR 后，才运行 `codexctl repo finalize OWNER/REPO#PR --expected-head SHA`。`awaiting-worker` 表示默认分支已配置、正在等待指定 GitHub App 的 Mac mini 探针证明访问能力；变为 `ready` 后才能派单。旧 v1 配置必须先升级；保留的 v1 任务不继续执行或修订，应在升级后重新派单。
 
 Worker 交付后先运行 `codexctl task review ISSUE_URL`。它只读并显示门禁与审批指纹。只有针对当前 PR、head SHA 和 fingerprint 的 explicit approval，才能运行 `codexctl task merge ISSUE_URL --expected-head SHA --expected-fingerprint FINGERPRINT`。设计通过、仓库级授权、旧对话或任何 future PR 授权都无效。

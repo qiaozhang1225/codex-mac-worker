@@ -25,8 +25,9 @@ from codex_mac_worker.repository_onboarding import (
 
 
 PROJECT_TOML = """
-schema_version = 1
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 777
 allowed_risk_levels = ["low", "medium"]
 protected_paths = [".codex", ".codex-worker", ".github/workflows", ".env"]
 max_changed_files = 30
@@ -113,10 +114,16 @@ def test_onboarding_snapshot_rejects_foreign_head_repository() -> None:
 
 def test_project_config_renderer_requires_explicit_fast_commands() -> None:
     with pytest.raises(OnboardingError, match="fast verification"):
-        render_project_config(default_branch="main", fast_commands=(), full_commands=())
+        render_project_config(
+            default_branch="main",
+            worker_github_app_id=777,
+            fast_commands=(),
+            full_commands=(),
+        )
 
     rendered = render_project_config(
         default_branch="main",
+        worker_github_app_id=777,
         fast_commands=("python -m unittest",),
         full_commands=("python -m unittest", "npm run build"),
     )
@@ -124,6 +131,7 @@ def test_project_config_renderer_requires_explicit_fast_commands() -> None:
 
     assert config.verification["fast"] == ("python -m unittest",)
     assert config.verification["full"] == ("python -m unittest", "npm run build")
+    assert config.worker_github_app_id == 777
 
 
 class FinalizeGitHub(OnboardingGitHub):
@@ -352,6 +360,32 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
     unsafe_bypass = repository_status(github, "owner/repo")
     assert unsafe_bypass.phase == "blocked"
     assert unsafe_bypass.ruleset_valid is False
+
+    github.rulesets[0]["bypass_actors"].pop()
+    github.comments[probe["number"]][0]["performed_via_github_app"]["id"] = 999
+    wrong_app = repository_status(github, "owner/repo")
+    assert wrong_app.phase == "awaiting-worker"
+    assert wrong_app.worker_attested is False
+
+    github.comments[probe["number"]][0]["performed_via_github_app"] = None
+    nullable_app = repository_status(github, "owner/repo")
+    assert nullable_app.phase == "awaiting-worker"
+
+    valid_comment = dict(github.comments[probe["number"]][0])
+    valid_comment["performed_via_github_app"] = {
+        "id": 777,
+        "slug": "coworker-app",
+    }
+    github.comments[probe["number"]] = [
+        valid_comment,
+        {
+            "body": valid_comment["body"],
+            "user": {"login": "invalid-app[bot]", "type": "Bot"},
+            "performed_via_github_app": None,
+        },
+    ]
+    ignores_nullable_app = repository_status(github, "owner/repo")
+    assert ignores_nullable_app.phase == "ready"
 
 
 def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: Path) -> None:
