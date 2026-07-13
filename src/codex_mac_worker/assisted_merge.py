@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 import hashlib
 import json
+import re
 from typing import Any, Iterable
 
+import yaml
+
 from .config import parse_project_config
+from .control_state import ControlState, operation_id
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .protocol import (
     DELIVERY_MARKER,
@@ -24,6 +29,10 @@ from .repository_onboarding import RULESET_NAME, _ruleset_valid
 
 class AssistedMergeError(RuntimeError):
     """Raised when a Worker delivery cannot be reviewed safely."""
+
+
+class MergeBlocked(AssistedMergeError):
+    """Raised before an unsafe or stale merge can be attempted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +65,22 @@ class ReviewSnapshot:
     unresolved_threads: tuple[str, ...]
     gates: GateResult
     approval_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class MergeResult:
+    repo: str
+    issue_number: int
+    pr_number: int
+    approved_head: str
+    merge_commit_sha: str
+    actor_login: str
+    approval_fingerprint: str
+    merged: bool
+
+
+APPROVAL_MARKER = "<!-- codex-human-approval:v1 -->"
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def evaluate_merge_gates(blockers: Iterable[str]) -> GateResult:
@@ -327,3 +352,176 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         gates=gates,
         approval_fingerprint=fingerprint,
     )
+
+
+def render_approval_audit(
+    *, snapshot: ReviewSnapshot, actor_login: str, approved_at: str
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "approval_fingerprint": snapshot.approval_fingerprint,
+        "actor_login": actor_login,
+        "issue_number": snapshot.issue_number,
+        "pr_number": snapshot.pr_number,
+        "task_hash": snapshot.task_hash,
+        "approved_head": snapshot.head_sha,
+        "approved_at": approved_at,
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{APPROVAL_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def _delivery_pulls(github: Any, reference: IssueReference) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for pull in github.list_pull_requests(reference.repo, state="all"):
+        body = str(pull.get("body", ""))
+        if DELIVERY_MARKER not in body:
+            continue
+        try:
+            delivery = parse_delivery_block(body)
+        except ProtocolError:
+            continue
+        if delivery.issue_number == reference.number:
+            matches.append(pull)
+    return matches
+
+
+def _merge_result(raw: dict[str, Any]) -> MergeResult:
+    return MergeResult(
+        repo=str(raw["repo"]),
+        issue_number=int(raw["issue_number"]),
+        pr_number=int(raw["pr_number"]),
+        approved_head=str(raw["approved_head"]),
+        merge_commit_sha=str(raw["merge_commit_sha"]),
+        actor_login=str(raw["actor_login"]),
+        approval_fingerprint=str(raw["approval_fingerprint"]),
+        merged=bool(raw["merged"]),
+    )
+
+
+def _audit_once(github: Any, snapshot: ReviewSnapshot, actor_login: str) -> None:
+    expected = (
+        APPROVAL_MARKER in str(comment.get("body", ""))
+        and snapshot.approval_fingerprint in str(comment.get("body", ""))
+        for comment in github.list_comments(snapshot.repo, snapshot.pr_number)
+    )
+    if any(expected):
+        return
+    github.add_comment(
+        snapshot.repo,
+        snapshot.pr_number,
+        render_approval_audit(
+            snapshot=snapshot,
+            actor_login=actor_login,
+            approved_at=datetime.now(UTC).isoformat(),
+        ),
+    )
+
+
+def merge_task(
+    github: Any,
+    state: ControlState,
+    reference: IssueReference,
+    *,
+    expected_head: str,
+) -> MergeResult:
+    expected_head = expected_head.lower()
+    if not _FULL_SHA_RE.fullmatch(expected_head):
+        raise MergeBlocked("expected_head must be a full 40-character Git SHA")
+
+    candidates = _delivery_pulls(github, reference)
+    if len(candidates) != 1:
+        raise MergeBlocked(
+            f"expected exactly one Worker PR for Issue #{reference.number}; found {len(candidates)}"
+        )
+    candidate = candidates[0]
+    pr_number = int(candidate["number"])
+    current_head = str(candidate.get("head", {}).get("sha", "")).lower()
+    key = operation_id("task-merge", f"{reference.repo}#{pr_number}", expected_head)
+    existing = state.get(key)
+    merged_at = candidate.get("merged_at")
+    if existing is not None and existing["state"] == "completed":
+        if not merged_at or current_head != expected_head:
+            raise MergeBlocked("completed merge ledger does not match GitHub state")
+        return _merge_result(existing["result"])
+    if current_head != expected_head:
+        raise MergeBlocked("approval expired because the PR head changed")
+    if merged_at and existing is None:
+        raise MergeBlocked("PR was already merged outside this approval operation")
+
+    snapshot = review_task(github, reference)
+    if snapshot.head_sha != expected_head:
+        raise MergeBlocked("approval expired because the PR head changed")
+    if not snapshot.gates.allowed:
+        raise MergeBlocked("merge gates blocked: " + "; ".join(snapshot.gates.blockers))
+
+    user = github.get_authenticated_user()
+    actor_login = str(user.get("login", ""))
+    permission = github.collaborator_permission(reference.repo, actor_login)
+    if not actor_login or permission not in {"admin", "maintain"}:
+        raise MergeBlocked("authenticated user must have admin or maintain permission")
+    if str(candidate.get("user", {}).get("login", "")) == actor_login:
+        raise MergeBlocked("normal Worker PRs cannot be approved by their own author")
+
+    state.begin(
+        key,
+        "task-merge",
+        f"{reference.repo}#{pr_number}",
+        expected_head,
+    )
+
+    if snapshot.is_draft:
+        github.mark_pull_request_ready(reference.repo, pr_number)
+        snapshot = review_task(github, reference)
+        if snapshot.head_sha != expected_head:
+            raise MergeBlocked("approval expired because the PR head changed after Ready")
+        if not snapshot.gates.allowed:
+            raise MergeBlocked(
+                "merge gates blocked after Ready: " + "; ".join(snapshot.gates.blockers)
+            )
+
+    current_approval = any(
+        str(review.get("state", "")).upper() == "APPROVED"
+        and str(review.get("user", {}).get("login", "")) == actor_login
+        and str(review.get("commit_id", "")).lower() == expected_head
+        for review in github.list_reviews(reference.repo, pr_number)
+    )
+    if not current_approval:
+        github.create_pull_review(
+            reference.repo,
+            pr_number,
+            body=f"Approved by codexctl for immutable head `{expected_head}`.",
+            event="APPROVE",
+        )
+
+    try:
+        merge_payload = github.merge_pull_request(
+            reference.repo,
+            pr_number,
+            expected_head=expected_head,
+        )
+        if merge_payload.get("merged") is not True:
+            raise MergeBlocked(str(merge_payload.get("message", "GitHub rejected the merge")))
+        merge_commit_sha = str(merge_payload.get("sha", ""))
+    except MergeBlocked:
+        raise
+    except Exception:
+        reconciled = github.get_pull_request(reference.repo, pr_number)
+        reconciled_head = str(reconciled.get("head", {}).get("sha", "")).lower()
+        if not reconciled.get("merged_at") or reconciled_head != expected_head:
+            raise
+        merge_commit_sha = str(reconciled.get("merge_commit_sha", ""))
+
+    result = MergeResult(
+        repo=reference.repo,
+        issue_number=reference.number,
+        pr_number=pr_number,
+        approved_head=expected_head,
+        merge_commit_sha=merge_commit_sha,
+        actor_login=actor_login,
+        approval_fingerprint=snapshot.approval_fingerprint,
+        merged=True,
+    )
+    _audit_once(github, snapshot, actor_login)
+    state.complete(key, asdict(result))
+    return result

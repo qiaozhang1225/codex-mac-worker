@@ -34,6 +34,45 @@ def test_task_review_returns_two_when_gates_block(monkeypatch, capsys) -> None:
     assert json.loads(capsys.readouterr().out)["gates"]["allowed"] is False
 
 
+def test_ctl_parser_requires_full_head_for_task_merge() -> None:
+    parser = build_ctl_parser()
+    args = parser.parse_args(
+        ["task", "merge", "owner/repo#12", "--expected-head", "c" * 40]
+    )
+
+    assert args.expected_head == "c" * 40
+
+
+def test_task_merge_uses_local_operation_ledger(monkeypatch, tmp_path, capsys) -> None:
+    from codex_mac_worker.assisted_merge import MergeResult
+
+    monkeypatch.setenv("CODEXCTL_STATE_PATH", str(tmp_path / "state.db"))
+    monkeypatch.setattr(cli, "personal_github_token", lambda: "token")
+    monkeypatch.setattr(cli, "GitHubClient", lambda **kwargs: object())
+    seen: dict = {}
+
+    def fake_merge(github, state, reference, *, expected_head):
+        seen.update(reference=reference, expected_head=expected_head)
+        return MergeResult(
+            repo=reference.repo,
+            issue_number=reference.number,
+            pr_number=44,
+            approved_head=expected_head,
+            merge_commit_sha="e" * 40,
+            actor_login="qiaoz",
+            approval_fingerprint="f" * 64,
+            merged=True,
+        )
+
+    monkeypatch.setattr(cli, "merge_task", fake_merge)
+
+    assert ctl_main(
+        ["task", "merge", "owner/repo#12", "--expected-head", "c" * 40]
+    ) == 0
+    assert seen["reference"].number == 12
+    assert json.loads(capsys.readouterr().out)["merged"] is True
+
+
 def test_personal_token_prefers_environment(monkeypatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "token-from-env")
 

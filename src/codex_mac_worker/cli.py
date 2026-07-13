@@ -10,7 +10,7 @@ import subprocess
 import sys
 from typing import Sequence
 
-from .assisted_merge import review_task
+from .assisted_merge import merge_task, review_task
 from .config import load_worker_config
 from .control import create_task, parse_issue_reference, send_command
 from .control_state import ControlState
@@ -96,6 +96,10 @@ def build_ctl_parser() -> argparse.ArgumentParser:
     review = actions.add_parser("review")
     review.add_argument("reference")
 
+    merge = actions.add_parser("merge")
+    merge.add_argument("reference")
+    merge.add_argument("--expected-head", required=True, type=full_sha)
+
     repo = top.add_parser("repo")
     repo_actions = repo.add_subparsers(dest="action", required=True)
 
@@ -162,6 +166,19 @@ def ctl_main(argv: Sequence[str] | None = None) -> int:
         snapshot = review_task(github, IssueReference(repo, issue_number))
         print(json.dumps(asdict(snapshot), ensure_ascii=False, indent=2))
         return 0 if snapshot.gates.allowed else 2
+    if args.action == "merge":
+        state = ControlState(control_state_path())
+        try:
+            result = merge_task(
+                github,
+                state,
+                IssueReference(repo, issue_number),
+                expected_head=args.expected_head,
+            )
+        finally:
+            state.close()
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return 0
     if args.action == "status":
         issue = github.get_issue(repo, issue_number)
         summary = {
