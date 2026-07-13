@@ -39,4 +39,3 @@ def parse_issue_reference(reference: str) -> IssueReference:
 def parse_pull_request_reference(reference: str) -> PullRequestReference:
     repo, number = _parse(reference, "pull")
     return PullRequestReference(repo, number)
-

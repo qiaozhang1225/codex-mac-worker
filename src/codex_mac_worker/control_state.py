@@ -69,4 +69,3 @@ class ControlState:
 
     def close(self) -> None:
         self.connection.close()
-

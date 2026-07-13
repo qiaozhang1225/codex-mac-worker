@@ -30,4 +30,3 @@ def test_references_accept_urls_and_short_forms() -> None:
 def test_references_reject_invalid_values(reference: str) -> None:
     with pytest.raises(ValueError, match="reference must be"):
         parse_issue_reference(reference)
-

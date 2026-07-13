@@ -44,4 +44,3 @@ body:
           required: true
         - label: The allowed paths are narrower than the whole repository.
           required: true
-

@@ -109,4 +109,3 @@ jobs:
                 body: `${marker}\n⚠️ Codex Worker Watchdog: ${detail}\n\nCheck the Mac mini through the configured remote-maintenance channel.`,
               });
             }
-
