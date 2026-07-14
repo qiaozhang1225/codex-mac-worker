@@ -227,6 +227,33 @@ class EventStore:
         )
         self.connection.commit()
 
+    def reactivate_failed_outbox_and_set_worker_state(
+        self,
+        outbox_id: int,
+        *,
+        state_key: str,
+        state_value: Any,
+    ) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE outbox
+                SET attempts=0, last_error=NULL, failed_at=NULL
+                WHERE id=? AND delivered_at IS NULL AND failed_at IS NOT NULL
+                """,
+                (outbox_id,),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO worker_state(key, value_json, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (state_key, json.dumps(state_value, sort_keys=True), utc_now()),
+            )
+        return cursor.rowcount == 1
+
     def record_outbox_failure(
         self,
         outbox_id: int,
