@@ -20,8 +20,19 @@ gh auth login
 codexctl --help
 codexctl task create --help
 codexctl task status --help
+codexctl repo status --help
+codexctl repo onboard --help
+codexctl repo finalize --help
+codexctl task review --help
+codexctl task merge --help
 ```
 
 在 Codex 中可要求：“使用 `$dispatch-codex-task` 把这个明确的小改动整理成 Mac mini 任务。”skill 会检查 context 已 commit/push、读取项目边界、拒绝过大或高风险任务，并在创建 GitHub Issue 前显示最终规格等待确认。
 
-该 skill 和 `codexctl` 都不使用 Goal/“目标”模式，不会自动部署或合并 PR。GitHub CLI 使用你的个人身份派单；Mac mini Worker 使用独立 GitHub App 执行，两者凭据不要混用。
+该 skill 和 `codexctl` 都不使用 Goal/“目标”模式，不会自动部署或自动合并 PR。GitHub CLI 的个人 token 始终留在 MacBook；Mac mini Worker 只使用独立 GitHub App，两者凭据不要混用。
+
+## 仓库接入与一次性批准
+
+先运行 `codexctl repo status OWNER/REPO`。未接入时，在 `project.toml` 使用 `schema_version = 2`，并写入与 Mac mini `worker.toml` 一致的数字 `worker_github_app_id`，再用 `codexctl repo onboard --repo OWNER/REPO --project-config project.toml` 创建接入 PR；只有明确批准该 PR 后，才运行 `codexctl repo finalize OWNER/REPO#PR --expected-head SHA`。`awaiting-worker` 表示默认分支已配置、正在等待指定 GitHub App 的 Mac mini 探针证明访问能力；变为 `ready` 后才能派单。旧 v1 配置必须先升级；保留的 v1 任务不继续执行或修订，应在升级后重新派单。
+
+Worker 交付后先运行 `codexctl task review ISSUE_URL`。它只读并显示门禁与审批指纹。只有针对当前 PR、head SHA 和 fingerprint 的 explicit approval，才能运行 `codexctl task merge ISSUE_URL --expected-head SHA --expected-fingerprint FINGERPRINT`。设计通过、仓库级授权、旧对话或任何 future PR 授权都无效。

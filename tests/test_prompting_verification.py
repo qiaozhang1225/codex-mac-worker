@@ -33,7 +33,20 @@ def test_execution_prompt_is_bounded_and_never_mentions_goal_mode(tmp_path: Path
     assert "Only modify these paths" in prompt
     assert "/goal" not in prompt.lower()
     assert "goal mode" not in prompt.lower()
-    assert result_schema()["required"] == ["status", "summary", "changed_files", "risks", "needs_human"]
+    assert result_schema()["required"] == [
+        "status",
+        "summary",
+        "changed_files",
+        "risks",
+        "needs_human",
+        "acceptance_results",
+    ]
+    acceptance = result_schema()["properties"]["acceptance_results"]
+    assert acceptance["items"]["properties"]["status"]["enum"] == [
+        "met",
+        "not_met",
+        "needs_review",
+    ]
 
 
 def test_revision_prompt_starts_new_bounded_attempt() -> None:
@@ -50,8 +63,9 @@ def test_run_verification_uses_only_configured_commands(tmp_path: Path) -> None:
     config_path = tmp_path / "project.toml"
     config_path.write_text(
         f"""
-schema_version = 1
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 777
 allowed_risk_levels = ["low"]
 protected_paths = [".codex-worker"]
 max_changed_files = 3

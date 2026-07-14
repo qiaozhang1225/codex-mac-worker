@@ -13,6 +13,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     default_base_branch: str
+    worker_github_app_id: int
     allowed_risk_levels: tuple[str, ...]
     protected_paths: tuple[str, ...]
     max_changed_files: int
@@ -46,6 +47,7 @@ class WorkerConfig:
     authorized_users: tuple[str, ...]
     repositories: tuple[RepositoryConfig, ...]
     codex_home: Path | None = None
+    discover_installation_repositories: bool = False
 
 
 def _positive_int(raw: dict[str, Any], key: str) -> int:
@@ -73,11 +75,25 @@ def _strings(raw: dict[str, Any], key: str) -> tuple[str, ...]:
 
 def load_project_config(path: Path) -> ProjectConfig:
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise ConfigError(f"unable to read project config: {exc}") from exc
-    if raw.get("schema_version") != 1:
-        raise ConfigError("schema_version must be 1")
+    return parse_project_config(text)
+
+
+def parse_project_config(text: str) -> ProjectConfig:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"unable to read project config: {exc}") from exc
+    schema_version = raw.get("schema_version")
+    if schema_version == 1:
+        raise ConfigError(
+            "project schema_version 1 must be migrated to 2 and define "
+            "worker_github_app_id; re-dispatch retained v1 tasks after migration"
+        )
+    if schema_version != 2:
+        raise ConfigError("project schema_version must be 2")
 
     verification_raw = raw.get("verification")
     if not isinstance(verification_raw, dict) or not verification_raw:
@@ -100,6 +116,7 @@ def load_project_config(path: Path) -> ProjectConfig:
         raise ConfigError("default_base_branch must be a non-empty string")
     return ProjectConfig(
         default_base_branch=base.strip(),
+        worker_github_app_id=_positive_int(raw, "worker_github_app_id"),
         allowed_risk_levels=_strings(raw, "allowed_risk_levels"),
         protected_paths=_strings(raw, "protected_paths"),
         max_changed_files=_positive_int(raw, "max_changed_files"),
@@ -121,6 +138,13 @@ def _worker_string(raw: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
+def _worker_numeric_string(raw: dict[str, Any], key: str) -> str:
+    value = _worker_string(raw, key)
+    if not value.isdigit() or int(value) <= 0:
+        raise ConfigError(f"{key} must be a positive numeric identifier")
+    return value
+
+
 def load_worker_config(path: Path) -> WorkerConfig:
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -128,9 +152,19 @@ def load_worker_config(path: Path) -> WorkerConfig:
         raise ConfigError(f"unable to read worker config: {exc}") from exc
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be 1")
-    repositories_raw = raw.get("repositories")
-    if not isinstance(repositories_raw, list) or not repositories_raw:
-        raise ConfigError("repositories must contain at least one entry")
+    discover_installation_repositories = raw.get(
+        "discover_installation_repositories",
+        False,
+    )
+    if not isinstance(discover_installation_repositories, bool):
+        raise ConfigError("discover_installation_repositories must be a boolean")
+    repositories_raw = raw.get("repositories", [])
+    if not isinstance(repositories_raw, list):
+        raise ConfigError("repositories must be an array of tables")
+    if not repositories_raw and not discover_installation_repositories:
+        raise ConfigError(
+            "at least one repository source is required: static repositories or installation discovery"
+        )
     repositories: list[RepositoryConfig] = []
     seen: set[str] = set()
     for item in repositories_raw:
@@ -154,10 +188,11 @@ def load_worker_config(path: Path) -> WorkerConfig:
         worktree_root=worker_path("worktree_root"),
         output_root=worker_path("output_root"),
         codex_path=worker_path("codex_path"),
-        github_app_id=_worker_string(raw, "github_app_id"),
-        github_installation_id=_worker_string(raw, "github_installation_id"),
+        github_app_id=_worker_numeric_string(raw, "github_app_id"),
+        github_installation_id=_worker_numeric_string(raw, "github_installation_id"),
         github_private_key_path=worker_path("github_private_key_path"),
         authorized_users=_strings(raw, "authorized_users"),
         repositories=tuple(repositories),
         codex_home=worker_path("codex_home"),
+        discover_installation_repositories=discover_installation_repositories,
     )

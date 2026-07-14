@@ -6,8 +6,12 @@ import signal
 import time
 from typing import Any, Protocol
 
-from .config import RepositoryConfig, WorkerConfig
-from .protocol import ProtocolError, parse_command_comment
+from .config import ConfigError, RepositoryConfig, WorkerConfig, parse_project_config
+from .protocol import (
+    REPOSITORY_PROBE_MARKER,
+    ProtocolError,
+    parse_command_comment,
+)
 from .store import EventStore
 
 
@@ -44,6 +48,12 @@ class QueueGitHub(Protocol):
 
 
 class IssueProcessor(Protocol):
+    def process_repository_probe(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> None: ...
+
     def process_issue(
         self,
         repository: RepositoryConfig,
@@ -83,10 +93,77 @@ class WorkerDaemon:
             stop_service()
 
     def _repository(self, name: str) -> RepositoryConfig:
-        for repository in self.config.repositories:
+        for repository in self.repositories():
             if repository.name == name:
                 return repository
         raise KeyError(f"repository is no longer configured: {name}")
+
+    def repositories(self) -> tuple[RepositoryConfig, ...]:
+        configured = {item.name: item for item in self.config.repositories}
+        if not self.config.discover_installation_repositories:
+            return tuple(sorted(configured.values(), key=lambda item: item.name))
+
+        cache_key = "repository_discovery:v1"
+        cached = self.store.get_worker_state(cache_key, {})
+        now = time.time()
+        if isinstance(cached, dict) and now - float(cached.get("refreshed_at", 0)) < 300:
+            for item in cached.get("repositories", []):
+                if isinstance(item, dict) and item.get("name") and item.get("clone_url"):
+                    repository = RepositoryConfig(str(item["name"]), str(item["clone_url"]))
+                    configured.setdefault(repository.name, repository)
+            return tuple(sorted(configured.values(), key=lambda item: item.name))
+
+        discovered: list[RepositoryConfig] = []
+        try:
+            installations = self.github.list_installation_repositories()  # type: ignore[attr-defined]
+            for item in installations:
+                name = item.get("full_name")
+                clone_url = item.get("clone_url")
+                default_branch = item.get("default_branch")
+                if not all(isinstance(value, str) and value for value in (name, clone_url, default_branch)):
+                    continue
+                try:
+                    text = self.github.get_repository_file(  # type: ignore[attr-defined]
+                        name,
+                        ".codex-worker/project.toml",
+                        ref=default_branch,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "status_code", None) == 404:
+                        continue
+                    raise
+                try:
+                    project = parse_project_config(text)
+                except ConfigError:
+                    continue
+                if project.default_base_branch != default_branch:
+                    continue
+                if project.worker_github_app_id != int(self.config.github_app_id):
+                    continue
+                discovered.append(RepositoryConfig(name, clone_url))
+        except Exception:
+            if not isinstance(cached, dict) or not cached.get("repositories"):
+                raise
+            discovered = [
+                RepositoryConfig(str(item["name"]), str(item["clone_url"]))
+                for item in cached["repositories"]
+                if isinstance(item, dict) and item.get("name") and item.get("clone_url")
+            ]
+        else:
+            self.store.set_worker_state(
+                cache_key,
+                {
+                    "refreshed_at": now,
+                    "repositories": [
+                        {"name": item.name, "clone_url": item.clone_url}
+                        for item in discovered
+                    ],
+                },
+            )
+
+        for repository in discovered:
+            configured.setdefault(repository.name, repository)
+        return tuple(sorted(configured.values(), key=lambda item: item.name))
 
     def _set_remote_state(self, repo: str, issue: dict[str, Any], state: str) -> None:
         labels = []
@@ -96,6 +173,13 @@ class WorkerDaemon:
                 labels.append(value)
         labels.append(f"codex:{state}")
         self.github.set_labels(repo, int(issue["number"]), labels)  # type: ignore[attr-defined]
+
+    def _record_repository_eligibility(
+        self, repo: str, value: dict[str, Any]
+    ) -> None:
+        key = f"repository_eligibility:{repo}"
+        if self.store.get_worker_state(key) != value:
+            self.store.set_worker_state(key, value)
 
     def recover_active_tasks(self) -> bool:
         recovered = False
@@ -274,7 +358,22 @@ class WorkerDaemon:
         if self.store.active_tasks():
             return False
         queued: list[tuple[RepositoryConfig, dict[str, Any]]] = []
-        for repository in self.config.repositories:
+        for repository in self.repositories():
+            try:
+                self.service.validate_repository_authority(repository)
+            except Exception as exc:
+                self._record_repository_eligibility(
+                    repository.name,
+                    {
+                        "eligible": False,
+                        "error": f"{type(exc).__name__}: {exc}"[:1000],
+                    },
+                )
+                continue
+            self._record_repository_eligibility(
+                repository.name,
+                {"eligible": True},
+            )
             for issue in self.github.list_queued_issues(repository.name):
                 if "pull_request" in issue:
                     continue
@@ -285,7 +384,10 @@ class WorkerDaemon:
             queued,
             key=lambda item: (str(item[1].get("created_at", "")), int(item[1]["number"])),
         )
-        self.service.process_issue(repository, issue)
+        if REPOSITORY_PROBE_MARKER in str(issue.get("body", "")):
+            self.service.process_repository_probe(repository, issue)
+        else:
+            self.service.process_issue(repository, issue)
         return True
 
     def run_forever(self) -> None:

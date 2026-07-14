@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codex_mac_worker.config import ConfigError, load_project_config
+from codex_mac_worker.config import ConfigError, load_project_config, parse_project_config
 from codex_mac_worker.policy import PolicyError, validate_changed_paths, validate_task_policy
 from codex_mac_worker.protocol import parse_task_body
 
@@ -14,8 +14,9 @@ from .test_protocol import task_body
 def write_config(path: Path) -> None:
     path.write_text(
         """
-schema_version = 1
+schema_version = 2
 default_base_branch = "main"
+worker_github_app_id = 777
 allowed_risk_levels = ["low", "medium"]
 protected_paths = [".github/workflows", ".env", "product/deploy"]
 max_changed_files = 3
@@ -42,16 +43,55 @@ def test_load_project_config_parses_verification_profiles(tmp_path: Path) -> Non
     config = load_project_config(config_path)
 
     assert config.max_changed_files == 3
+    assert config.worker_github_app_id == 777
     assert config.preparation == ("python3 -m venv .venv",)
     assert config.verification["fast"] == ("python -m unittest",)
+
+
+def test_parse_project_config_validates_remote_text_without_a_file(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    write_config(config_path)
+
+    config = parse_project_config(config_path.read_text(encoding="utf-8"))
+
+    assert config.default_base_branch == "main"
+    assert config.max_changed_files == 3
+
+
+def test_project_config_requires_trusted_worker_github_app_id(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "worker_github_app_id = 777\n", ""
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="worker_github_app_id"):
+        load_project_config(config_path)
 
 
 def test_load_project_config_rejects_unknown_schema(tmp_path: Path) -> None:
     config_path = tmp_path / "project.toml"
     write_config(config_path)
-    config_path.write_text(config_path.read_text().replace("schema_version = 1", "schema_version = 2"))
+    config_path.write_text(config_path.read_text().replace("schema_version = 2", "schema_version = 3"))
 
     with pytest.raises(ConfigError, match="schema_version"):
+        load_project_config(config_path)
+
+
+def test_project_schema_v1_has_an_explicit_migration_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "schema_version = 2", "schema_version = 1"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="migrated to 2.*re-dispatch"):
         load_project_config(config_path)
 
 

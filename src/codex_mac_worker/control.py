@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import Any, Protocol
 import uuid
 
 import yaml
 
 from .protocol import TASK_MARKER, parse_task_body, render_command_comment
+from .references import parse_issue_reference as parse_issue
 
 
 class ControlGitHub(Protocol):
@@ -59,9 +59,5 @@ def send_command(
 
 
 def parse_issue_reference(reference: str) -> tuple[str, int]:
-    url_match = re.fullmatch(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)/?", reference)
-    short_match = re.fullmatch(r"([^/]+/[^#]+)#(\d+)", reference)
-    match = url_match or short_match
-    if not match:
-        raise ValueError("issue reference must be a GitHub issue URL or owner/repo#number")
-    return match.group(1), int(match.group(2))
+    parsed = parse_issue(reference)
+    return parsed.repo, parsed.number

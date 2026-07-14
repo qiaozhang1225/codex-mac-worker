@@ -39,18 +39,26 @@ clone_url = "https://github.com/owner/repo.git"
     )
 
     assert worker_main(["--config", str(config), "--check-config"]) == 0
-    assert '"worker_id": "test"' in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert '"worker_id": "test"' in output
+    assert '"discover_installation_repositories": false' in output
 
 
 def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
     example = (ROOT / "templates" / "worker.toml.example").read_text(encoding="utf-8")
-    rendered = example.replace("__HOME__", str(tmp_path)).replace("__OWNER__", "owner")
+    rendered = (
+        example.replace("__HOME__", str(tmp_path))
+        .replace("__OWNER__", "owner")
+        .replace("REPLACE_WITH_APP_ID", "123")
+        .replace("REPLACE_WITH_INSTALLATION_ID", "456")
+    )
     config_path = tmp_path / "worker.toml"
     config_path.write_text(rendered, encoding="utf-8")
     config = load_worker_config(config_path)
     assert config.worker_id == "mac-mini-01"
     assert config.repositories[0].name == "owner/EaseWise"
     assert config.codex_home == tmp_path / "Library/Application Support/CodexWorker/codex-home"
+    assert config.discover_installation_repositories is True
 
     permissions = tomllib.loads(
         (ROOT / "templates" / "codex-worker.config.toml").read_text(encoding="utf-8")
@@ -88,3 +96,22 @@ def test_shell_scripts_parse_and_docs_cover_manual_boundaries() -> None:
         assert required in operations
     assert "dispatch-codex-task" in macbook
     assert "codexctl" in macbook
+    combined = "\n".join((setup, operations, macbook, (ROOT / "docs" / "SECURITY.md").read_text()))
+    for required in (
+        "discover_installation_repositories",
+        "codexctl repo status",
+        "codexctl repo onboard",
+        "codexctl repo finalize",
+        "awaiting-worker",
+        "codexctl task review",
+        "codexctl task merge",
+        "--expected-head",
+        "explicit",
+        "future PR",
+        "Goal",
+    ):
+        assert required in combined
+
+    bootstrap = (ROOT / "scripts" / "bootstrap_repository.sh").read_text(encoding="utf-8")
+    assert "codexctl repo status" in bootstrap
+    assert "gh label create" not in bootstrap

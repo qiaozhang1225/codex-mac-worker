@@ -10,6 +10,9 @@ import yaml
 
 TASK_MARKER = "<!-- codex-task:v1 -->"
 COMMAND_MARKER = "<!-- codex-command:v1 -->"
+REPOSITORY_PROBE_MARKER = "<!-- codex-repository-probe:v1 -->"
+REPOSITORY_ATTESTATION_MARKER = "<!-- codex-worker-readiness:v1 -->"
+DELIVERY_MARKER = "<!-- codex-worker-delivery:v1 -->"
 _BLOCK_RE = re.compile(
     rf"{re.escape(TASK_MARKER)}\s*```yaml\s*(.*?)\s*```",
     re.DOTALL,
@@ -20,6 +23,19 @@ _COMMAND_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _COMMAND_ACTIONS = {"revise", "pause", "resume", "retry", "cancel"}
+_PROBE_BLOCK_RE = re.compile(
+    rf"{re.escape(REPOSITORY_PROBE_MARKER)}\s*```yaml\s*(.*?)\s*```",
+    re.DOTALL,
+)
+_ATTESTATION_BLOCK_RE = re.compile(
+    rf"{re.escape(REPOSITORY_ATTESTATION_MARKER)}\s*```yaml\s*(.*?)\s*```",
+    re.DOTALL,
+)
+_HASH_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DELIVERY_BLOCK_RE = re.compile(
+    rf"{re.escape(DELIVERY_MARKER)}\s*```yaml\s*(.*?)\s*```",
+    re.DOTALL,
+)
 
 
 class ProtocolError(ValueError):
@@ -49,6 +65,37 @@ class CommandSpec:
     requirements: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RepositoryProbe:
+    probe_id: str
+    default_head: str
+    project_config_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryAttestation:
+    probe_id: str
+    worker_id: str
+    default_head: str
+    project_config_hash: str
+    attested_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryMetadata:
+    issue_number: int
+    task_hash: str
+    context_commit: str
+    delivery_commit: str
+    verification_profile: str
+    verification_passed: bool
+    model: str | None
+    cli_version: str | None
+    acceptance_results: tuple[dict[str, str], ...]
+    risks: tuple[str, ...]
+    needs_human: tuple[str, ...]
+
+
 def _string_list(data: dict[str, Any], key: str, *, required: bool = True) -> tuple[str, ...]:
     value = data.get(key)
     if not isinstance(value, list) or (required and not value):
@@ -63,6 +110,26 @@ def _required_string(data: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ProtocolError(f"{key} must be a non-empty string")
     return value.strip()
+
+
+def _machine_mapping(body: str, pattern: re.Pattern[str], resource: str) -> dict[str, Any]:
+    matches = pattern.findall(body)
+    if len(matches) != 1:
+        raise ProtocolError(f"{resource} must contain exactly one machine block")
+    try:
+        raw = yaml.safe_load(matches[0])
+    except yaml.YAMLError as exc:
+        raise ProtocolError(f"invalid {resource} YAML: {exc}") from exc
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ProtocolError(f"{resource} schema_version must be 1")
+    return raw
+
+
+def _full_hex(raw: dict[str, Any], key: str, pattern: re.Pattern[str]) -> str:
+    value = _required_string(raw, key).lower()
+    if not pattern.fullmatch(value):
+        raise ProtocolError(f"{key} has an invalid hexadecimal length")
+    return value
 
 
 def parse_task_body(body: str) -> TaskSpec:
@@ -163,4 +230,134 @@ def parse_command_comment(body: str) -> CommandSpec:
         issue_number=issue_number,
         action=action,
         requirements=tuple(item.strip() for item in requirements_raw),
+    )
+
+
+def render_repository_probe(
+    *,
+    probe_id: str,
+    default_head: str,
+    project_config_hash: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "probe_id": probe_id,
+        "default_head": default_head,
+        "project_config_hash": project_config_hash,
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{REPOSITORY_PROBE_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def parse_repository_probe(body: str) -> RepositoryProbe:
+    raw = _machine_mapping(body, _PROBE_BLOCK_RE, "repository probe")
+    return RepositoryProbe(
+        probe_id=_required_string(raw, "probe_id"),
+        default_head=_full_hex(raw, "default_head", _FULL_SHA_RE),
+        project_config_hash=_full_hex(raw, "project_config_hash", _HASH_RE),
+    )
+
+
+def render_repository_attestation(
+    *,
+    probe_id: str,
+    worker_id: str,
+    default_head: str,
+    project_config_hash: str,
+    attested_at: str,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "probe_id": probe_id,
+        "worker_id": worker_id,
+        "default_head": default_head,
+        "project_config_hash": project_config_hash,
+        "attested_at": attested_at,
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{REPOSITORY_ATTESTATION_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def parse_repository_attestation(body: str) -> RepositoryAttestation:
+    raw = _machine_mapping(body, _ATTESTATION_BLOCK_RE, "repository attestation")
+    return RepositoryAttestation(
+        probe_id=_required_string(raw, "probe_id"),
+        worker_id=_required_string(raw, "worker_id"),
+        default_head=_full_hex(raw, "default_head", _FULL_SHA_RE),
+        project_config_hash=_full_hex(raw, "project_config_hash", _HASH_RE),
+        attested_at=_required_string(raw, "attested_at"),
+    )
+
+
+def render_delivery_block(metadata: DeliveryMetadata) -> str:
+    payload = {
+        "schema_version": 1,
+        "issue_number": metadata.issue_number,
+        "task_hash": metadata.task_hash,
+        "context_commit": metadata.context_commit,
+        "delivery_commit": metadata.delivery_commit,
+        "verification_profile": metadata.verification_profile,
+        "verification_passed": metadata.verification_passed,
+        "model": metadata.model,
+        "cli_version": metadata.cli_version,
+        "acceptance_results": list(metadata.acceptance_results),
+        "risks": list(metadata.risks),
+        "needs_human": list(metadata.needs_human),
+    }
+    machine = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).strip()
+    return f"{DELIVERY_MARKER}\n```yaml\n{machine}\n```\n"
+
+
+def parse_delivery_block(body: str) -> DeliveryMetadata:
+    raw = _machine_mapping(body, _DELIVERY_BLOCK_RE, "worker delivery")
+    issue_number = raw.get("issue_number")
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool) or issue_number <= 0:
+        raise ProtocolError("delivery issue_number must be a positive integer")
+    verification_passed = raw.get("verification_passed")
+    if not isinstance(verification_passed, bool):
+        raise ProtocolError("delivery verification_passed must be a boolean")
+    acceptance = raw.get("acceptance_results")
+    if not isinstance(acceptance, list):
+        raise ProtocolError("delivery acceptance_results must be a list")
+    normalized_acceptance: list[dict[str, str]] = []
+    for item in acceptance:
+        if not isinstance(item, dict):
+            raise ProtocolError("delivery acceptance result must be a mapping")
+        criterion = _required_string(item, "criterion")
+        status = _required_string(item, "status")
+        evidence = _required_string(item, "evidence")
+        if status not in {"met", "not_met", "needs_review"}:
+            raise ProtocolError("delivery acceptance result status is invalid")
+        normalized_acceptance.append(
+            {"criterion": criterion, "status": status, "evidence": evidence}
+        )
+
+    def strings(key: str) -> tuple[str, ...]:
+        value = raw.get(key)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            raise ProtocolError(f"delivery {key} must be a string list")
+        return tuple(item.strip() for item in value)
+
+    def optional_string(key: str) -> str | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ProtocolError(f"delivery {key} must be a string or null")
+        return value.strip()
+
+    return DeliveryMetadata(
+        issue_number=issue_number,
+        task_hash=_full_hex(raw, "task_hash", _HASH_RE),
+        context_commit=_full_hex(raw, "context_commit", _FULL_SHA_RE),
+        delivery_commit=_full_hex(raw, "delivery_commit", _FULL_SHA_RE),
+        verification_profile=_required_string(raw, "verification_profile"),
+        verification_passed=verification_passed,
+        model=optional_string("model"),
+        cli_version=optional_string("cli_version"),
+        acceptance_results=tuple(normalized_acceptance),
+        risks=strings("risks"),
+        needs_human=strings("needs_human"),
     )
