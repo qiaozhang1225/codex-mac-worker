@@ -115,6 +115,29 @@ class DurableGitHub:
             {"operation": "add_comment", "repo": repo, "issue_number": issue_number, "body": body}
         )
 
+    def retry_failed_comment(
+        self,
+        repo: str,
+        issue_number: int,
+        body: str,
+        *,
+        state_key: str,
+        state_value: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "operation": "add_comment",
+            "repo": repo,
+            "issue_number": issue_number,
+            "body": body,
+        }
+        outbox_id = self.store.enqueue_outbox("github", payload, self._key(payload))
+        self.store.reactivate_failed_outbox_and_set_worker_state(
+            outbox_id,
+            state_key=state_key,
+            state_value=state_value,
+        )
+        return self._write(payload)
+
     def update_comment(self, repo: str, comment_id: int, body: str) -> dict[str, Any]:
         return self._write(
             {"operation": "update_comment", "repo": repo, "comment_id": comment_id, "body": body}

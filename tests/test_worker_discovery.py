@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from codex_mac_worker.config import RepositoryConfig, WorkerConfig
 from codex_mac_worker.daemon import WorkerDaemon
+from codex_mac_worker.durable_github import DurableGitHub
 from codex_mac_worker.github import GitHubError
 from codex_mac_worker.protocol import render_repository_probe
 from codex_mac_worker.store import EventStore
@@ -134,12 +137,13 @@ class ProbeGitHub:
         self.config_text = config_text
         self.comments: list[str] = []
         self.updates: list[dict] = []
+        self.fail_attestations = False
 
     def collaborator_permission(self, repo: str, username: str) -> str:
         return "write"
 
     def get_repository(self, repo: str) -> dict:
-        return {"default_branch": "main"}
+        return {"id": 123456, "default_branch": "main"}
 
     def get_commit(self, repo: str, ref: str) -> dict:
         assert ref == "main"
@@ -151,8 +155,16 @@ class ProbeGitHub:
         return self.config_text
 
     def add_comment(self, repo: str, issue_number: int, body: str) -> dict:
+        if self.fail_attestations and "<!-- codex-worker-readiness:v1 -->" in body:
+            raise RuntimeError("offline")
         self.comments.append(body)
         return {"id": 99}
+
+    def list_comments(self, repo: str, issue_number: int) -> list[dict]:
+        return [
+            {"id": index, "body": body}
+            for index, body in enumerate(self.comments, start=1)
+        ]
 
     def update_issue(
         self,
@@ -207,6 +219,128 @@ def test_probe_is_attested_without_invoking_runner(tmp_path: Path) -> None:
     assert github.updates == [
         {"labels": ["kind:probe", "codex:completed"], "state": "closed"}
     ]
+
+
+def test_probe_attestation_is_idempotent_across_worker_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = RepositoryConfig("owner/ready", "https://github.com/owner/ready.git")
+    settings = worker_config(tmp_path, repositories=(repository,))
+    remote = ProbeGitHub(PROJECT_TOML)
+    store = EventStore(settings.database_path)
+    issue = {
+        "number": 7,
+        "body": render_repository_probe(
+            probe_id="probe-1",
+            default_head="a" * 40,
+            project_config_hash=hashlib.sha256(PROJECT_TOML.encode()).hexdigest(),
+        ),
+        "labels": [{"name": "codex:queued"}, {"name": "kind:probe"}],
+        "user": {"login": "owner"},
+    }
+    timestamps = iter(["2026-07-14T00:00:00+00:00", "2026-07-14T00:01:00+00:00"])
+    monkeypatch.setattr("codex_mac_worker.worker.iso_now", lambda: next(timestamps))
+    service = WorkerService(
+        config=settings,
+        github=DurableGitHub(remote, store),
+        token_provider=lambda: "token",
+        store=store,
+        git=object(),
+        runner=RunnerMustNotRun(),
+    )
+
+    service.process_repository_probe(repository, issue)
+    store.close()
+    reopened_store = EventStore(settings.database_path)
+    service = WorkerService(
+        config=settings,
+        github=DurableGitHub(remote, reopened_store),
+        token_provider=lambda: "token",
+        store=reopened_store,
+        git=object(),
+        runner=RunnerMustNotRun(),
+    )
+    service.process_repository_probe(repository, issue)
+
+    assert len(remote.comments) == 1
+    assert remote.updates == [
+        {"labels": ["kind:probe", "codex:completed"], "state": "closed"}
+    ]
+
+
+def test_probe_attestation_can_retry_after_issue_is_explicitly_updated(
+    tmp_path: Path,
+) -> None:
+    repository = RepositoryConfig("owner/ready", "https://github.com/owner/ready.git")
+    settings = worker_config(tmp_path, repositories=(repository,))
+    remote = ProbeGitHub(PROJECT_TOML)
+    remote.fail_attestations = True
+    store = EventStore(settings.database_path)
+    github = DurableGitHub(remote, store)
+    issue = {
+        "number": 7,
+        "body": render_repository_probe(
+            probe_id="probe-1",
+            default_head="a" * 40,
+            project_config_hash=hashlib.sha256(PROJECT_TOML.encode()).hexdigest(),
+        ),
+        "labels": [{"name": "codex:queued"}, {"name": "kind:probe"}],
+        "user": {"login": "owner"},
+        "updated_at": "2026-07-14T00:00:00Z",
+    }
+    service = WorkerService(
+        config=settings,
+        github=github,
+        token_provider=lambda: "token",
+        store=store,
+        git=object(),
+        runner=RunnerMustNotRun(),
+    )
+
+    service.process_repository_probe(repository, issue)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="offline"):
+            github.flush()
+
+    failed = store.connection.execute(
+        """
+        SELECT failed_at FROM outbox
+        WHERE payload_json LIKE '%codex-worker-readiness%'
+        """
+    ).fetchone()
+    assert failed is not None
+    assert failed["failed_at"] is not None
+
+    remote.fail_attestations = False
+    retried_issue = {**issue, "updated_at": "2026-07-14T00:05:00Z"}
+
+    def crash_after_retry_transaction(payload: dict) -> dict:
+        raise SystemExit("simulated crash after retry transaction")
+
+    github._write = crash_after_retry_transaction
+    with pytest.raises(SystemExit, match="simulated crash"):
+        service.process_repository_probe(repository, retried_issue)
+    store.close()
+
+    reopened_store = EventStore(settings.database_path)
+    service = WorkerService(
+        config=settings,
+        github=DurableGitHub(remote, reopened_store),
+        token_provider=lambda: "token",
+        store=reopened_store,
+        git=object(),
+        runner=RunnerMustNotRun(),
+    )
+    service.process_repository_probe(repository, retried_issue)
+    service.process_repository_probe(repository, retried_issue)
+
+    attestations = [
+        body
+        for body in remote.comments
+        if "<!-- codex-worker-readiness:v1 -->" in body
+    ]
+    assert len(attestations) == 1
 
 
 def test_probe_rejects_project_bound_to_another_github_app(tmp_path: Path) -> None:

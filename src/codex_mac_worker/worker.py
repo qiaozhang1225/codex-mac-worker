@@ -223,6 +223,60 @@ class WorkerService:
         if author not in self.config.authorized_users or permission not in AUTHORIZED_PERMISSIONS:
             raise PolicyError(f"issue author {author or '<missing>'} is not authorized")
 
+    def _repository_attestation_state(
+        self,
+        *,
+        repository_identity: str,
+        issue_number: int,
+        probe_id: str,
+        default_head: str,
+        project_config_hash: str,
+        issue_updated_at: str,
+    ) -> tuple[str, bool, str, dict[str, str]]:
+        identity = json.dumps(
+            [
+                repository_identity,
+                issue_number,
+                probe_id,
+                default_head,
+                project_config_hash,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        state_key = "repository-attested-at:" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+        existing = self.store.get_worker_state(state_key)
+        if isinstance(existing, str) and existing:
+            existing = {
+                "attested_at": existing,
+                "issue_updated_at": issue_updated_at,
+            }
+            self.store.set_worker_state(state_key, existing)
+        if isinstance(existing, dict):
+            attested_at = existing.get("attested_at")
+            observed_update = existing.get("issue_updated_at")
+            if isinstance(attested_at, str) and attested_at:
+                retry_failed = bool(
+                    issue_updated_at
+                    and isinstance(observed_update, str)
+                    and observed_update
+                    and issue_updated_at != observed_update
+                )
+                retry_state = {
+                    "attested_at": attested_at,
+                    "issue_updated_at": issue_updated_at,
+                }
+                return attested_at, retry_failed, state_key, retry_state
+        attested_at = iso_now()
+        state = {
+            "attested_at": attested_at,
+            "issue_updated_at": issue_updated_at,
+        }
+        self.store.set_worker_state(state_key, state)
+        return attested_at, False, state_key, state
+
     def process_repository_probe(
         self,
         repository: RepositoryConfig,
@@ -237,6 +291,14 @@ class WorkerService:
             default_branch = str(repository_payload.get("default_branch", ""))
             if not default_branch:
                 raise PolicyError("repository default branch is missing")
+            repository_id = repository_payload.get("id")
+            repository_identity = (
+                f"github-id:{repository_id}"
+                if isinstance(repository_id, int)
+                and not isinstance(repository_id, bool)
+                and repository_id > 0
+                else repo.lower()
+            )
             commit = self.github.get_commit(repo, default_branch)
             current_head = str(commit.get("sha", "")).lower()
             if current_head != probe.default_head:
@@ -253,17 +315,36 @@ class WorkerService:
             config_hash = hashlib.sha256(project_text.encode("utf-8")).hexdigest()
             if config_hash != probe.project_config_hash:
                 raise PolicyError("repository probe project config changed")
-            self.github.add_comment(
-                repo,
-                number,
-                render_repository_attestation(
+            attested_at, retry_failed, state_key, retry_state = (
+                self._repository_attestation_state(
+                    repository_identity=repository_identity,
+                    issue_number=number,
                     probe_id=probe.probe_id,
-                    worker_id=self.config.worker_id,
                     default_head=current_head,
                     project_config_hash=config_hash,
-                    attested_at=iso_now(),
-                ),
+                    issue_updated_at=str(issue.get("updated_at", "")),
+                )
             )
+            attestation_body = render_repository_attestation(
+                probe_id=probe.probe_id,
+                worker_id=self.config.worker_id,
+                default_head=current_head,
+                project_config_hash=config_hash,
+                attested_at=attested_at,
+            )
+            retry_comment = getattr(self.github, "retry_failed_comment", None)
+            if retry_failed and callable(retry_comment):
+                retry_comment(
+                    repo,
+                    number,
+                    attestation_body,
+                    state_key=state_key,
+                    state_value=retry_state,
+                )
+            else:
+                self.github.add_comment(repo, number, attestation_body)
+                if retry_failed:
+                    self.store.set_worker_state(state_key, retry_state)
             labels = [
                 label
                 for label in self._labels(issue)
