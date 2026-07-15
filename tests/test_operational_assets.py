@@ -64,6 +64,7 @@ def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
         (ROOT / "templates" / "codex-worker.config.toml").read_text(encoding="utf-8")
     )
     assert permissions["features"]["goals"] is False
+    assert permissions["features"]["network_proxy"] is True
     assert permissions["permissions"]["codex-worker"]["filesystem"]["~"] == "deny"
     assert permissions["permissions"]["codex-worker"]["filesystem"]["/opt/homebrew"] == "read"
     assert permissions["permissions"]["codex-worker"]["network"]["enabled"] is False
