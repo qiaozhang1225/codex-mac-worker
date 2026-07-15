@@ -21,7 +21,14 @@ class DurableGitHub:
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return "github:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _write(self, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _remote_id(result: Any) -> str | None:
+        if not isinstance(result, dict):
+            return None
+        value = result.get("id") or result.get("number")
+        return str(value) if value is not None else None
+
+    def _write(self, payload: dict[str, Any]) -> Any:
         outbox_id = self.store.enqueue_outbox("github", payload, self._key(payload))
         existing = self.store.get_outbox(outbox_id)
         if existing and existing["delivered_at"]:
@@ -38,10 +45,10 @@ class DurableGitHub:
                 retryable=bool(getattr(exc, "retryable", True)),
             )
             raise
-        remote_id = result.get("id") or result.get("number")
+        remote_id = self._remote_id(result)
         self.store.mark_outbox_delivered(
             outbox_id,
-            remote_id=str(remote_id) if remote_id is not None else None,
+            remote_id=remote_id,
         )
         return result
 
@@ -104,10 +111,10 @@ class DurableGitHub:
                     retryable=bool(getattr(exc, "retryable", True)),
                 )
                 raise
-            remote_id = result.get("id") or result.get("number")
+            remote_id = self._remote_id(result)
             self.store.mark_outbox_delivered(
                 item["id"],
-                remote_id=str(remote_id) if remote_id is not None else None,
+                remote_id=remote_id,
             )
 
     def add_comment(self, repo: str, issue_number: int, body: str) -> dict[str, Any]:
