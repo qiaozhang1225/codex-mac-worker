@@ -85,6 +85,12 @@ class GitOperations:
             "early eof",
             "ssl_error_syscall",
             "send failure: broken pipe",
+            "error in the http2 framing layer",
+            "http/2 stream",
+            "gnutls recv error",
+            "tls connection was non-properly terminated",
+            "unexpected disconnect while reading sideband packet",
+            "empty reply from server",
         )
         if any(marker in normalized for marker in transient_markers):
             return True

@@ -106,6 +106,33 @@ def test_network_git_does_not_retry_authentication_failure(
     assert delays == []
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "fatal: unable to access repository: Error in the HTTP2 framing layer",
+        "RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL",
+        "GnuTLS recv error (-110): The TLS connection was non-properly terminated",
+        "fetch-pack: unexpected disconnect while reading sideband packet",
+        "fatal: unable to access repository: Empty reply from server",
+    ],
+)
+def test_known_transport_interruptions_are_retryable(stderr: str) -> None:
+    assert GitOperations._is_retryable_network_failure(stderr) is True
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "fatal: Authentication failed",
+        "fatal: unable to access repository: The requested URL returned error: 403",
+        "SSL certificate problem: self-signed certificate",
+        "fatal: refusing to fetch into branch checked out at worktree",
+    ],
+)
+def test_permanent_git_failures_are_not_retryable(stderr: str) -> None:
+    assert GitOperations._is_retryable_network_failure(stderr) is False
+
+
 def test_transient_network_retries_are_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
