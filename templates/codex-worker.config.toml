@@ -26,3 +26,15 @@ extends = ":workspace"
 
 [permissions.codex-worker.network]
 enabled = false
+
+[permissions.codex-worker-preparation]
+description = "Reviewed dependency preparation with scoped package-registry access."
+extends = "codex-worker"
+
+[permissions.codex-worker-preparation.network]
+enabled = true
+
+[permissions.codex-worker-preparation.network.domains]
+"pypi.org" = "allow"
+"files.pythonhosted.org" = "allow"
+"registry.npmjs.org" = "allow"

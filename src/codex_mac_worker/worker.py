@@ -582,6 +582,7 @@ This PR was created as a draft. The worker cannot merge it.
                 timeout_seconds=max(1, min(remaining, 1800)),
                 codex_path=self.config.codex_path if self.config.codex_home else None,
                 codex_home=self.config.codex_home,
+                permission_profile="codex-worker-preparation",
                 control_callback=monitor,
             )
             if preparation_result.termination_reason:
@@ -900,6 +901,7 @@ This PR was created as a draft. The worker cannot merge it.
                 timeout_seconds=max(1, min(remaining, 1800)),
                 codex_path=self.config.codex_path if self.config.codex_home else None,
                 codex_home=self.config.codex_home,
+                permission_profile="codex-worker-preparation",
                 control_callback=monitor,
             )
             if preparation_result.termination_reason:

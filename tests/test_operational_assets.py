@@ -67,6 +67,14 @@ def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
     assert permissions["permissions"]["codex-worker"]["filesystem"]["~"] == "deny"
     assert permissions["permissions"]["codex-worker"]["filesystem"]["/opt/homebrew"] == "read"
     assert permissions["permissions"]["codex-worker"]["network"]["enabled"] is False
+    preparation = permissions["permissions"]["codex-worker-preparation"]
+    assert preparation["extends"] == "codex-worker"
+    assert preparation["network"]["enabled"] is True
+    assert preparation["network"]["domains"] == {
+        "pypi.org": "allow",
+        "files.pythonhosted.org": "allow",
+        "registry.npmjs.org": "allow",
+    }
 
     for name in (
         "com.easewise.codex-worker.plist",

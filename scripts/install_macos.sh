@@ -37,13 +37,15 @@ install -m 600 "$REPO_ROOT/templates/codex-worker.config.toml" \
   "$WORKER_CODEX_HOME/config.toml"
 
 SANDBOX_CHECK_ROOT="$(mktemp -d)"
-if ! CODEX_HOME="$WORKER_CODEX_HOME" "$CODEX_PATH" sandbox \
-  -P codex-worker -C "$SANDBOX_CHECK_ROOT" -- "$PYTHON_SOURCE" --version; then
-  rm -rf "$SANDBOX_CHECK_ROOT"
-  echo "Python cannot execute inside the Worker permission profile." >&2
-  echo "Use Python from /opt/homebrew or the signed Python.org framework." >&2
-  exit 2
-fi
+for permission_profile in codex-worker codex-worker-preparation; do
+  if ! CODEX_HOME="$WORKER_CODEX_HOME" "$CODEX_PATH" sandbox \
+    -P "$permission_profile" -C "$SANDBOX_CHECK_ROOT" -- "$PYTHON_SOURCE" --version; then
+    rm -rf "$SANDBOX_CHECK_ROOT"
+    echo "Python cannot execute inside the $permission_profile permission profile." >&2
+    echo "Use Python from /opt/homebrew or the signed Python.org framework." >&2
+    exit 2
+  fi
+done
 rm -rf "$SANDBOX_CHECK_ROOT"
 
 "$PYTHON_SOURCE" -m venv "$APP_ROOT/venv"
