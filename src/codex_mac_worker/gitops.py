@@ -7,11 +7,16 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from typing import Iterator, Mapping
+import time
+from typing import Callable, Iterator, Mapping
 
 
 class GitError(RuntimeError):
     """Raised when repository preparation or integrity validation fails."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,10 +33,20 @@ class DiffSummary:
 
 
 class GitOperations:
-    def __init__(self, *, cache_root: Path, worktree_root: Path, git_path: str = "git") -> None:
+    def __init__(
+        self,
+        *,
+        cache_root: Path,
+        worktree_root: Path,
+        git_path: str = "git",
+        network_retry_delays: tuple[float, ...] = (1.0, 3.0),
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.cache_root = cache_root
         self.worktree_root = worktree_root
         self.git_path = git_path
+        self.network_retry_delays = network_retry_delays
+        self._sleep = sleep
 
     def _git(
         self,
@@ -54,6 +69,50 @@ class GitOperations:
         if check and result.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
         return result
+
+    @staticmethod
+    def _is_retryable_network_failure(stderr: str) -> bool:
+        normalized = stderr.casefold()
+        transient_markers = (
+            "ssl connection timeout",
+            "connection timed out",
+            "operation timed out",
+            "could not resolve host",
+            "couldn't resolve host",
+            "failed to connect to",
+            "connection reset",
+            "remote end hung up unexpectedly",
+            "early eof",
+            "ssl_error_syscall",
+            "send failure: broken pipe",
+        )
+        if any(marker in normalized for marker in transient_markers):
+            return True
+        return re.search(
+            r"requested url returned error:\s*(?:429|5\d\d)\b",
+            normalized,
+        ) is not None
+
+    def _git_network(
+        self,
+        cwd: Path,
+        *args: str,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        attempts = len(self.network_retry_delays) + 1
+        for attempt in range(attempts):
+            result = self._git(cwd, *args, env=env, check=False)
+            if result.returncode == 0:
+                return result
+            retryable = self._is_retryable_network_failure(result.stderr)
+            if not retryable or attempt == attempts - 1:
+                attempt_detail = f" after {attempt + 1} attempts" if retryable else ""
+                raise GitError(
+                    f"git {' '.join(args)} failed{attempt_detail}: {result.stderr.strip()}",
+                    retryable=retryable,
+                )
+            self._sleep(self.network_retry_delays[attempt])
+        raise AssertionError("unreachable")
 
     @contextmanager
     def _authentication(self, token: str | None) -> Iterator[dict[str, str]]:
@@ -87,10 +146,17 @@ class GitOperations:
         mirror = self.cache_root / owner / f"{name}.git"
         with self._authentication(token) as env:
             if mirror.exists():
-                self._git(mirror, "remote", "update", "--prune", env=env)
+                self._git_network(mirror, "remote", "update", "--prune", env=env)
                 return mirror
             mirror.parent.mkdir(parents=True, exist_ok=True)
-            self._git(mirror.parent, "clone", "--mirror", clone_url, str(mirror), env=env)
+            self._git_network(
+                mirror.parent,
+                "clone",
+                "--mirror",
+                clone_url,
+                str(mirror),
+                env=env,
+            )
         return mirror
 
     def prepare_worktree(
@@ -221,7 +287,7 @@ class GitOperations:
         else:
             self._git(worktree, "remote", "add", remote_name, clone_url)
         with self._authentication(token) as env:
-            self._git(
+            self._git_network(
                 worktree,
                 "push",
                 remote_name,
