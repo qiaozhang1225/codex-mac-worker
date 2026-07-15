@@ -100,7 +100,9 @@ def test_verification_uses_worker_permission_profile_and_scrubbed_environment(
         "args = sys.argv[1:]\n"
         f"pathlib.Path({str(capture)!r}).write_text(json.dumps({{"
         "'args': args, 'codex_home': os.environ.get('CODEX_HOME'), "
-        "'github_token': os.environ.get('GITHUB_TOKEN')}))\n"
+        "'github_token': os.environ.get('GITHUB_TOKEN'), "
+        "'pip_cache': os.environ.get('PIP_CACHE_DIR'), "
+        "'npm_cache': os.environ.get('npm_config_cache')}))\n"
         "index = args.index('--')\n"
         "raise SystemExit(subprocess.run(args[index + 1:]).returncode)\n",
         encoding="utf-8",
@@ -133,6 +135,8 @@ def test_verification_uses_worker_permission_profile_and_scrubbed_environment(
     assert data["args"][:4] == ["sandbox", "-P", "codex-worker", "-C"]
     assert data["codex_home"] == str(codex_home)
     assert data["github_token"] is None
+    assert data["pip_cache"] is None
+    assert data["npm_cache"] is None
 
 
 def test_command_runner_uses_requested_permission_profile(
@@ -155,7 +159,10 @@ def test_command_runner_uses_requested_permission_profile(
 
     result = run_commands(
         tmp_path,
-        (f"{sys.executable} -c 'print(123)'",),
+        (
+            f"{sys.executable} -c 'print(123)'",
+            f"{sys.executable} -c 'print(456)'",
+        ),
         timeout_seconds=5,
         codex_path=fake_codex,
         codex_home=codex_home,
@@ -169,6 +176,49 @@ def test_command_runner_uses_requested_permission_profile(
         "codex-worker-preparation",
         "-C",
     ]
+
+
+def test_preparation_runner_uses_ephemeral_package_caches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "sandbox.json"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        "data = {"
+        "'pip_cache': os.environ.get('PIP_CACHE_DIR'), "
+        "'npm_cache': os.environ.get('npm_config_cache'), "
+        "'github_token': os.environ.get('GITHUB_TOKEN'), "
+        "'pip_exists': pathlib.Path(os.environ['PIP_CACHE_DIR']).is_dir(), "
+        "'npm_parent_exists': pathlib.Path(os.environ['npm_config_cache']).parent.is_dir()}\n"
+        f"pathlib.Path({str(capture)!r}).write_text(json.dumps(data))\n"
+        "index = args.index('--')\n"
+        "raise SystemExit(subprocess.run(args[index + 1:]).returncode)\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IEXEC)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-leak")
+
+    result = run_commands(
+        tmp_path,
+        (f"{sys.executable} -c 'print(123)'",),
+        timeout_seconds=5,
+        codex_path=fake_codex,
+        codex_home=codex_home,
+        permission_profile="codex-worker-preparation",
+    )
+    assert result.passed is True, result.commands
+    data = json.loads(capture.read_text(encoding="utf-8"))
+
+    assert data["pip_exists"] is True
+    assert data["npm_parent_exists"] is True
+    assert Path(data["pip_cache"]).parent == Path(data["npm_cache"]).parent
+    assert data["github_token"] is None
+    assert not Path(data["pip_cache"]).parent.exists()
 
 
 def test_command_runner_stops_process_group_on_cancel(tmp_path: Path) -> None:

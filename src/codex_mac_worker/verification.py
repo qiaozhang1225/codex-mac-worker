@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
@@ -98,82 +99,107 @@ def run_commands(
     results: list[CommandResult] = []
     started = time.monotonic()
     termination_reason: str | None = None
-    for command in commands:
-        remaining = timeout_seconds - (time.monotonic() - started)
-        if remaining <= 0:
-            results.append(CommandResult(command, 124, "verification timed out"))
-            break
-        argv = ["/bin/zsh", "-lc", command]
-        environment: dict[str, str] | None = None
-        if codex_path is not None or codex_home is not None:
-            if codex_path is None or codex_home is None:
-                raise VerificationError("codex_path and codex_home must be supplied together")
-            argv = [
-                str(codex_path),
-                "sandbox",
-                "-P",
-                permission_profile,
-                "-C",
-                str(worktree),
-                "--",
-                *argv,
-            ]
-            environment = {
-                key: value
-                for key, value in os.environ.items()
-                if key in {"PATH", "TMPDIR", "LANG", "LC_ALL"}
-                or key.startswith("LC_")
-            }
-            environment["HOME"] = os.environ.get("HOME", str(Path.home()))
-            environment["CODEX_HOME"] = str(codex_home)
-        try:
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output_file:
-                process = subprocess.Popen(
-                argv,
-                cwd=worktree,
-                env=environment,
-                text=True,
-                stdout=output_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                )
-                deadline = time.monotonic() + max(0.01, remaining)
-                timed_out = False
-                while process.poll() is None:
-                    requested = control_callback() if control_callback is not None else None
-                    if requested in {"pause", "cancel"}:
-                        termination_reason = requested
-                        os.killpg(process.pid, signal.SIGTERM)
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait(timeout=2)
-                        break
-                    if time.monotonic() >= deadline:
-                        timed_out = True
-                        os.killpg(process.pid, signal.SIGTERM)
-                        try:
-                            process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid, signal.SIGKILL)
-                            process.wait(timeout=2)
-                        break
-                    time.sleep(0.1)
-                process.wait()
-                output_file.seek(0)
-                output = output_file.read()
-                if termination_reason:
-                    result = CommandResult(command, 130, output + f"\n{termination_reason} requested")
-                elif timed_out:
-                    result = CommandResult(command, 124, output + "\nverification timed out")
-                else:
-                    result = CommandResult(command, process.returncode, output)
-        except OSError as exc:
-            result = CommandResult(command, 126, str(exc))
-        results.append(result)
-        if result.exit_code != 0 or termination_reason:
-            break
+    uses_preparation_cache = (
+        codex_path is not None and permission_profile == "codex-worker-preparation"
+    )
+    cache_context = (
+        tempfile.TemporaryDirectory(prefix="codex-worker-packages-")
+        if uses_preparation_cache
+        else nullcontext(None)
+    )
+    with cache_context as cache_root:
+        for command in commands:
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                results.append(CommandResult(command, 124, "verification timed out"))
+                break
+            argv = ["/bin/zsh", "-lc", command]
+            environment: dict[str, str] | None = None
+            if codex_path is not None or codex_home is not None:
+                if codex_path is None or codex_home is None:
+                    raise VerificationError(
+                        "codex_path and codex_home must be supplied together"
+                    )
+                argv = [
+                    str(codex_path),
+                    "sandbox",
+                    "-P",
+                    permission_profile,
+                    "-C",
+                    str(worktree),
+                    "--",
+                    *argv,
+                ]
+                environment = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key in {"PATH", "TMPDIR", "LANG", "LC_ALL"}
+                    or key.startswith("LC_")
+                }
+                environment["HOME"] = os.environ.get("HOME", str(Path.home()))
+                environment["CODEX_HOME"] = str(codex_home)
+                if cache_root is not None:
+                    package_cache = Path(cache_root)
+                    pip_cache = package_cache / "pip"
+                    npm_cache = package_cache / "npm"
+                    pip_cache.mkdir(exist_ok=True)
+                    npm_cache.mkdir(exist_ok=True)
+                    environment["PIP_CACHE_DIR"] = str(pip_cache)
+                    environment["npm_config_cache"] = str(npm_cache)
+            try:
+                with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output_file:
+                    process = subprocess.Popen(
+                        argv,
+                        cwd=worktree,
+                        env=environment,
+                        text=True,
+                        stdout=output_file,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    deadline = time.monotonic() + max(0.01, remaining)
+                    timed_out = False
+                    while process.poll() is None:
+                        requested = (
+                            control_callback() if control_callback is not None else None
+                        )
+                        if requested in {"pause", "cancel"}:
+                            termination_reason = requested
+                            os.killpg(process.pid, signal.SIGTERM)
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                os.killpg(process.pid, signal.SIGKILL)
+                                process.wait(timeout=2)
+                            break
+                        if time.monotonic() >= deadline:
+                            timed_out = True
+                            os.killpg(process.pid, signal.SIGTERM)
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                os.killpg(process.pid, signal.SIGKILL)
+                                process.wait(timeout=2)
+                            break
+                        time.sleep(0.1)
+                    process.wait()
+                    output_file.seek(0)
+                    output = output_file.read()
+                    if termination_reason:
+                        result = CommandResult(
+                            command, 130, output + f"\n{termination_reason} requested"
+                        )
+                    elif timed_out:
+                        result = CommandResult(
+                            command, 124, output + "\nverification timed out"
+                        )
+                    else:
+                        result = CommandResult(command, process.returncode, output)
+            except OSError as exc:
+                result = CommandResult(command, 126, str(exc))
+            results.append(result)
+            if result.exit_code != 0 or termination_reason:
+                break
     return VerificationResult(
         passed=all(item.exit_code == 0 for item in results),
         commands=tuple(results),
