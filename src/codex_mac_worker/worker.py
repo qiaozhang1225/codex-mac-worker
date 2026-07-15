@@ -621,7 +621,7 @@ This PR was created as a draft. The worker cannot merge it.
             self.config.output_root.mkdir(parents=True, exist_ok=True)
             schema_path = self.config.output_root / "result.schema.json"
             schema_path.write_text(
-                json.dumps(result_schema(), ensure_ascii=False, indent=2) + "\n",
+                json.dumps(result_schema(spec), ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
 
@@ -955,7 +955,7 @@ This PR was created as a draft. The worker cannot merge it.
             self.config.output_root.mkdir(parents=True, exist_ok=True)
             schema_path = self.config.output_root / "result.schema.json"
             schema_path.write_text(
-                json.dumps(result_schema(), ensure_ascii=False, indent=2) + "\n",
+                json.dumps(result_schema(spec), ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
 

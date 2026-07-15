@@ -6,7 +6,8 @@ from typing import Any
 from .protocol import TaskSpec
 
 
-def result_schema() -> dict[str, Any]:
+def result_schema(spec: TaskSpec) -> dict[str, Any]:
+    acceptance_count = len(spec.acceptance)
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -27,12 +28,17 @@ def result_schema() -> dict[str, Any]:
             "needs_human": {"type": "array", "items": {"type": "string"}},
             "acceptance_results": {
                 "type": "array",
+                "minItems": acceptance_count,
+                "maxItems": acceptance_count,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["criterion", "status", "evidence"],
                     "properties": {
-                        "criterion": {"type": "string", "minLength": 1},
+                        "criterion": {
+                            "type": "string",
+                            "enum": list(spec.acceptance),
+                        },
                         "status": {
                             "type": "string",
                             "enum": ["met", "not_met", "needs_review"],
@@ -74,6 +80,7 @@ Safety boundaries:
 - Finish this single attempt; do not start a persistent objective or schedule follow-up work.
 
 Run focused local checks when useful. The worker will run the authoritative verification profile.
+Copy each criterion verbatim and keep the original order in acceptance_results.
 Return only the structured final result required by the supplied JSON Schema.
 """
 
@@ -90,11 +97,12 @@ Current diff summary:
 {current_diff}
 
 Do not commit, push, open a pull request, deploy, or merge. Do not broaden the original objective.
+Copy each criterion verbatim and keep the original order in acceptance_results.
 Only address the explicit revision requirements inside the allowed paths, then return the structured result.
 """
 
 
-def write_result_schema(path: str) -> None:
+def write_result_schema(path: str, spec: TaskSpec) -> None:
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(result_schema(), handle, ensure_ascii=False, indent=2)
+        json.dump(result_schema(spec), handle, ensure_ascii=False, indent=2)
         handle.write("\n")
