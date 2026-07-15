@@ -33,7 +33,9 @@ def test_execution_prompt_is_bounded_and_never_mentions_goal_mode(tmp_path: Path
     assert "Only modify these paths" in prompt
     assert "/goal" not in prompt.lower()
     assert "goal mode" not in prompt.lower()
-    assert result_schema()["required"] == [
+    assert "Copy each criterion verbatim and keep the original order" in prompt
+    schema = result_schema(spec)
+    assert schema["required"] == [
         "status",
         "summary",
         "changed_files",
@@ -41,7 +43,12 @@ def test_execution_prompt_is_bounded_and_never_mentions_goal_mode(tmp_path: Path
         "needs_human",
         "acceptance_results",
     ]
-    acceptance = result_schema()["properties"]["acceptance_results"]
+    acceptance = schema["properties"]["acceptance_results"]
+    assert acceptance["minItems"] == len(spec.acceptance)
+    assert acceptance["maxItems"] == len(spec.acceptance)
+    assert acceptance["items"]["properties"]["criterion"]["enum"] == list(
+        spec.acceptance
+    )
     assert acceptance["items"]["properties"]["status"]["enum"] == [
         "met",
         "not_met",
@@ -57,6 +64,7 @@ def test_revision_prompt_starts_new_bounded_attempt() -> None:
     assert "Add the missing empty-state test" in prompt
     assert "diff summary" in prompt
     assert "new bounded attempt" in prompt
+    assert "Copy each criterion verbatim and keep the original order" in prompt
 
 
 def test_run_verification_uses_only_configured_commands(tmp_path: Path) -> None:
