@@ -23,6 +23,51 @@ class FlakyGitHub:
         return [{"id": 99, "body": body} for body in self.comments]
 
 
+class ListLabelsGitHub:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def set_labels(
+        self, repo: str, issue_number: int, labels: list[str]
+    ) -> list[dict]:
+        self.calls += 1
+        return [{"name": label} for label in labels]
+
+
+def test_durable_label_write_accepts_list_response(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    remote = ListLabelsGitHub()
+    durable = DurableGitHub(remote, store)
+
+    result = durable.set_labels("owner/repo", 12, ["codex:cancelled"])
+
+    assert result == [{"name": "codex:cancelled"}]
+    assert remote.calls == 1
+    assert store.pending_outbox() == []
+
+
+def test_pending_label_write_flushes_after_list_response(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    remote = ListLabelsGitHub()
+    durable = DurableGitHub(remote, store)
+    payload = {
+        "operation": "set_labels",
+        "repo": "owner/repo",
+        "issue_number": 12,
+        "labels": ["codex:cancelled"],
+    }
+    outbox_id = store.enqueue_outbox("github", payload, "pending-labels")
+
+    durable.flush()
+
+    assert remote.calls == 1
+    assert store.pending_outbox() == []
+    row = store.get_outbox(outbox_id)
+    assert row is not None
+    assert row["delivered_at"] is not None
+    assert row["remote_id"] is None
+
+
 def test_failed_write_remains_in_outbox_and_flushes_after_recovery(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "worker.sqlite3")
     remote = FlakyGitHub()
