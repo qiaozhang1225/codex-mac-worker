@@ -36,7 +36,7 @@ brew install python@3.12 node git gh
 gh auth login
 ```
 
-安装器会用受限权限档案执行一次 Worker 虚拟环境 Python 冒烟测试。若出现 `Operation not permitted`，不要扩大到整个用户目录；改用 `/opt/homebrew` 下的 Apple Silicon Homebrew 或 Python.org 签名安装包后重建虚拟环境。
+安装器会分别用执行权限档案和 preparation 权限档案执行 Python 冒烟测试。若出现 `Operation not permitted`，不要扩大到整个用户目录；改用 `/opt/homebrew` 下的 Apple Silicon Homebrew 或 Python.org 签名安装包后重建虚拟环境。
 
 安装 ChatGPT 桌面应用。Worker 不复用日常 Codex 配置，而是在安装目录中使用独立 `CODEX_HOME`。先运行一次安装器，让它创建受控权限档案和配置示例：
 
@@ -48,7 +48,7 @@ CODEX_HOME="$HOME/Library/Application Support/CodexWorker/codex-home" \
   /Applications/ChatGPT.app/Contents/Resources/codex login status
 ```
 
-安装器每次都会恢复受审查的 Worker 权限档案：用户目录默认不可读、当前 worktree 可写、网络关闭，并明确关闭 Goal、apps 和多代理。不要把个人 `~/.codex/config.toml` 复制进去。
+安装器每次都会恢复受审查的 Worker 权限档案：用户目录默认不可读、当前 worktree 可写，并明确关闭 Goal、apps 和多代理。`codex-worker` 执行与验证档案保持网络关闭；只有仓库配置中受审查的 preparation 命令使用 `codex-worker-preparation`，且只能访问 `pypi.org`、`files.pythonhosted.org` 和 `registry.npmjs.org`。不要把个人 `~/.codex/config.toml` 复制进去，也不要给 Codex 执行档案开放网络。
 
 在一个无敏感信息的测试仓库运行只读冒烟测试，确认不弹出人工批准且能自行退出：
 

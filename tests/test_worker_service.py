@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+import codex_mac_worker.worker as worker_module
 from codex_mac_worker.config import RepositoryConfig, WorkerConfig
 from codex_mac_worker.gitops import GitOperations
 from codex_mac_worker.protocol import parse_delivery_block, parse_task_body
@@ -135,7 +136,9 @@ class FakeGitHub:
         return payload
 
 
-def test_worker_processes_bounded_task_into_draft_pr(tmp_path: Path) -> None:
+def test_worker_processes_bounded_task_into_draft_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     remote, sha = make_project_remote(tmp_path)
     body = task_body(sha=sha)
     issue = {
@@ -171,6 +174,13 @@ def test_worker_processes_bounded_task_into_draft_pr(tmp_path: Path) -> None:
         git=operations,
         runner=FakeRunner(),
     )
+    preparation_profiles: list[object] = []
+
+    def capture_preparation(*args: object, **kwargs: object) -> VerificationResult:
+        preparation_profiles.append(kwargs.get("permission_profile"))
+        return VerificationResult(True, ())
+
+    monkeypatch.setattr(worker_module, "run_commands", capture_preparation)
 
     service.process_issue(config.repositories[0], issue)
 
@@ -191,6 +201,7 @@ def test_worker_processes_bounded_task_into_draft_pr(tmp_path: Path) -> None:
     assert github.labels[-1] == ["priority:p1", "codex:awaiting-review"]
     assert git(tmp_path / "remote.git", "show", "codex/12-bounded-task:src/result.txt") == "implemented"
     assert len(store.list_runs("owner/repo", 12)) == 1
+    assert preparation_profiles == ["codex-worker-preparation"]
 
 
 def test_worker_rejects_unauthorized_issue_author(tmp_path: Path) -> None:

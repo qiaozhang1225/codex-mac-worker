@@ -92,6 +92,7 @@ def run_commands(
     timeout_seconds: float,
     codex_path: Path | None = None,
     codex_home: Path | None = None,
+    permission_profile: str = "codex-worker",
     control_callback: Callable[[], str | None] | None = None,
 ) -> VerificationResult:
     results: list[CommandResult] = []
@@ -111,7 +112,7 @@ def run_commands(
                 str(codex_path),
                 "sandbox",
                 "-P",
-                "codex-worker",
+                permission_profile,
                 "-C",
                 str(worktree),
                 "--",

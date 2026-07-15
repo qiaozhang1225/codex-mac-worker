@@ -135,6 +135,42 @@ def test_verification_uses_worker_permission_profile_and_scrubbed_environment(
     assert data["github_token"] is None
 
 
+def test_command_runner_uses_requested_permission_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture = tmp_path / "sandbox.json"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        f"pathlib.Path({str(capture)!r}).write_text(json.dumps(args))\n"
+        "index = args.index('--')\n"
+        "raise SystemExit(subprocess.run(args[index + 1:]).returncode)\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IEXEC)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+
+    result = run_commands(
+        tmp_path,
+        (f"{sys.executable} -c 'print(123)'",),
+        timeout_seconds=5,
+        codex_path=fake_codex,
+        codex_home=codex_home,
+        permission_profile="codex-worker-preparation",
+    )
+
+    assert result.passed is True
+    assert json.loads(capture.read_text(encoding="utf-8"))[:4] == [
+        "sandbox",
+        "-P",
+        "codex-worker-preparation",
+        "-C",
+    ]
+
+
 def test_command_runner_stops_process_group_on_cancel(tmp_path: Path) -> None:
     result = run_commands(
         tmp_path,
