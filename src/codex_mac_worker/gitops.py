@@ -73,6 +73,31 @@ class GitOperations:
     @staticmethod
     def _is_retryable_network_failure(stderr: str) -> bool:
         normalized = stderr.casefold()
+        permanent_markers = (
+            "authentication failed",
+            "permission denied",
+            "access denied",
+            "repository not found",
+            "could not read from remote repository",
+            "ssl certificate problem",
+            "certificate verify failed",
+            "server certificate verification failed",
+            "self-signed certificate",
+            "refusing to fetch into branch checked out",
+            "not a git repository",
+            "does not appear to be a git repository",
+            "couldn't find remote ref",
+            "non-fast-forward",
+            "remote rejected",
+            "cannot lock ref",
+            "unable to update local ref",
+            "would clobber existing tag",
+        )
+        if any(marker in normalized for marker in permanent_markers) or re.search(
+            r"requested url returned error:\s*(?:400|401|403|404)\b",
+            normalized,
+        ):
+            return False
         transient_markers = (
             "ssl connection timeout",
             "connection timed out",

@@ -133,6 +133,27 @@ def test_permanent_git_failures_are_not_retryable(stderr: str) -> None:
     assert GitOperations._is_retryable_network_failure(stderr) is False
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Error in the HTTP2 framing layer\nfatal: Authentication failed",
+        (
+            "The requested URL returned error: 403\n"
+            "unexpected disconnect while reading sideband packet"
+        ),
+        "SSL certificate problem: self-signed certificate\nGnuTLS recv error",
+        (
+            "fatal: refusing to fetch into branch checked out at worktree\n"
+            "empty reply from server"
+        ),
+    ],
+)
+def test_permanent_git_failures_take_precedence_over_transient_markers(
+    stderr: str,
+) -> None:
+    assert GitOperations._is_retryable_network_failure(stderr) is False
+
+
 def test_transient_network_retries_are_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
