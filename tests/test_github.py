@@ -23,6 +23,27 @@ def generate_private_key(path: Path) -> None:
     )
 
 
+def test_github_http_clients_ignore_environment_proxies(
+    monkeypatch, tmp_path: Path
+) -> None:
+    client_options: list[dict] = []
+
+    class RecordingClient:
+        def __init__(self, **kwargs) -> None:
+            client_options.append(kwargs)
+
+    monkeypatch.setattr(httpx, "Client", RecordingClient)
+
+    GitHubAppAuth(
+        app_id="123",
+        installation_id="456",
+        private_key_path=tmp_path / "app.pem",
+    )
+    GitHubClient(token_provider=lambda: "token")
+
+    assert [options["trust_env"] for options in client_options] == [False, False]
+
+
 def test_app_auth_builds_short_lived_jwt(tmp_path: Path) -> None:
     key_path = tmp_path / "app.pem"
     generate_private_key(key_path)

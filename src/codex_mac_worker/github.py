@@ -34,7 +34,12 @@ class GitHubAppAuth:
         self.app_id = app_id
         self.installation_id = installation_id
         self.private_key_path = private_key_path
-        self._client = httpx.Client(base_url=api_url, transport=transport, timeout=30)
+        self._client = httpx.Client(
+            base_url=api_url,
+            transport=transport,
+            timeout=30,
+            trust_env=False,
+        )
         self._cached_token: str | None = None
         self._expires_at: datetime | None = None
 
@@ -88,7 +93,12 @@ class GitHubClient:
         api_url: str = "https://api.github.com",
     ) -> None:
         self._token_provider = token_provider
-        self._client = httpx.Client(base_url=api_url, transport=transport, timeout=30)
+        self._client = httpx.Client(
+            base_url=api_url,
+            transport=transport,
+            timeout=30,
+            trust_env=False,
+        )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = {
