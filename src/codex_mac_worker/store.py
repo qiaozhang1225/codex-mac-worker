@@ -125,6 +125,22 @@ class EventStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (repo, issue_number, task_hash)
             );
+
+            CREATE TABLE IF NOT EXISTS auto_merge_operations (
+                repo TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                pr_number INTEGER NOT NULL,
+                task_hash TEXT NOT NULL,
+                expected_head TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                merge_commit_sha TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (repo, issue_number, pr_number, task_hash, expected_head)
+            );
             """
         )
         columns = {
@@ -333,6 +349,121 @@ class EventStore:
         item["structured_result"] = json.loads(item.pop("structured_result_json"))
         item["retryable"] = bool(item["retryable"])
         return item
+
+    def begin_auto_merge(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        task_hash: str,
+        expected_head: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connection:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM auto_merge_operations
+                WHERE repo=? AND issue_number=? AND pr_number=?
+                """,
+                (repo, issue_number, pr_number),
+            ).fetchall()
+            for row in rows:
+                if (
+                    str(row["task_hash"]) != task_hash
+                    or str(row["expected_head"]) != expected_head
+                ):
+                    raise ValueError("auto-merge operation identity changed")
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO auto_merge_operations (
+                    repo, issue_number, pr_number, task_hash, expected_head,
+                    state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'recorded', ?, ?)
+                """,
+                (repo, issue_number, pr_number, task_hash, expected_head, now, now),
+            )
+        operation = self.get_auto_merge(repo, issue_number, pr_number, expected_head)
+        assert operation is not None
+        return operation
+
+    def get_auto_merge(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM auto_merge_operations
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (repo, issue_number, pr_number, expected_head),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_auto_merge_state(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+        *,
+        state: str,
+        error: str | None = None,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE auto_merge_operations
+            SET state=?, attempts=attempts + CASE WHEN ? IS NULL THEN 0 ELSE 1 END,
+                last_error=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (
+                state,
+                error,
+                error[:4000] if error is not None else None,
+                utc_now(),
+                repo,
+                issue_number,
+                pr_number,
+                expected_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("auto-merge operation does not exist")
+
+    def complete_auto_merge(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+        merge_commit_sha: str,
+    ) -> None:
+        now = utc_now()
+        cursor = self.connection.execute(
+            """
+            UPDATE auto_merge_operations
+            SET state='completed', merge_commit_sha=?, last_error=NULL,
+                updated_at=?, completed_at=?
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (
+                merge_commit_sha,
+                now,
+                now,
+                repo,
+                issue_number,
+                pr_number,
+                expected_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("auto-merge operation does not exist")
 
     def set_delivery_checkpoint_state(
         self,

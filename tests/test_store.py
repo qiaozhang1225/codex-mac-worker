@@ -264,6 +264,31 @@ def test_old_database_migrates_delivery_integration_columns(tmp_path: Path) -> N
     assert checkpoint["integration_refreshes"] == 0
 
 
+def test_auto_merge_operation_is_idempotent_and_rejects_identity_drift(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    payload = {
+        "repo": "owner/repo",
+        "issue_number": 12,
+        "pr_number": 44,
+        "task_hash": "a" * 64,
+        "expected_head": "c" * 40,
+    }
+
+    first = store.begin_auto_merge(**payload)
+    second = store.begin_auto_merge(**payload)
+
+    assert first["state"] == "recorded"
+    assert second["state"] == "recorded"
+    try:
+        store.begin_auto_merge(**(payload | {"expected_head": "d" * 40}))
+    except ValueError as exc:
+        assert "identity changed" in str(exc)
+    else:
+        raise AssertionError("expected auto-merge identity drift rejection")
+
+
 def test_legacy_checkpoint_and_reconstruction_marker_are_saved_together(
     tmp_path: Path,
 ) -> None:

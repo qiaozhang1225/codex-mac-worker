@@ -258,7 +258,12 @@ def _collect_checks(
     return tuple(checks)
 
 
-def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
+def review_task(
+    github: Any,
+    reference: IssueReference,
+    *,
+    allowed_lifecycle_labels: frozenset[str] = frozenset({"codex:awaiting-review"}),
+) -> ReviewSnapshot:
     issue = github.get_issue(reference.repo, reference.number)
     spec = parse_task_body(str(issue.get("body", "")))
     pull, delivery = _matching_delivery(github, reference)
@@ -270,8 +275,10 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         label = str(item.get("name", "")) if isinstance(item, dict) else str(item)
         if label.startswith("codex:"):
             status_labels.add(label)
-    if status_labels != {"codex:awaiting-review"}:
-        blockers.append("Issue must have exactly the codex:awaiting-review lifecycle label")
+    if len(status_labels) != 1 or not status_labels.issubset(allowed_lifecycle_labels):
+        blockers.append(
+            "Issue must have exactly one allowed Worker merge lifecycle label"
+        )
 
     base = pull.get("base", {})
     head = pull.get("head", {})

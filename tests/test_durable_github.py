@@ -211,3 +211,68 @@ def test_durable_github_propagates_request_deadline_to_remote(
         github.add_comment("owner/repo", 12, "bounded")
 
     assert remote.active_deadline is None
+
+
+def test_durable_ready_and_merge_reconcile_exact_head(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+
+    class Remote:
+        def __init__(self) -> None:
+            self.pull = {
+                "number": 44,
+                "draft": True,
+                "merged_at": None,
+                "merge_commit_sha": None,
+                "head": {"sha": "c" * 40},
+            }
+            self.ready_calls = 0
+            self.merge_calls = 0
+
+        def get_pull_request(self, repo: str, pr_number: int) -> dict:
+            return self.pull
+
+        def mark_pull_request_ready(self, repo: str, pr_number: int) -> dict:
+            self.ready_calls += 1
+            self.pull["draft"] = False
+            return self.pull
+
+        def merge_pull_request(
+            self, repo: str, pr_number: int, *, expected_head: str
+        ) -> dict:
+            self.merge_calls += 1
+            self.pull["merged_at"] = "2026-07-17T00:00:00Z"
+            self.pull["merge_commit_sha"] = "e" * 40
+            return {"merged": True, "sha": "e" * 40}
+
+    remote = Remote()
+    github = DurableGitHub(remote, store)
+
+    github.mark_pull_request_ready("owner/repo", 44, expected_head="c" * 40)
+    github.mark_pull_request_ready("owner/repo", 44, expected_head="c" * 40)
+    github.merge_pull_request("owner/repo", 44, expected_head="c" * 40)
+    github.merge_pull_request("owner/repo", 44, expected_head="c" * 40)
+
+    assert remote.ready_calls == 1
+    assert remote.merge_calls == 1
+    assert store.pending_outbox() == []
+
+
+def test_durable_merge_rejects_changed_head_before_write(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+
+    class Remote:
+        def get_pull_request(self, repo: str, pr_number: int) -> dict:
+            return {
+                "number": 44,
+                "draft": False,
+                "merged_at": None,
+                "head": {"sha": "d" * 40},
+            }
+
+        def merge_pull_request(self, *args: object, **kwargs: object) -> dict:
+            raise AssertionError("changed head reached merge API")
+
+    github = DurableGitHub(Remote(), store)
+
+    with pytest.raises(ValueError, match="head"):
+        github.merge_pull_request("owner/repo", 44, expected_head="c" * 40)
