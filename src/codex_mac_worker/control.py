@@ -6,6 +6,7 @@ import uuid
 
 import yaml
 
+from .coordination import active_task_conflicts
 from .protocol import TASK_MARKER, parse_task_body, render_command_comment
 from .references import parse_issue_reference as parse_issue
 
@@ -14,6 +15,8 @@ class ControlGitHub(Protocol):
     def create_issue(self, repo: str, title: str, body: str, labels: list[str]) -> dict[str, Any]: ...
 
     def add_comment(self, repo: str, issue_number: int, body: str) -> dict[str, Any]: ...
+
+    def list_issues(self, repo: str, *, state: str = "open") -> list[dict[str, Any]]: ...
 
 
 def create_task(
@@ -25,6 +28,12 @@ def create_task(
     machine_yaml = spec_path.read_text(encoding="utf-8").strip()
     provisional = f"{TASK_MARKER}\n```yaml\n{machine_yaml}\n```\n"
     spec = parse_task_body(provisional)
+    conflicts = active_task_conflicts(github, repo, spec.allowed_paths)
+    if conflicts:
+        raise ValueError(
+            "task allowed_paths conflicts with active Worker task: "
+            + ", ".join(conflicts)
+        )
     issue_title = title or f"[Codex] {spec.objective[:160]}"
     body = f"{issue_title}\n\n{provisional}"
     return github.create_issue(repo, issue_title, body, ["codex:queued"])

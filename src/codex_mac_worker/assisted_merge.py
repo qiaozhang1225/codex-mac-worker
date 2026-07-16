@@ -11,6 +11,7 @@ import yaml
 
 from .config import parse_project_config
 from .control_state import ControlState, operation_id
+from .merge_policy import RULESET_NAME, classify_ruleset
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .protocol import (
     DELIVERY_MARKER,
@@ -24,7 +25,6 @@ from .protocol import (
     parse_task_body,
 )
 from .references import IssueReference
-from .repository_onboarding import RULESET_NAME, _ruleset_valid
 
 
 class AssistedMergeError(RuntimeError):
@@ -63,6 +63,7 @@ class ReviewSnapshot:
     risks: tuple[str, ...]
     needs_human: tuple[str, ...]
     unresolved_threads: tuple[str, ...]
+    ruleset_profile: str | None
     gates: GateResult
     approval_fingerprint: str
 
@@ -213,7 +214,7 @@ def _ruleset(github: Any, repo: str, blockers: list[str]) -> dict[str, Any]:
         blockers.append("Ruleset: expected exactly one Codex Worker Ruleset")
         return {}
     current = github.get_ruleset(repo, int(matching[0]["id"]))
-    if not _ruleset_valid(current):
+    if classify_ruleset(current) is None:
         blockers.append("Ruleset: Codex Worker branch protection is missing or unsafe")
     return current
 
@@ -257,7 +258,12 @@ def _collect_checks(
     return tuple(checks)
 
 
-def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
+def review_task(
+    github: Any,
+    reference: IssueReference,
+    *,
+    allowed_lifecycle_labels: frozenset[str] = frozenset({"codex:awaiting-review"}),
+) -> ReviewSnapshot:
     issue = github.get_issue(reference.repo, reference.number)
     spec = parse_task_body(str(issue.get("body", "")))
     pull, delivery = _matching_delivery(github, reference)
@@ -269,8 +275,10 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         label = str(item.get("name", "")) if isinstance(item, dict) else str(item)
         if label.startswith("codex:"):
             status_labels.add(label)
-    if status_labels != {"codex:awaiting-review"}:
-        blockers.append("Issue must have exactly the codex:awaiting-review lifecycle label")
+    if len(status_labels) != 1 or not status_labels.issubset(allowed_lifecycle_labels):
+        blockers.append(
+            "Issue must have exactly one allowed Worker merge lifecycle label"
+        )
 
     base = pull.get("base", {})
     head = pull.get("head", {})
@@ -344,6 +352,7 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         blockers.append("PR is not reported mergeable by GitHub")
 
     ruleset = _ruleset(github, reference.repo, blockers)
+    ruleset_profile = classify_ruleset(ruleset)
     checks = _collect_checks(
         github,
         reference.repo,
@@ -407,6 +416,7 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         risks=delivery.risks,
         needs_human=delivery.needs_human,
         unresolved_threads=tuple(unresolved_threads),
+        ruleset_profile=ruleset_profile,
         gates=gates,
         approval_fingerprint=fingerprint,
     )

@@ -13,6 +13,7 @@ from codex_mac_worker.store import EventStore
 class FakeGitHub:
     def __init__(self, issues: list[dict]) -> None:
         self.issues = issues
+        self.issue_updates: list[dict] = []
 
     def list_queued_issues(self, repo: str) -> list[dict]:
         return self.issues
@@ -43,7 +44,9 @@ class FakeGitHub:
         labels: list[str] | None = None,
         state: str | None = None,
     ) -> dict:
-        return {"labels": labels, "state": state}
+        update = {"issue_number": issue_number, "labels": labels, "state": state}
+        self.issue_updates.append(update)
+        return update
 
 
 class FakeService:
@@ -53,6 +56,8 @@ class FakeService:
         self.delivery_retried: list[int] = []
         self.validated: list[str] = []
         self.stopped = False
+        self.auto_merge_calls: list[int] = []
+        self.auto_merge_result = "completed"
 
     def stop(self) -> None:
         self.stopped = True
@@ -86,12 +91,41 @@ class FakeService:
         self.delivery_retried.append(issue["number"])
         return "awaiting-review"
 
+    def auto_merge_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict,
+        task: dict,
+    ) -> str:
+        self.auto_merge_calls.append(issue["number"])
+        return self.auto_merge_result
+
 
 def config(tmp_path: Path) -> WorkerConfig:
     return WorkerConfig(
         "mac-mini", 60, 120, tmp_path / "state.sqlite3", tmp_path / "cache",
         tmp_path / "worktrees", tmp_path / "outputs", Path("/tmp/codex"), "123", "456",
         tmp_path / "app.pem", ("owner",), (RepositoryConfig("owner/repo", "url"),),
+    )
+
+
+def automatic_config(tmp_path: Path) -> WorkerConfig:
+    settings = config(tmp_path)
+    return WorkerConfig(
+        settings.worker_id,
+        settings.poll_seconds,
+        settings.heartbeat_seconds,
+        settings.database_path,
+        settings.cache_root,
+        settings.worktree_root,
+        settings.output_root,
+        settings.codex_path,
+        settings.github_app_id,
+        settings.github_installation_id,
+        settings.github_private_key_path,
+        settings.authorized_users,
+        settings.repositories,
+        merge_mode="automatic",
     )
 
 
@@ -482,6 +516,110 @@ def test_daemon_closes_issue_only_after_pr_is_merged(tmp_path: Path) -> None:
     assert daemon.process_review_tasks() is True
     assert store.get_task("owner/repo", 9)["state"] == "completed"
     assert updates == [{"labels": ["codex:completed"], "state": "closed"}]
+
+
+def test_daemon_auto_merges_existing_awaiting_review_task(tmp_path: Path) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="awaiting-review",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+    github = FakeGitHub([])
+    service = FakeService()
+    daemon = WorkerDaemon(settings, github, store, service)
+
+    assert daemon.process_review_tasks() is True
+
+    assert service.auto_merge_calls == [9]
+    assert store.get_task("owner/repo", 9)["state"] == "completed"
+    assert github.issue_updates[-1] == {
+        "issue_number": 9,
+        "labels": ["codex:completed"],
+        "state": "closed",
+    }
+
+
+def test_daemon_automatic_mode_reconciles_already_merged_pr_through_service(
+    tmp_path: Path,
+) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="merging",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+
+    class MergedGitHub(FakeGitHub):
+        def get_pull_request(self, repo: str, pr_number: int) -> dict:
+            return {"number": pr_number, "merged_at": "2026-07-17T00:00:00Z"}
+
+    github = MergedGitHub([])
+    service = FakeService()
+    service.auto_merge_result = "needs-attention"
+    daemon = WorkerDaemon(settings, github, store, service)
+
+    assert daemon.process_review_tasks() is True
+    assert service.auto_merge_calls == [9]
+    assert store.get_task("owner/repo", 9)["state"] == "needs-attention"
+    assert github.issue_updates == []
+
+
+def test_daemon_manual_mode_leaves_delivery_for_human_review(tmp_path: Path) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="awaiting-review",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_review_tasks() is False
+    assert service.auto_merge_calls == []
+    assert store.get_task("owner/repo", 9)["state"] == "awaiting-review"
+
+
+@pytest.mark.parametrize(
+    ("service_result", "expected_state"),
+    [("merging", "merging"), ("needs-attention", "needs-attention")],
+)
+def test_daemon_reconciles_auto_merge_outcomes(
+    tmp_path: Path, service_result: str, expected_state: str
+) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="merging",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+    service = FakeService()
+    service.auto_merge_result = service_result
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_review_tasks() is True
+    assert store.get_task("owner/repo", 9)["state"] == expected_state
+    assert service.processed == []
 
 
 def test_single_instance_lock_rejects_second_worker(tmp_path: Path) -> None:

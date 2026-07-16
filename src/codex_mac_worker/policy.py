@@ -42,6 +42,8 @@ def _is_within(path: str, prefix: str) -> bool:
 
 
 def validate_task_policy(spec: TaskSpec, config: ProjectConfig) -> None:
+    if spec.risk not in {"low", "medium"}:
+        raise PolicyError("risk must be low or medium")
     if spec.risk not in config.allowed_risk_levels:
         raise PolicyError(f"risk {spec.risk!r} is not allowed")
     if spec.base_branch != config.default_base_branch:

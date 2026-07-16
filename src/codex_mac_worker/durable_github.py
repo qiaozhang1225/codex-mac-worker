@@ -8,6 +8,12 @@ from typing import Any
 from .store import EventStore
 
 
+class DurableGitHubPolicyError(ValueError):
+    """Permanent local gate failure that must never be replayed from outbox."""
+
+    retryable = False
+
+
 class DurableGitHub:
     """Write-through GitHub proxy backed by a durable SQLite outbox."""
 
@@ -116,6 +122,35 @@ class DurableGitHub:
                 payload["repo"],
                 payload["pr_number"],
                 body=payload["body"],
+            )
+        if operation == "mark_pull_request_ready":
+            pull = self.remote.get_pull_request(payload["repo"], payload["pr_number"])
+            observed_head = str(pull.get("head", {}).get("sha", "")).lower()
+            if observed_head != payload["expected_head"]:
+                raise DurableGitHubPolicyError(
+                    "pull request head differs from expected head"
+                )
+            if pull.get("draft") is False:
+                return pull
+            return self.remote.mark_pull_request_ready(
+                payload["repo"], payload["pr_number"]
+            )
+        if operation == "merge_pull_request":
+            pull = self.remote.get_pull_request(payload["repo"], payload["pr_number"])
+            observed_head = str(pull.get("head", {}).get("sha", "")).lower()
+            if observed_head != payload["expected_head"]:
+                raise DurableGitHubPolicyError(
+                    "pull request head differs from expected head"
+                )
+            if pull.get("merged_at"):
+                return {
+                    "merged": True,
+                    "sha": str(pull.get("merge_commit_sha", "")),
+                }
+            return self.remote.merge_pull_request(
+                payload["repo"],
+                payload["pr_number"],
+                expected_head=payload["expected_head"],
             )
         raise ValueError(f"unsupported durable GitHub operation: {operation}")
 
@@ -231,5 +266,37 @@ class DurableGitHub:
                 "repo": repo,
                 "pr_number": pr_number,
                 "body": body,
+            }
+        )
+
+    def mark_pull_request_ready(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        expected_head: str,
+    ) -> dict[str, Any]:
+        return self._write(
+            {
+                "operation": "mark_pull_request_ready",
+                "repo": repo,
+                "pr_number": pr_number,
+                "expected_head": expected_head.lower(),
+            }
+        )
+
+    def merge_pull_request(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        expected_head: str,
+    ) -> dict[str, Any]:
+        return self._write(
+            {
+                "operation": "merge_pull_request",
+                "repo": repo,
+                "pr_number": pr_number,
+                "expected_head": expected_head.lower(),
             }
         )

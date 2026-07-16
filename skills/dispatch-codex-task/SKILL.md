@@ -1,84 +1,52 @@
 ---
 name: dispatch-codex-task
-description: Use when onboarding a repository for the Mac mini Worker, dispatching or controlling a bounded Worker task, reviewing its PR, or handling a request to merge that PR.
+description: Use when onboarding a repository for the Mac mini Worker, deciding whether MacBook work should be delegated, dispatching or controlling a bounded Worker task, or reviewing a Worker delivery.
 ---
 
 # Dispatch Codex Task
 
-## Overview
+## Role and boundary
 
-Manage one repository or bounded task at a time. Each mutation has an immutable snapshot and explicit confirmation boundary.
+Act as the MacBook **principal development agent**. Develop directly when that is faster or safer; delegate only an independently verifiable **strict subset of the authorized parent objective**. Mac mini cannot further delegate, widen scope, choose new verification commands, deploy, access production data, or use Codex Goal mode.
 
-## Repository Readiness
+## Repository readiness
 
-1. Run `codexctl repo status OWNER/REPO`; refuse dispatch unless `phase` is `ready` and the reviewed project config uses schema v2 and pins the intended numeric `worker_github_app_id`. Re-dispatch retained v1 tasks after migration; never resume them.
-2. Otherwise use `codexctl repo onboard`, then show PR, head SHA, paths, and blockers.
-3. Stop. Only explicit approval naming that PR authorizes:
-
-   ```bash
-   codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
-   ```
-
-4. After finalize, wait for `awaiting-worker` to become `ready`.
-
-## Create a Task
-
-1. Read `.codex-worker/project.toml`, relevant `AGENTS.md`, then verify immutable remote context:
-
-   ```bash
-   git status --short
-   git rev-parse HEAD
-   git rev-parse --verify '@{upstream}'
-   git merge-base --is-ancestor HEAD '@{upstream}'
-   ```
-
-   Require a clean tree and HEAD on upstream history. Otherwise require commit and `git push`.
-2. Produce exactly one deliverable with:
-
-   - one observable `objective` and verifiable `acceptance`;
-   - tracked `context_files` and minimal `allowed_paths`;
-   - a configured `verification_profile` and low/medium `risk`.
-
-3. Check protected paths and limits. Refuse unrelated outcomes, high risk, deployment, production data, irreversible operations, unverifiable work, or oversized scope.
-4. Write `task.yaml`; show the complete specification and command:
-
-   ```bash
-   codexctl task create --repo OWNER/REPO --spec task.yaml
-   ```
-
-5. Run only after explicit confirmation of that final specification.
-
-## Operate an Existing Task
-
-Inspect with `codexctl task status ISSUE_URL`. Show one legal control command for the current state and obtain explicit confirmation before posting it:
+Run `codexctl repo status OWNER/REPO`. Require `phase: ready`, schema v2, the intended numeric `worker_github_app_id`, and a recognized Ruleset profile. If unconfigured, use `codexctl repo onboard`, show its exact PR/head/paths/blockers, and run the following only after explicit approval of that snapshot:
 
 ```bash
-codexctl task revise ISSUE_URL --requirements revision.yaml
-codexctl task pause ISSUE_URL
-codexctl task resume ISSUE_URL
-codexctl task retry ISSUE_URL
-codexctl task cancel ISSUE_URL
+codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 ```
 
-A revision stays bounded on the original branch and Draft PR.
+Wait for `ready` before dispatch.
 
-## Review and Merge One Delivery
+## Decide whether to delegate
 
-1. Run read-only `codexctl task review ISSUE_URL`; show PR, head SHA, fingerprint, gates, Checks, evidence, risks, and dependencies.
-2. Stop. Only explicit approval naming that PR or current snapshot authorizes:
+Keep tightly coupled, exploratory, high-risk, hard-to-verify, or product-judgment work local. Delegate only when risk is low/medium, the objective and acceptance are observable, `allowed_paths` are minimal, and the repository owns the verification profile.
+
+Before dispatch, check GitHub Issue **active path ownership**, `git status`, and MacBook planned paths. Delegated paths must not overlap protected, locally changed, planned, or active Worker paths. If ownership or scope is uncertain, keep it local, narrow it, or sequence it.
+
+## Dispatch
+
+Read `.codex-worker/project.toml` and relevant `AGENTS.md`. Verify context is committed and pushed with `git rev-parse`, upstream ancestry, and `git push`. Freeze `context_commit`, `base_branch`, one objective, acceptance, tracked `context_files`, minimal `allowed_paths`, `verification_profile`, and risk. The agent must refuse production deployment/data, credentials, migrations, irreversible work, high risk, unverifiable acceptance, and oversized scope.
+
+Choose one boundary:
+
+1. For a standalone owner request, show the complete final specification and obtain confirmation before creation.
+2. For delegation inside the currently authorized parent development objective, after subset, context, policy, and conflict checks pass, do not ask again:
 
    ```bash
-   codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA --expected-fingerprint APPROVAL_FINGERPRINT
+   codexctl task create --yes --repo OWNER/REPO --spec task.yaml
    ```
 
-3. Any SHA, check, task, thread, or Ruleset change requires fresh review and approval.
+Record the Issue URL and active paths before continuing non-conflicting local work.
 
-Design approval, repository-wide approval, “看起来可以”, “设计通过”, old-thread approval, and approval for a future PR are not merge authorization. There is no automatic merge or standing approval, including indirect GitHub or workflow auto-merge.
+## Control
 
-## Safety Contract
+Inspect with `codexctl task status ISSUE_URL`. Use only a legal command for the current state: `codexctl task revise`, `pause`, `resume`, `retry`, or `cancel`. A revision stays inside the original contract and starts a new session. `retry` is infrastructure-only and never reruns Codex after a delivery checkpoint.
 
-- Do not use Codex Goal/“目标” mode or persistent objectives.
-- Do not expand `allowed_paths`, acceptance, permissions, or risk; Issues select only repository-approved verification profiles.
-- Do not request credentials, production access, deployment, Ruleset bypass, automatic merge, or protected-branch pushes.
-- Never authorize future PRs or treat a repository-level preference as approval.
-- Never invoke `repo finalize` or `task merge` without the immediately preceding immutable snapshot and explicit one-PR approval.
+## Merge policy
+
+- With `merge_mode = "automatic"` and the automatic Ruleset profile, monitor `codex:merging`. Worker rechecks current main, scope, checks, threads, identity, and exact head before squash merge. Do not issue a manual merge or simulate review.
+- In manual mode, run `codexctl task review ISSUE_URL` and show the PR, head SHA, fingerprint, gates, evidence, risks, and dependencies. Explicit confirmation of that exact snapshot is required before `codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA --expected-fingerprint APPROVAL_FINGERPRINT`.
+
+Any drift invalidates a manual snapshot. Automatic merge ends at the default branch; test observation, production deployment, and rollback remain separate decisions. Never treat automatic merge as permission to bypass failed checks, unresolved threads, scope limits, or exact-head validation.

@@ -75,6 +75,13 @@ class IssueProcessor(Protocol):
         issue: dict[str, Any],
     ) -> str: ...
 
+    def auto_merge_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        task: dict[str, Any],
+    ) -> str: ...
+
 
 class WorkerDaemon:
     """Single-worker polling loop; never claims a second task while one is active."""
@@ -388,13 +395,18 @@ class WorkerDaemon:
         return False
 
     def process_review_tasks(self) -> bool:
-        """Reconcile merged PRs and authorized revisions without ever merging a PR."""
-        for task in self.store.tasks_in_states(("awaiting-review",)):
+        """Reconcile manual reviews and trusted Worker automatic merges."""
+        states = (
+            ("awaiting-review", "merging")
+            if self.config.merge_mode == "automatic"
+            else ("awaiting-review",)
+        )
+        for task in self.store.tasks_in_states(states):
             repo = str(task["repo"])
             issue_number = int(task["issue_number"])
             issue = self.github.get_issue(repo, issue_number)  # type: ignore[attr-defined]
             pr_number = task.get("pr_number")
-            if pr_number is not None:
+            if pr_number is not None and self.config.merge_mode != "automatic":
                 pull = self.github.get_pull_request(repo, int(pr_number))  # type: ignore[attr-defined]
                 if pull.get("merged_at"):
                     labels = []
@@ -419,6 +431,39 @@ class WorkerDaemon:
                         pr_number=int(pr_number),
                     )
                     return True
+
+            if self.config.merge_mode == "automatic":
+                result = self.service.auto_merge_delivery(
+                    self._repository(repo), issue, task
+                )
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=issue_number,
+                    task_hash=str(task["task_hash"]),
+                    state=result,
+                    branch=task.get("branch"),
+                    worktree=task.get("worktree"),
+                    session_id=task.get("session_id"),
+                    pr_number=int(pr_number) if pr_number is not None else None,
+                )
+                if result == "completed":
+                    labels = []
+                    for item in issue.get("labels", []):
+                        value = item.get("name") if isinstance(item, dict) else item
+                        if isinstance(value, str) and not value.startswith("codex:"):
+                            labels.append(value)
+                    labels.append("codex:completed")
+                    self.github.update_issue(  # type: ignore[attr-defined]
+                        repo,
+                        issue_number,
+                        labels=labels,
+                        state="closed",
+                    )
+                elif result in {"merging", "needs-attention"}:
+                    self._set_remote_state(repo, issue, result)
+                else:
+                    raise ValueError(f"unknown automatic merge outcome: {result}")
+                return True
 
             for comment in reversed(self.github.list_comments(repo, issue_number)):  # type: ignore[attr-defined]
                 body = str(comment.get("body", ""))

@@ -1,8 +1,10 @@
 # 日常操作
 
-## MacBook 派单
+## MacBook 主开发代理
 
-先确认仓库 ready，再确保设计与上下文已经 commit 并 push。任务规格必须只有一个目标、可验证 acceptance、已提交的 context files、最小 allowed paths 和仓库已有的验证 profile。
+MacBook Codex agent 是主开发代理：可以直接完成开发，也可以在当前已经授权的父目标内，将一个可独立验证的严格子集交给 Mac mini。任务拆分和是否委派由 MacBook agent 裁定；Mac mini 只执行冻结规格，不能继续拆分或创建后续任务。
+
+委派前先确认仓库 ready、上下文已经 commit/push，并核对所有非终态 Worker Issue 的 active path ownership、MacBook 已改路径和计划路径。任务必须只有一个目标、可验证 acceptance、已提交的 context files、最小 allowed paths 和仓库已有的验证 profile。
 
 ```bash
 codexctl repo status OWNER/REPO
@@ -10,7 +12,7 @@ codexctl task create --repo OWNER/REPO --title '单一结果' --spec task.yaml
 codexctl task status https://github.com/OWNER/REPO/issues/123
 ```
 
-`create` 默认先显示完整规格并再次询问。不要用 Goal/“目标”模式代替任务拆分。
+独立派单请求仍先展示完整规格并确认。若委派属于当前已授权父开发目标的严格子集，且低/中风险、上下文已 push、路径不冲突、验收和验证均明确，MacBook agent 可以用 `codexctl task create --yes` 直接派发，不再重复请求同一授权。不要用 Goal/“目标”模式代替任务拆分。
 
 ## 控制命令
 
@@ -72,7 +74,7 @@ tail -f "$HOME/Library/Logs/CodexWorker/worker.stderr.log"
 
 旧命令 `503e56c5-64a7-474b-8364-299c6f929272` 已执行，禁止复用。
 
-Worker 永不调用 merge API。MacBook 的受控命令确认合并后，Worker 才把 Issue 标记为 completed。
+自动模式下，Worker 只会对自己创建并完成全部门禁的精确 PR head 调用 merge API；确认远端已合并后才关闭 Issue。手动模式仍由 MacBook 受控合并。两种模式都不包含生产部署或自动回滚。
 
 ## 仓库接入
 
@@ -84,13 +86,23 @@ codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 
 `repo onboard` 后先展示不可变 PR 快照并停止。只有 explicit approval 明确指向该 PR，才能 finalize。`awaiting-worker` 是正常中间态；等待 Mac mini readiness attestation，变为 `ready` 才派单。
 
-## 审查与辅助合并
+## 合并模式
+
+### 自动模式
+
+自动合并必须同时满足两个独立信号：Mac mini 本地可信配置为 `merge_mode = "automatic"`，且仓库使用被识别的 automatic Ruleset。仓库源码不能单独打开自动合并。
+
+Worker 验证通过后进入 `codex:merging`，重新拉取当前 main；若 main 前进，则最多做两次有界集成刷新并重新验证。随后它复核任务哈希、允许路径、风险、Checks、review threads、Ruleset、Worker bot 身份和精确 head，再执行 squash merge。任何漂移、冲突或门禁失败都会停止，不会猜测解决。
+
+EaseWise 当前的单所有者 Ruleset 是受支持的 automatic profile，不需要模拟第二个人审批。自动合并只到默认分支；测试机观察、生产部署和回滚仍是单独决策。
+
+### 手动模式
 
 ```bash
 codexctl task review ISSUE_URL
 codexctl task merge ISSUE_URL --expected-head FULL_HEAD_SHA --expected-fingerprint APPROVAL_FINGERPRINT
 ```
 
-`task review` 永远只读。展示 Checks、测试证据、acceptance、风险、review threads、审批指纹和 head SHA 后停止。明确批准当前 PR/head/fingerprint 才执行 merge；任一值、Checks 或 Ruleset 改变就必须重新 review 和批准。不存在 automatic merge、仓库级永久批准或 future PR 授权。
+`task review` 永远只读。展示 Checks、测试证据、acceptance、风险、review threads、审批指纹和 head SHA 后停止。明确批准当前 PR/head/fingerprint 才执行 merge；任一值、Checks 或 Ruleset 改变就必须重新 review 和批准。手动批准不构成仓库级永久批准或 future PR 授权。
 
-MacBook 使用个人 `gh` token 做 review/approval/squash merge；Mac mini 不持有该 token。
+手动模式由 MacBook 使用个人 `gh` token 做 review/approval/squash merge；Mac mini 不持有该 token。自动模式只使用受限 Worker GitHub App，并且不能扩展到其他 PR。

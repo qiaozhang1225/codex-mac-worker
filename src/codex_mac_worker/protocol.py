@@ -94,6 +94,14 @@ class DeliveryMetadata:
     acceptance_results: tuple[dict[str, str], ...]
     risks: tuple[str, ...]
     needs_human: tuple[str, ...]
+    integrated_base: str | None = None
+    task_commit: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.integrated_base is None:
+            object.__setattr__(self, "integrated_base", self.context_commit)
+        if self.task_commit is None:
+            object.__setattr__(self, "task_commit", self.delivery_commit)
 
 
 def _string_list(data: dict[str, Any], key: str, *, required: bool = True) -> tuple[str, ...]:
@@ -296,6 +304,8 @@ def render_delivery_block(metadata: DeliveryMetadata) -> str:
         "task_hash": metadata.task_hash,
         "context_commit": metadata.context_commit,
         "delivery_commit": metadata.delivery_commit,
+        "integrated_base": metadata.integrated_base,
+        "task_commit": metadata.task_commit,
         "verification_profile": metadata.verification_profile,
         "verification_passed": metadata.verification_passed,
         "model": metadata.model,
@@ -348,11 +358,23 @@ def parse_delivery_block(body: str) -> DeliveryMetadata:
             raise ProtocolError(f"delivery {key} must be a string or null")
         return value.strip()
 
+    context_commit = _full_hex(raw, "context_commit", _FULL_SHA_RE)
+    delivery_commit = _full_hex(raw, "delivery_commit", _FULL_SHA_RE)
+    integrated_base = (
+        _full_hex(raw, "integrated_base", _FULL_SHA_RE)
+        if "integrated_base" in raw
+        else context_commit
+    )
+    task_commit = (
+        _full_hex(raw, "task_commit", _FULL_SHA_RE)
+        if "task_commit" in raw
+        else delivery_commit
+    )
     return DeliveryMetadata(
         issue_number=issue_number,
         task_hash=_full_hex(raw, "task_hash", _HASH_RE),
-        context_commit=_full_hex(raw, "context_commit", _FULL_SHA_RE),
-        delivery_commit=_full_hex(raw, "delivery_commit", _FULL_SHA_RE),
+        context_commit=context_commit,
+        delivery_commit=delivery_commit,
         verification_profile=_required_string(raw, "verification_profile"),
         verification_passed=verification_passed,
         model=optional_string("model"),
@@ -360,4 +382,6 @@ def parse_delivery_block(body: str) -> DeliveryMetadata:
         acceptance_results=tuple(normalized_acceptance),
         risks=strings("risks"),
         needs_human=strings("needs_human"),
+        integrated_base=integrated_base,
+        task_commit=task_commit,
     )

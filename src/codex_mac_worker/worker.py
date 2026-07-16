@@ -11,6 +11,7 @@ from typing import Any, Callable, Protocol
 
 import yaml
 
+from .automatic_merge import automatic_merge_task
 from .config import (
     ProjectConfig,
     RepositoryConfig,
@@ -18,6 +19,7 @@ from .config import (
     load_project_config,
     parse_project_config,
 )
+from .coordination import active_task_conflicts
 from .gitops import GitOperations
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .prompting import build_execution_prompt, build_revision_prompt, result_schema
@@ -30,6 +32,7 @@ from .protocol import (
     render_delivery_block,
     render_repository_attestation,
 )
+from .references import IssueReference
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
 from .store import EventStore
 from .verification import (
@@ -443,6 +446,8 @@ class WorkerService:
         runner_result: RunnerResult,
         structured_result: dict[str, Any],
         verification_result: Any,
+        task_commit_sha: str | None = None,
+        integrated_base_sha: str | None = None,
     ) -> str:
         acceptance_results = tuple(structured_result["acceptance_results"])
         risks = tuple(structured_result["risks"])
@@ -459,6 +464,8 @@ class WorkerService:
             acceptance_results=acceptance_results,
             risks=risks,
             needs_human=needs_human,
+            task_commit=task_commit_sha,
+            integrated_base=integrated_base_sha,
         )
         acceptance_text = "\n".join(
             f"- [{'x' if item['status'] == 'met' else ' '}] {item['criterion']} "
@@ -467,6 +474,11 @@ class WorkerService:
         )
         risk_text = "\n".join(f"- {item}" for item in risks) or "- None reported"
         human_text = "\n".join(f"- {item}" for item in needs_human) or "- None"
+        merge_note = (
+            "The Worker will auto-merge only after the trusted single-owner gates pass."
+            if self.config.merge_mode == "automatic"
+            else "This repository remains in manual merge mode."
+        )
         return f"""{render_delivery_block(metadata)}
 Relates to #{issue_number}
 
@@ -484,7 +496,7 @@ Relates to #{issue_number}
 ## Human dependencies
 {human_text}
 
-This PR was created as a draft. The worker cannot merge it.
+This PR was created as a draft. {merge_note}
 """
 
     def _validate_delivery_diff(
@@ -498,6 +510,21 @@ This PR was created as a draft. The worker cannot merge it.
         diff = self.git.diff_summary(worktree, spec.context_commit)
         if not diff.changed_paths:
             raise PolicyError("Codex produced no repository changes")
+        validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
+        scan_for_secrets(worktree, diff.changed_paths)
+
+    def _validate_committed_delivery(
+        self,
+        worktree: Path,
+        baseline_head: str,
+        spec: Any,
+        project_config: Any,
+    ) -> None:
+        if not self.git.is_clean(worktree):
+            raise PolicyError("delivery worktree is not clean")
+        diff = self.git.diff_summary(worktree, baseline_head)
+        if not diff.changed_paths:
+            raise PolicyError("delivery commit has no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
         scan_for_secrets(worktree, diff.changed_paths)
 
@@ -612,6 +639,8 @@ This PR was created as a draft. The worker cannot merge it.
             runner_result=runner_result,
             structured_result=checkpoint["structured_result"],
             verification_result=verification_result,
+            task_commit_sha=str(checkpoint["task_commit_sha"]),
+            integrated_base_sha=str(checkpoint["integrated_base_sha"]),
         )
         try:
             self._require_delivery_deadline(deadline_monotonic, "push")
@@ -639,14 +668,17 @@ This PR was created as a draft. The worker cannot merge it.
             raise
         try:
             self._require_delivery_deadline(deadline_monotonic, "finalization")
-            self._set_state(repo, issue, "awaiting-review")
+            delivery_state = (
+                "merging" if self.config.merge_mode == "automatic" else "awaiting-review"
+            )
+            self._set_state(repo, issue, delivery_state)
             self._require_delivery_deadline(deadline_monotonic, "status comment")
             self.github.update_comment(
                 repo,
                 status_comment_id,
                 self._status_body(
                     task_hash=task_hash,
-                    state="awaiting-review",
+                    state=delivery_state,
                     branch=branch,
                     progress_at=iso_now(),
                     detail=str(pr.get("html_url", "")),
@@ -657,7 +689,7 @@ This PR was created as a draft. The worker cannot merge it.
                 repo=repo,
                 issue_number=number,
                 task_hash=task_hash,
-                state="awaiting-review",
+                state=delivery_state,
                 branch=branch,
                 worktree=str(worktree),
                 session_id=checkpoint.get("session_id"),
@@ -675,6 +707,181 @@ This PR was created as a draft. The worker cannot merge it.
             last_error=None,
         )
         return pr
+
+    def auto_merge_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        task: dict[str, Any],
+    ) -> str:
+        """Revalidate and auto-merge a retained delivery without invoking Codex."""
+        repo = repository.name
+        number = int(issue["number"])
+        task_hash = str(task.get("task_hash", ""))
+        attempt_key = f"auto-merge-attempts:{repo}#{number}:{task_hash}"
+        try:
+            spec = parse_task_body(str(issue.get("body", "")))
+            if spec.task_hash != task_hash:
+                raise PolicyError("task body changed before automatic merge")
+            if self.config.merge_mode != "automatic":
+                raise PolicyError("local merge mode is not automatic")
+            pr_number = task.get("pr_number")
+            if not isinstance(pr_number, int) or isinstance(pr_number, bool):
+                raise PolicyError("automatic merge task has no PR number")
+            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+            if checkpoint is None:
+                raise PolicyError("automatic merge delivery checkpoint is missing")
+            branch = str(checkpoint["branch"])
+            worktree = Path(str(checkpoint["worktree"]))
+            if not worktree.is_dir():
+                raise PolicyError("automatic merge worktree is missing")
+            if self.git.current_branch(worktree) != branch:
+                raise PolicyError("automatic merge branch changed after checkpoint")
+            if self.git.current_head(worktree) != str(checkpoint["commit_sha"]):
+                raise PolicyError("automatic merge HEAD changed after checkpoint")
+            if not self.git.is_clean(worktree):
+                raise PolicyError("automatic merge worktree is not clean")
+            self.validate_repository_authority(repository)
+
+            # A merge API call may have succeeded before its response was
+            # persisted. Reconcile that exact remote result before refreshing
+            # main: the squash merge now changes the same paths as the task and
+            # would correctly look like an integration conflict otherwise.
+            pull = self.github.get_pull_request(repo, pr_number)
+            if pull.get("merged_at"):
+                result = automatic_merge_task(
+                    self.github,
+                    self.store,
+                    IssueReference(repo, number),
+                    pr_number=pr_number,
+                    expected_head=str(checkpoint["commit_sha"]),
+                    merge_mode=self.config.merge_mode,
+                )
+                self.store.set_worker_state(attempt_key, 0)
+                return "completed" if result.merged else "merging"
+
+            mirror = self.git.mirror_path(repo)
+            if not mirror.is_dir():
+                raise PolicyError("automatic merge repository mirror is missing")
+            self.git.refresh_branch(
+                mirror,
+                clone_url=repository.clone_url,
+                branch=spec.base_branch,
+                token=self.token_provider(),
+            )
+            task_paths = self.git.changed_paths_between(
+                worktree,
+                spec.context_commit,
+                str(checkpoint["task_commit_sha"]),
+            )
+            previous_head = str(checkpoint["commit_sha"])
+            integration = self.git.integrate_default(
+                worktree,
+                mirror,
+                spec.base_branch,
+                str(checkpoint["integrated_base_sha"]),
+                task_paths,
+                refresh_count=int(checkpoint["integration_refreshes"]),
+                author_name="Codex Mac Worker",
+                author_email="codex-worker@users.noreply.github.com",
+            )
+            if integration.delivery_head != previous_head:
+                project_config = load_project_config(
+                    worktree / ".codex-worker" / "project.toml"
+                )
+                self._validate_project_worker_app(project_config)
+                validate_task_policy(spec, project_config)
+                self._validate_committed_delivery(
+                    worktree,
+                    integration.integrated_base,
+                    spec,
+                    project_config,
+                )
+                verification_result = run_verification(
+                    worktree,
+                    project_config,
+                    spec.verification_profile,
+                    timeout_seconds=1800,
+                    codex_path=(
+                        self.config.codex_path if self.config.codex_home else None
+                    ),
+                    codex_home=self.config.codex_home,
+                    control_callback=self._command_monitor(repo, number),
+                )
+                if verification_result.termination_reason or not verification_result.passed:
+                    raise PolicyError(
+                        "automatic merge integration verification failed:\n"
+                        + self._verification_detail(verification_result)
+                    )
+                self.store.update_delivery_integration(
+                    repo,
+                    number,
+                    task_hash,
+                    expected_task_commit=str(checkpoint["task_commit_sha"]),
+                    previous_head=previous_head,
+                    delivery_head=integration.delivery_head,
+                    integrated_base=integration.integrated_base,
+                    integration_refreshes=integration.refresh_count,
+                    verification_result=self._serialize_verification(
+                        verification_result
+                    ),
+                    verification_commands=project_config.verification[
+                        spec.verification_profile
+                    ],
+                    project_config_hash=self._project_config_hash(worktree),
+                )
+                checkpoint = self.store.get_delivery_checkpoint(
+                    repo, number, task_hash
+                )
+                assert checkpoint is not None
+
+            # Always reconcile the checkpointed head with the remote branch. A
+            # previous process may have persisted an integration refresh and
+            # then failed before push; the next pass must finish that same
+            # delivery instead of invoking Codex or creating another commit.
+            self.git.push(
+                worktree,
+                branch=branch,
+                clone_url=repository.clone_url,
+                token=self.token_provider(),
+            )
+            runner_result = self._checkpoint_runner_result(checkpoint)
+            pr_body = self._delivery_pr_body(
+                issue_number=number,
+                spec=spec,
+                task_hash=task_hash,
+                commit_sha=str(checkpoint["commit_sha"]),
+                runner_result=runner_result,
+                structured_result=checkpoint["structured_result"],
+                verification_result=self._restore_verification(
+                    checkpoint["verification_result"]
+                ),
+                task_commit_sha=str(checkpoint["task_commit_sha"]),
+                integrated_base_sha=str(checkpoint["integrated_base_sha"]),
+            )
+            self.github.update_pull_request(repo, pr_number, body=pr_body)
+
+            result = automatic_merge_task(
+                self.github,
+                self.store,
+                IssueReference(repo, number),
+                pr_number=pr_number,
+                expected_head=str(checkpoint["commit_sha"]),
+                merge_mode=self.config.merge_mode,
+            )
+            self.store.set_worker_state(attempt_key, 0)
+            return "completed" if result.merged else "merging"
+        except Exception as exc:
+            attempts = int(self.store.get_worker_state(attempt_key, 0)) + 1
+            self.store.set_worker_state(attempt_key, attempts)
+            self.store.set_worker_state(
+                attempt_key + ":last-error",
+                {"error": f"{type(exc).__name__}: {exc}"[:4000], "attempts": attempts},
+            )
+            retryable = getattr(exc, "retryable", False) is True
+            if retryable and attempts < 2:
+                return "merging"
+            return "needs-attention"
 
     def _command_monitor(self, repo: str, issue_number: int) -> Callable[[], str | None]:
         last_checked = 0.0
@@ -725,6 +932,18 @@ This PR was created as a draft. The worker cannot merge it.
             self._validate_issue_author(repo, issue)
             spec = parse_task_body(str(issue.get("body", "")))
             self.validate_repository_authority(repository)
+            conflicts = active_task_conflicts(
+                self.github,
+                repo,
+                spec.allowed_paths,
+                exclude_issue_number=number,
+                ignore_queued=True,
+            )
+            if conflicts:
+                raise PolicyError(
+                    "allowed_paths conflict with active Worker task: "
+                    + ", ".join(conflicts)
+                )
             task_hash = spec.task_hash
             branch = f"codex/{number}-{_slug(str(issue.get('title', 'task')))}"
             self.store.upsert_task(
@@ -999,12 +1218,62 @@ This PR was created as a draft. The worker cannot merge it.
             )
             self.validate_repository_authority(repository)
 
-            commit_sha = self.git.commit(
+            task_commit_sha = self.git.commit(
                 prepared.path,
                 f"feat: complete codex task #{number}",
                 author_name="Codex Mac Worker",
                 author_email="codex-worker@users.noreply.github.com",
             )
+            task_diff = self.git.diff_summary(prepared.path, spec.context_commit)
+            self.git.refresh_branch(
+                mirror,
+                clone_url=repository.clone_url,
+                branch=spec.base_branch,
+                token=self.token_provider(),
+            )
+            integration = self.git.integrate_default(
+                prepared.path,
+                mirror,
+                spec.base_branch,
+                spec.context_commit,
+                task_diff.changed_paths,
+                refresh_count=0,
+                author_name="Codex Mac Worker",
+                author_email="codex-worker@users.noreply.github.com",
+            )
+            project_config = load_project_config(
+                prepared.path / ".codex-worker" / "project.toml"
+            )
+            self._validate_project_worker_app(project_config)
+            validate_task_policy(spec, project_config)
+            self._validate_committed_delivery(
+                prepared.path,
+                integration.integrated_base,
+                spec,
+                project_config,
+            )
+            if integration.refresh_count:
+                remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
+                if remaining <= 0:
+                    raise RunnerTimeout(
+                        "task hard timeout exceeded before integration verification"
+                    )
+                verification_result = run_verification(
+                    prepared.path,
+                    project_config,
+                    spec.verification_profile,
+                    timeout_seconds=max(1, min(remaining, 1800)),
+                    codex_path=(
+                        self.config.codex_path if self.config.codex_home else None
+                    ),
+                    codex_home=self.config.codex_home,
+                    control_callback=monitor,
+                )
+                if not verification_result.passed:
+                    raise PolicyError(
+                        "integration verification failed:\n"
+                        + self._verification_detail(verification_result)
+                    )
             self.store.save_delivery_checkpoint(
                 repo=repo,
                 issue_number=number,
@@ -1012,7 +1281,10 @@ This PR was created as a draft. The worker cannot merge it.
                 branch=branch,
                 worktree=str(prepared.path),
                 context_commit=spec.context_commit,
-                commit_sha=commit_sha,
+                commit_sha=integration.delivery_head,
+                task_commit_sha=task_commit_sha,
+                integrated_base_sha=integration.integrated_base,
+                integration_refreshes=integration.refresh_count,
                 project_config_hash=self._project_config_hash(prepared.path),
                 verification_profile=spec.verification_profile,
                 verification_commands=project_config.verification[
@@ -1094,6 +1366,9 @@ This PR was created as a draft. The worker cannot merge it.
             "worktree": worktree_value,
             "context_commit": spec.context_commit,
             "commit_sha": self.git.current_head(worktree),
+            "task_commit_sha": self.git.current_head(worktree),
+            "integrated_base_sha": spec.context_commit,
+            "integration_refreshes": 0,
             "project_config_hash": self._project_config_hash(worktree),
             "verification_profile": spec.verification_profile,
             "verification_commands": list(verification_commands),
@@ -1185,12 +1460,31 @@ This PR was created as a draft. The worker cannot merge it.
                 raise PolicyError("delivery worktree is not clean")
             if self.git.current_head(worktree) != str(checkpoint["commit_sha"]):
                 raise PolicyError("delivery HEAD changed after checkpoint")
-            if self.git.commit_parents(worktree, str(checkpoint["commit_sha"])) != (
+            delivery_parents = self.git.commit_parents(
+                worktree, str(checkpoint["commit_sha"])
+            )
+            task_commit_sha = str(checkpoint["task_commit_sha"])
+            integrated_base_sha = str(checkpoint["integrated_base_sha"])
+            refreshes = int(checkpoint["integration_refreshes"])
+            if self.git.commit_parents(worktree, task_commit_sha) != (
                 spec.context_commit,
             ):
-                raise PolicyError(
-                    "delivery commit must have the context commit as sole parent"
+                raise PolicyError("task commit must have the context commit as sole parent")
+            if refreshes == 0:
+                if (
+                    str(checkpoint["commit_sha"]) != task_commit_sha
+                    or integrated_base_sha != spec.context_commit
+                    or delivery_parents != (spec.context_commit,)
+                ):
+                    raise PolicyError("non-integrated delivery checkpoint is inconsistent")
+            elif (
+                len(delivery_parents) != 2
+                or delivery_parents[1] != integrated_base_sha
+                or not self.git.is_ancestor(
+                    worktree, task_commit_sha, delivery_parents[0]
                 )
+            ):
+                raise PolicyError("integration delivery parents differ from checkpoint")
             project_config = load_project_config(
                 worktree / ".codex-worker" / "project.toml"
             )
@@ -1212,7 +1506,7 @@ This PR was created as a draft. The worker cannot merge it.
             ) != verification_commands:
                 raise PolicyError("delivery verification commands changed after checkpoint")
 
-            diff = self.git.diff_summary(worktree, spec.context_commit)
+            diff = self.git.diff_summary(worktree, integrated_base_sha)
             if not diff.changed_paths:
                 raise PolicyError("delivery commit has no repository changes")
             validate_changed_paths(
@@ -1312,6 +1606,9 @@ This PR was created as a draft. The worker cannot merge it.
                     worktree=str(worktree),
                     context_commit=spec.context_commit,
                     commit_sha=str(checkpoint["commit_sha"]),
+                    task_commit_sha=str(checkpoint["task_commit_sha"]),
+                    integrated_base_sha=str(checkpoint["integrated_base_sha"]),
+                    integration_refreshes=int(checkpoint["integration_refreshes"]),
                     project_config_hash=str(checkpoint["project_config_hash"]),
                     verification_profile=spec.verification_profile,
                     verification_commands=tuple(
@@ -1360,7 +1657,11 @@ This PR was created as a draft. The worker cannot merge it.
                     if getattr(exc, "retryable", False) is True
                     else "not-retryable"
                 )
-            return "awaiting-review"
+            return (
+                "merging"
+                if self.config.merge_mode == "automatic"
+                else "awaiting-review"
+            )
         except Exception as exc:
             retryable = getattr(exc, "retryable", False) is True
             persisted_checkpoint = self.store.get_delivery_checkpoint(

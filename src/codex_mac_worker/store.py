@@ -107,6 +107,9 @@ class EventStore:
                 worktree TEXT NOT NULL,
                 context_commit TEXT NOT NULL,
                 commit_sha TEXT NOT NULL,
+                task_commit_sha TEXT NOT NULL,
+                integrated_base_sha TEXT NOT NULL,
+                integration_refreshes INTEGER NOT NULL DEFAULT 0,
                 project_config_hash TEXT NOT NULL,
                 verification_profile TEXT NOT NULL,
                 verification_commands_json TEXT NOT NULL,
@@ -122,6 +125,22 @@ class EventStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (repo, issue_number, task_hash)
             );
+
+            CREATE TABLE IF NOT EXISTS auto_merge_operations (
+                repo TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                pr_number INTEGER NOT NULL,
+                task_hash TEXT NOT NULL,
+                expected_head TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                merge_commit_sha TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY (repo, issue_number, pr_number, task_hash, expected_head)
+            );
             """
         )
         columns = {
@@ -135,6 +154,29 @@ class EventStore:
         ):
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE outbox ADD COLUMN {name} {definition}")
+        checkpoint_columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA table_info(delivery_checkpoints)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("task_commit_sha", "TEXT"),
+            ("integrated_base_sha", "TEXT"),
+            ("integration_refreshes", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in checkpoint_columns:
+                self.connection.execute(
+                    f"ALTER TABLE delivery_checkpoints ADD COLUMN {name} {definition}"
+                )
+        self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET task_commit_sha=COALESCE(task_commit_sha, commit_sha),
+                integrated_base_sha=COALESCE(integrated_base_sha, context_commit),
+                integration_refreshes=COALESCE(integration_refreshes, 0)
+            """
+        )
         self.connection.commit()
 
     def upsert_task(
@@ -208,18 +250,23 @@ class EventStore:
         phase: str = "delivery-ready",
         worker_state_key: str | None = None,
         worker_state_value: Any = None,
+        task_commit_sha: str | None = None,
+        integrated_base_sha: str | None = None,
+        integration_refreshes: int = 0,
     ) -> None:
         now = utc_now()
+        task_commit_sha = task_commit_sha or commit_sha
+        integrated_base_sha = integrated_base_sha or context_commit
         with self.connection:
             existing = self.connection.execute(
                 """
-                SELECT branch, worktree, context_commit, commit_sha
+                SELECT branch, worktree, context_commit, commit_sha, task_commit_sha
                 FROM delivery_checkpoints
                 WHERE repo=? AND issue_number=? AND task_hash=?
                 """,
                 (repo, issue_number, task_hash),
             ).fetchone()
-            identity = (branch, worktree, context_commit, commit_sha)
+            identity = (branch, worktree, context_commit, commit_sha, task_commit_sha)
             if existing is not None and tuple(existing) != identity:
                 raise ValueError("delivery checkpoint identity changed")
 
@@ -227,13 +274,14 @@ class EventStore:
                 """
                 INSERT INTO delivery_checkpoints (
                     repo, issue_number, task_hash, branch, worktree,
-                    context_commit, commit_sha, project_config_hash,
+                    context_commit, commit_sha, task_commit_sha,
+                    integrated_base_sha, integration_refreshes, project_config_hash,
                     verification_profile, verification_commands_json,
                     verification_result_json, structured_result_json,
                     model, cli_version, session_id, phase, retryable,
                     last_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, 1, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          1, NULL, ?, ?)
                 ON CONFLICT(repo, issue_number, task_hash) DO NOTHING
                 """,
                 (
@@ -244,6 +292,9 @@ class EventStore:
                     worktree,
                     context_commit,
                     commit_sha,
+                    task_commit_sha,
+                    integrated_base_sha,
+                    integration_refreshes,
                     project_config_hash,
                     verification_profile,
                     json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
@@ -299,6 +350,121 @@ class EventStore:
         item["retryable"] = bool(item["retryable"])
         return item
 
+    def begin_auto_merge(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        task_hash: str,
+        expected_head: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connection:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM auto_merge_operations
+                WHERE repo=? AND issue_number=? AND pr_number=?
+                """,
+                (repo, issue_number, pr_number),
+            ).fetchall()
+            for row in rows:
+                if (
+                    str(row["task_hash"]) != task_hash
+                    or str(row["expected_head"]) != expected_head
+                ):
+                    raise ValueError("auto-merge operation identity changed")
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO auto_merge_operations (
+                    repo, issue_number, pr_number, task_hash, expected_head,
+                    state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'recorded', ?, ?)
+                """,
+                (repo, issue_number, pr_number, task_hash, expected_head, now, now),
+            )
+        operation = self.get_auto_merge(repo, issue_number, pr_number, expected_head)
+        assert operation is not None
+        return operation
+
+    def get_auto_merge(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM auto_merge_operations
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (repo, issue_number, pr_number, expected_head),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_auto_merge_state(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+        *,
+        state: str,
+        error: str | None = None,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE auto_merge_operations
+            SET state=?, attempts=attempts + CASE WHEN ? IS NULL THEN 0 ELSE 1 END,
+                last_error=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (
+                state,
+                error,
+                error[:4000] if error is not None else None,
+                utc_now(),
+                repo,
+                issue_number,
+                pr_number,
+                expected_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("auto-merge operation does not exist")
+
+    def complete_auto_merge(
+        self,
+        repo: str,
+        issue_number: int,
+        pr_number: int,
+        expected_head: str,
+        merge_commit_sha: str,
+    ) -> None:
+        now = utc_now()
+        cursor = self.connection.execute(
+            """
+            UPDATE auto_merge_operations
+            SET state='completed', merge_commit_sha=?, last_error=NULL,
+                updated_at=?, completed_at=?
+            WHERE repo=? AND issue_number=? AND pr_number=? AND expected_head=?
+            """,
+            (
+                merge_commit_sha,
+                now,
+                now,
+                repo,
+                issue_number,
+                pr_number,
+                expected_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("auto-merge operation does not exist")
+
     def set_delivery_checkpoint_state(
         self,
         repo: str,
@@ -353,6 +519,49 @@ class EventStore:
         self.connection.commit()
         if cursor.rowcount != 1:
             raise KeyError("delivery checkpoint does not exist")
+
+    def update_delivery_integration(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        *,
+        expected_task_commit: str,
+        previous_head: str,
+        delivery_head: str,
+        integrated_base: str,
+        integration_refreshes: int,
+        verification_result: dict[str, Any],
+        verification_commands: tuple[str, ...],
+        project_config_hash: str,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET commit_sha=?, integrated_base_sha=?, integration_refreshes=?,
+                verification_result_json=?, verification_commands_json=?,
+                project_config_hash=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND task_hash=?
+              AND task_commit_sha=? AND commit_sha=?
+            """,
+            (
+                delivery_head,
+                integrated_base,
+                integration_refreshes,
+                json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
+                json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
+                project_config_hash,
+                utc_now(),
+                repo,
+                issue_number,
+                task_hash,
+                expected_task_commit,
+                previous_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise ValueError("delivery integration identity changed")
 
     def active_tasks(self) -> list[dict[str, Any]]:
         terminal = ("awaiting-review", "completed", "cancelled", "needs-attention")
