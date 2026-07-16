@@ -87,7 +87,7 @@ class ReviewGitHub:
             ),
             "base": {"ref": "main", "sha": "a" * 40},
             "head": {"ref": "codex/12-bounded", "sha": "c" * 40},
-            "user": {"login": "worker-app[bot]"},
+            "user": {"login": "worker-app[bot]", "type": "Bot"},
             "performed_via_github_app": {"id": 777, "slug": "worker-app"},
             "draft": True,
             "mergeable": True,
@@ -316,6 +316,37 @@ def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
     assert snapshot.gates.allowed is True
     assert len(snapshot.approval_fingerprint) == 64
     assert snapshot.model == "gpt-test"
+
+
+def test_review_allows_attested_bot_when_pull_app_metadata_is_absent() -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["performed_via_github_app"] = None
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("user", "blocker"),
+    [
+        ({"login": "worker-app[bot]", "type": "User"}, "Bot"),
+        ({"login": "other-worker[bot]", "type": "Bot"}, "identity"),
+    ],
+)
+def test_review_blocks_unattested_pull_author(user: dict[str, str], blocker: str) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["user"] = user
+    github.pull["performed_via_github_app"] = None
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is False
+    assert any(blocker.lower() in item.lower() for item in snapshot.gates.blockers)
 
 
 def test_review_keeps_attested_worker_identity_after_default_branch_advances() -> None:

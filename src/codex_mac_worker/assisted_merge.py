@@ -282,7 +282,9 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
     if not head_branch.startswith("codex/"):
         blockers.append("source branch must begin with codex/")
     worker_identity = _authoritative_worker_identity(github, reference.repo)
-    author_login = str(pull.get("user", {}).get("login", ""))
+    pull_user = pull.get("user", {})
+    author_login = str(pull_user.get("login", ""))
+    author_type = str(pull_user.get("type", ""))
     pull_app_metadata = pull.get("performed_via_github_app")
     pull_app_id = (
         pull_app_metadata.get("id")
@@ -295,9 +297,11 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         )
     else:
         worker_login, worker_app_id = worker_identity
+        if author_type != "Bot":
+            blockers.append("PR author is not a GitHub Bot")
         if author_login != worker_login:
             blockers.append("PR author does not match the attested Worker identity")
-        if pull_app_id != worker_app_id:
+        if isinstance(pull_app_metadata, dict) and pull_app_id != worker_app_id:
             blockers.append("PR was not created by the attested Worker GitHub App")
     if delivery.task_hash != spec.task_hash:
         blockers.append("delivery task hash differs from the frozen Issue task hash")
