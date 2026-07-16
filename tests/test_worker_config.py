@@ -12,6 +12,7 @@ def write_worker_config(
     tmp_path: Path,
     *,
     discovery: str = "",
+    merge_mode: str = "",
     proxy: str = "",
     repositories: str = "",
 ) -> None:
@@ -32,6 +33,7 @@ github_installation_id = "456"
 github_private_key_path = "{tmp_path / 'app.pem'}"
 authorized_users = ["owner"]
 {discovery}
+{merge_mode}
 {proxy}
 {repositories}
 """.strip()
@@ -160,6 +162,44 @@ def test_worker_config_rejects_non_boolean_discovery_flag(tmp_path: Path) -> Non
 
     with pytest.raises(ConfigError, match="discover_installation_repositories"):
         load_worker_config(config_path)
+
+
+def test_worker_merge_mode_defaults_to_manual(tmp_path: Path) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery="discover_installation_repositories = true",
+    )
+
+    assert load_worker_config(config_path).merge_mode == "manual"
+
+
+@pytest.mark.parametrize("value", ["auto", "yes", "", "AUTOMATIC"])
+def test_worker_merge_mode_rejects_unknown_values(tmp_path: Path, value: str) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery="discover_installation_repositories = true",
+        merge_mode=f'merge_mode = "{value}"',
+    )
+
+    with pytest.raises(ConfigError, match="merge_mode"):
+        load_worker_config(config_path)
+
+
+@pytest.mark.parametrize("value", ["manual", "automatic"])
+def test_worker_merge_mode_accepts_known_values(tmp_path: Path, value: str) -> None:
+    config_path = tmp_path / "worker.toml"
+    write_worker_config(
+        config_path,
+        tmp_path,
+        discovery="discover_installation_repositories = true",
+        merge_mode=f'merge_mode = "{value}"',
+    )
+
+    assert load_worker_config(config_path).merge_mode == value
 
 
 def test_worker_config_parses_safe_git_proxy(tmp_path: Path) -> None:

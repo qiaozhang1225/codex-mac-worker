@@ -324,6 +324,36 @@ def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
     assert snapshot.gates.allowed is True
     assert len(snapshot.approval_fingerprint) == 64
     assert snapshot.model == "gpt-test"
+    assert snapshot.ruleset_profile == "manual"
+
+
+def test_review_accepts_automatic_ruleset_profile() -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.ruleset = ruleset_payload("automatic") | {"id": 1}
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is True
+    assert snapshot.ruleset_profile == "automatic"
+
+
+def test_review_blocks_hybrid_ruleset_profile() -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.ruleset = ruleset_payload("automatic") | {"id": 1}
+    pull_request = next(
+        rule for rule in github.ruleset["rules"] if rule["type"] == "pull_request"
+    )
+    pull_request["parameters"]["require_last_push_approval"] = True
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is False
+    assert snapshot.ruleset_profile is None
+    assert any("Ruleset" in blocker for blocker in snapshot.gates.blockers)
 
 
 def test_review_allows_attested_bot_when_pull_app_metadata_is_absent() -> None:

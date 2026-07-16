@@ -14,6 +14,7 @@ from typing import Any, Protocol
 
 from .config import parse_project_config
 from .control_state import ControlState, operation_id
+from .merge_policy import RULESET_NAME, classify_ruleset, ruleset_payload
 from .protocol import (
     REPOSITORY_ATTESTATION_MARKER,
     REPOSITORY_PROBE_MARKER,
@@ -34,7 +35,6 @@ ONBOARDING_PATHS = frozenset(
 )
 _ASSETS = {"codex-task.yml", "codex-worker-watchdog.yml"}
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-RULESET_NAME = "Codex Worker Default Branch"
 STATUS_LABELS: dict[str, tuple[str, str]] = {
     "codex:queued": ("1f6feb", "Ready for the Mac mini Worker"),
     "codex:claimed": ("8250df", "Claimed or paused by the Worker"),
@@ -83,6 +83,7 @@ class ReadinessReport:
     files_valid: bool
     labels_valid: bool
     ruleset_valid: bool
+    ruleset_profile: str | None
     worker_attested: bool
     worker_login: str | None
     blockers: tuple[str, ...]
@@ -399,66 +400,8 @@ def render_project_config(
     return rendered
 
 
-def ruleset_payload() -> dict[str, Any]:
-    return {
-        "name": RULESET_NAME,
-        "target": "branch",
-        "enforcement": "active",
-        "conditions": {
-            "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
-        },
-        "bypass_actors": [
-            {
-                "actor_id": 5,
-                "actor_type": "RepositoryRole",
-                "bypass_mode": "pull_request",
-            }
-        ],
-        "rules": [
-            {"type": "deletion"},
-            {"type": "non_fast_forward"},
-            {"type": "update"},
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "allowed_merge_methods": ["squash"],
-                    "dismiss_stale_reviews_on_push": True,
-                    "require_code_owner_review": False,
-                    "require_last_push_approval": True,
-                    "required_approving_review_count": 1,
-                    "required_review_thread_resolution": True,
-                },
-            },
-        ],
-    }
-
-
 def _ruleset_valid(payload: dict[str, Any]) -> bool:
-    if payload.get("name") != RULESET_NAME or payload.get("target") != "branch":
-        return False
-    if payload.get("enforcement") != "active":
-        return False
-    conditions = payload.get("conditions", {}).get("ref_name", {})
-    if "~DEFAULT_BRANCH" not in conditions.get("include", []):
-        return False
-    bypass = payload.get("bypass_actors", [])
-    if len(bypass) != 1 or (
-        bypass[0].get("actor_type"),
-        bypass[0].get("actor_id"),
-        bypass[0].get("bypass_mode"),
-    ) != ("RepositoryRole", 5, "pull_request"):
-        return False
-    rules = {item.get("type"): item for item in payload.get("rules", [])}
-    if not {"deletion", "non_fast_forward", "update", "pull_request"}.issubset(rules):
-        return False
-    parameters = rules["pull_request"].get("parameters", {})
-    return (
-        parameters.get("allowed_merge_methods") == ["squash"]
-        and parameters.get("dismiss_stale_reviews_on_push") is True
-        and parameters.get("require_last_push_approval") is True
-        and parameters.get("required_approving_review_count") == 1
-        and parameters.get("required_review_thread_resolution") is True
-    )
+    return classify_ruleset(payload) is not None
 
 
 def _default_repository_state(
@@ -523,15 +466,16 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
     if not labels_valid:
         blockers.append("labels: standard codex status labels are missing or changed")
 
-    ruleset_valid = False
+    ruleset_profile: str | None = None
     try:
         summaries = github.list_rulesets(repo)
         matching = [item for item in summaries if item.get("name") == RULESET_NAME]
         if len(matching) == 1:
             ruleset = github.get_ruleset(repo, int(matching[0]["id"]))
-            ruleset_valid = _ruleset_valid(ruleset)
+            ruleset_profile = classify_ruleset(ruleset)
     except Exception as exc:
         blockers.append(f"Ruleset: {type(exc).__name__}: {exc}")
+    ruleset_valid = ruleset_profile is not None
     if not ruleset_valid:
         blockers.append("Ruleset: Codex Worker default-branch protection is missing or unsafe")
 
@@ -602,6 +546,7 @@ def repository_status(github: Any, repo: str) -> ReadinessReport:
         files_valid=files_valid,
         labels_valid=labels_valid,
         ruleset_valid=ruleset_valid,
+        ruleset_profile=ruleset_profile,
         worker_attested=worker_attested,
         worker_login=worker_login,
         blockers=tuple(dict.fromkeys(blockers)),
@@ -625,7 +570,7 @@ def _reconcile_ruleset(github: Any, repo: str) -> None:
         for item in current.get("bypass_actors", [])
     ):
         raise OnboardingError("existing Ruleset grants an Integration bypass")
-    if not _ruleset_valid(current):
+    if classify_ruleset(current) is None:
         github.update_ruleset(repo, ruleset_id, expected)
 
 

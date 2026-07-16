@@ -22,6 +22,7 @@ from codex_mac_worker.repository_onboarding import (
     render_project_config,
     ruleset_payload,
 )
+from codex_mac_worker.merge_policy import classify_ruleset
 
 
 PROJECT_TOML = """
@@ -348,6 +349,7 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
     assert report.phase == "ready"
     assert report.worker_attested is True
     assert report.worker_login == "coworker-app[bot]"
+    assert report.ruleset_profile == "manual"
 
     github.default_head = "d" * 40
     after_product_merge = repository_status(github, "owner/repo")
@@ -360,6 +362,7 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
     unsafe_bypass = repository_status(github, "owner/repo")
     assert unsafe_bypass.phase == "blocked"
     assert unsafe_bypass.ruleset_valid is False
+    assert unsafe_bypass.ruleset_profile is None
 
     github.rulesets[0]["bypass_actors"].pop()
     github.comments[probe["number"]][0]["performed_via_github_app"]["id"] = 999
@@ -386,6 +389,29 @@ def test_repository_status_becomes_ready_only_for_matching_bot_attestation() -> 
     ]
     ignores_nullable_app = repository_status(github, "owner/repo")
     assert ignores_nullable_app.phase == "ready"
+
+
+def test_ruleset_classifier_distinguishes_manual_and_automatic() -> None:
+    manual = ruleset_payload("manual")
+    automatic = ruleset_payload("automatic")
+
+    assert classify_ruleset(manual) == "manual"
+    assert classify_ruleset(automatic) == "automatic"
+
+    automatic["bypass_actors"].append(
+        {"actor_id": 777, "actor_type": "Integration", "bypass_mode": "always"}
+    )
+    assert classify_ruleset(automatic) is None
+
+
+def test_ruleset_classifier_rejects_hybrid_review_settings() -> None:
+    hybrid = ruleset_payload("automatic")
+    pull_request = next(
+        rule for rule in hybrid["rules"] if rule["type"] == "pull_request"
+    )
+    pull_request["parameters"]["require_last_push_approval"] = True
+
+    assert classify_ruleset(hybrid) is None
 
 
 def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: Path) -> None:
