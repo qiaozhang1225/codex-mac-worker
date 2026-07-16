@@ -19,6 +19,7 @@ _PROXY_ENV_KEYS = (
     "https_proxy",
     "all_proxy",
 )
+_PROXY_BYPASS_ENV_KEYS = ("NO_PROXY", "no_proxy")
 
 
 class GitError(RuntimeError):
@@ -120,6 +121,8 @@ class GitOperations:
             "operation timed out",
             "could not resolve host",
             "couldn't resolve host",
+            "could not resolve proxy",
+            "couldn't resolve proxy",
             "failed to connect to",
             "connection reset",
             "remote end hung up unexpectedly",
@@ -140,22 +143,46 @@ class GitOperations:
             normalized,
         ) is not None
 
-    def _proxy_environment(self, *, use_proxy: bool) -> dict[str, str | None]:
+    def _proxy_environment(
+        self,
+        *,
+        use_proxy: bool,
+        target_url: str,
+    ) -> dict[str, str | None]:
         value = self.proxy_url if use_proxy else None
-        return {key: value for key in _PROXY_ENV_KEYS}
+        environment = {key: value for key in _PROXY_ENV_KEYS}
+        environment.update({key: None for key in _PROXY_BYPASS_ENV_KEYS})
+
+        git_proxy_value = self.proxy_url if use_proxy else ""
+        normalized_target = target_url.rstrip("/")
+        config_entries = (
+            ("http.proxy", git_proxy_value),
+            (f"http.{normalized_target}.proxy", git_proxy_value),
+            (f"http.{normalized_target}/.proxy", git_proxy_value),
+        )
+        environment["GIT_CONFIG_PARAMETERS"] = None
+        environment["GIT_CONFIG_COUNT"] = str(len(config_entries))
+        for index, (key, config_value) in enumerate(config_entries):
+            environment[f"GIT_CONFIG_KEY_{index}"] = key
+            environment[f"GIT_CONFIG_VALUE_{index}"] = config_value
+        return environment
 
     def _git_network(
         self,
         cwd: Path,
         *args: str,
         env: Mapping[str, str | None] | None = None,
+        proxy_target_url: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         attempts = len(self.network_retry_delays) + 1
         for attempt in range(attempts):
             attempt_env: dict[str, str | None] = dict(env or {})
-            if self.proxy_url is not None:
+            if self.proxy_url is not None and proxy_target_url is not None:
                 attempt_env.update(
-                    self._proxy_environment(use_proxy=attempt % 2 == 0)
+                    self._proxy_environment(
+                        use_proxy=attempt % 2 == 0,
+                        target_url=proxy_target_url,
+                    )
                 )
             result = self._git(cwd, *args, env=attempt_env, check=False)
             if result.returncode == 0:
@@ -202,7 +229,14 @@ class GitOperations:
         mirror = self.cache_root / owner / f"{name}.git"
         with self._authentication(token) as env:
             if mirror.exists():
-                self._git_network(mirror, "remote", "update", "--prune", env=env)
+                self._git_network(
+                    mirror,
+                    "remote",
+                    "update",
+                    "--prune",
+                    env=env,
+                    proxy_target_url=clone_url,
+                )
                 return mirror
             mirror.parent.mkdir(parents=True, exist_ok=True)
             self._git_network(
@@ -212,6 +246,7 @@ class GitOperations:
                 clone_url,
                 str(mirror),
                 env=env,
+                proxy_target_url=clone_url,
             )
         return mirror
 
@@ -349,4 +384,5 @@ class GitOperations:
                 remote_name,
                 f"HEAD:refs/heads/{branch}",
                 env=env,
+                proxy_target_url=clone_url,
             )

@@ -45,7 +45,10 @@ attempts alternate routes in this deterministic order:
 Each attempt receives only its route-specific proxy environment. Permanent errors such as
 authentication failure, authorization denial, certificate failure, repository absence, and
 local ref conflicts stop immediately. Only the existing classified transient transport errors
-advance to the next route. Error messages report the attempt count but never print credentials.
+advance to the next route. Route selection clears inherited proxy-bypass variables and applies
+command-scoped generic and repository-specific Git proxy overrides so global or local Git
+configuration cannot collapse the two routes. Error messages report the attempt count but never
+print credentials.
 
 This order makes the known-good proxy the normal route, preserves cold-start operation when
 the desktop proxy is unavailable, and keeps total latency and request volume bounded.
