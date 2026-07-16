@@ -216,6 +216,7 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
             json.dumps(
                 {
                     "worker_id": config.worker_id,
+                    "merge_mode": config.merge_mode,
                     "repositories": [item.name for item in config.repositories],
                     "discover_installation_repositories": (
                         config.discover_installation_repositories

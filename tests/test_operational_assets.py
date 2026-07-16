@@ -41,6 +41,7 @@ clone_url = "https://github.com/owner/repo.git"
     assert worker_main(["--config", str(config), "--check-config"]) == 0
     output = capsys.readouterr().out
     assert '"worker_id": "test"' in output
+    assert '"merge_mode": "manual"' in output
     assert '"discover_installation_repositories": false' in output
     assert '"git_proxy_url": null' in output
 
@@ -116,6 +117,11 @@ def test_shell_scripts_parse_and_docs_cover_manual_boundaries() -> None:
     combined = "\n".join((setup, operations, macbook, (ROOT / "docs" / "SECURITY.md").read_text()))
     for required in (
         "discover_installation_repositories",
+        'merge_mode = "automatic"',
+        "automatic Ruleset",
+        "principal",
+        "active path ownership",
+        "codexctl task create --yes",
         "codexctl repo status",
         "codexctl repo onboard",
         "codexctl repo finalize",

@@ -6,7 +6,7 @@ import yaml
 SKILL = Path(__file__).parents[1] / "skills" / "dispatch-codex-task"
 
 
-def test_dispatch_skill_enforces_human_confirmed_bounded_tasks() -> None:
+def test_dispatch_skill_defines_principal_agent_bounded_delegation() -> None:
     skill_path = SKILL / "SKILL.md"
     text = skill_path.read_text(encoding="utf-8")
     _, frontmatter, body = text.split("---", 2)
@@ -16,15 +16,19 @@ def test_dispatch_skill_enforces_human_confirmed_bounded_tasks() -> None:
     assert str(metadata["description"]).startswith("Use when")
     assert set(metadata) == {"name", "description"}
     for required in (
+        "principal development agent",
+        "strict subset of the authorized parent objective",
+        "active path ownership",
         "git status",
         "git rev-parse",
         "git push",
-        "codexctl task create",
+        "codexctl task create --yes",
         "allowed_paths",
         "acceptance",
         "refuse",
         "confirmation",
         "Goal",
+        'merge_mode = "automatic"',
         "merge",
         "codexctl repo status",
         "codexctl repo onboard",
@@ -35,14 +39,14 @@ def test_dispatch_skill_enforces_human_confirmed_bounded_tasks() -> None:
         "expected-fingerprint",
         "head SHA",
         "explicit",
-        "future PR",
-        "automatic merge",
+        "automatic Ruleset",
     ):
         assert required in body
 
-    assert "设计" in body
-    assert "看起来可以" in body
+    assert "Run only after explicit confirmation of that final specification" not in body
+    assert "Mac mini cannot further delegate" in body
+    assert "production" in body
 
     agent = yaml.safe_load((SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8"))
     assert "$dispatch-codex-task" in agent["interface"]["default_prompt"]
-    assert "review" in agent["interface"]["short_description"].lower()
+    assert "principal" in agent["interface"]["short_description"].lower()
