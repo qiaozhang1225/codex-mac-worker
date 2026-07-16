@@ -535,6 +535,155 @@ def test_retry_delivery_reconciles_existing_pr_after_ambiguous_response(
     assert len(remote.prs) == 1
 
 
+def prepare_legacy_delivery(
+    tmp_path: Path,
+    *,
+    damage: str | None = None,
+) -> tuple[WorkerService, WorkerConfig, FakeGitHub, EventStore, dict, str]:
+    service, config, github, store, operations, issue = make_worker_fixture(tmp_path)
+    spec = parse_task_body(issue["body"])
+    mirror = operations.ensure_mirror(
+        "owner/repo",
+        config.repositories[0].clone_url,
+        token="token",
+    )
+    prepared = operations.prepare_worktree(
+        repo="owner/repo",
+        mirror=mirror,
+        context_commit=spec.context_commit,
+        base_branch=spec.base_branch,
+        issue_number=12,
+        slug="bounded-task",
+    )
+    result = FakeRunner().run(
+        prepared.path,
+        "prompt",
+        tmp_path / "schema.json",
+    )
+    if damage == "scope-violation":
+        (prepared.path / ".env").write_text(
+            'PASSWORD="abcdefghijklmnop"\n',
+            encoding="utf-8",
+        )
+    if damage != "missing-run":
+        run_id = store.start_run("owner/repo", 12)
+        store.finish_run(
+            run_id,
+            exit_code=1 if damage == "nonzero-run" else 0,
+            result={
+                "session_id": result.session_id,
+                "termination_reason": result.termination_reason,
+                "event_count": len(result.events),
+                "last_message": (
+                    "{" if damage == "invalid-final-message" else result.last_message
+                ),
+                "model": result.model,
+                "cli_version": result.cli_version,
+            },
+        )
+    commit_sha = operations.commit(
+        prepared.path,
+        "feat: complete codex task #12",
+        author_name="Codex Mac Worker",
+        author_email="codex-worker@users.noreply.github.com",
+    )
+    if damage == "wrong-parent":
+        git(prepared.path, "commit", "--allow-empty", "-m", "second delivery commit")
+        commit_sha = git(prepared.path, "rev-parse", "HEAD")
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=12,
+        task_hash=spec.task_hash,
+        state="needs-attention",
+        branch=prepared.branch,
+        worktree=str(prepared.path),
+        session_id=(
+            "different-session" if damage == "session-mismatch" else result.session_id
+        ),
+    )
+    if damage == "dirty-worktree":
+        (prepared.path / "src" / "result.txt").write_text("dirty\n", encoding="utf-8")
+    elif damage == "wrong-branch":
+        git(prepared.path, "switch", "-c", "unexpected-branch")
+    elif damage == "missing-worktree":
+        prepared.path.rename(prepared.path.with_name(prepared.path.name + "-moved"))
+    return service, config, github, store, issue, commit_sha
+
+
+def test_retry_delivery_reconstructs_strict_legacy_checkpoint_once(
+    tmp_path: Path,
+) -> None:
+    service, config, _, store, issue, commit_sha = prepare_legacy_delivery(tmp_path)
+    task_hash = parse_task_body(issue["body"]).task_hash
+
+    outcome = service.retry_delivery(config.repositories[0], issue)
+
+    assert outcome == "awaiting-review"
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, task_hash)
+    assert checkpoint is not None
+    assert checkpoint["commit_sha"] == commit_sha
+    assert store.get_worker_state(
+        f"legacy-delivery-recovery:owner/repo#12:{task_hash}"
+    ) == "reconstructed"
+    assert git(tmp_path / "remote.git", "rev-parse", "codex/12-bounded-task") == commit_sha
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-worktree",
+        "dirty-worktree",
+        "wrong-branch",
+        "wrong-parent",
+        "missing-run",
+        "nonzero-run",
+        "session-mismatch",
+        "invalid-final-message",
+        "scope-violation",
+    ],
+)
+def test_legacy_reconstruction_rejects_incomplete_evidence(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    service, config, github, store, issue, _ = prepare_legacy_delivery(
+        tmp_path,
+        damage=damage,
+    )
+    task_hash = parse_task_body(issue["body"]).task_hash
+
+    outcome = service.retry_delivery(config.repositories[0], issue)
+
+    assert outcome == "not-retryable"
+    assert store.get_delivery_checkpoint("owner/repo", 12, task_hash) is None
+    assert store.get_worker_state(
+        f"legacy-delivery-recovery:owner/repo#12:{task_hash}"
+    ) == "rejected"
+    assert github.prs == []
+
+
+def test_legacy_reconstruction_rejects_fresh_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, config, _, store, issue, _ = prepare_legacy_delivery(tmp_path)
+    task_hash = parse_task_body(issue["body"]).task_hash
+    monkeypatch.setattr(
+        worker_module,
+        "run_verification",
+        lambda *args, **kwargs: VerificationResult(
+            False,
+            (CommandResult("pytest", 1, "failed"),),
+        ),
+    )
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+    assert store.get_delivery_checkpoint("owner/repo", 12, task_hash) is None
+    assert store.get_worker_state(
+        f"legacy-delivery-recovery:owner/repo#12:{task_hash}"
+    ) == "rejected"
+
+
 def test_worker_rejects_unauthorized_issue_author(tmp_path: Path) -> None:
     remote, sha = make_project_remote(tmp_path)
     issue = {

@@ -384,8 +384,26 @@ class WorkerService:
             payload = json.loads(result.last_message)
         except json.JSONDecodeError as exc:
             raise PolicyError("Codex returned an invalid structured result") from exc
-        if not isinstance(payload, dict) or payload.get("status") != "completed":
+        if not isinstance(payload, dict):
+            raise PolicyError("Codex returned an invalid structured result")
+        if payload.get("status") != "completed":
             raise PolicyError("Codex reported blocked instead of completed")
+        required_keys = {
+            "status",
+            "summary",
+            "changed_files",
+            "risks",
+            "needs_human",
+            "acceptance_results",
+        }
+        if set(payload) != required_keys:
+            raise PolicyError("Codex result fields do not match the frozen result schema")
+        if not isinstance(payload["summary"], str) or not payload["summary"].strip():
+            raise PolicyError("Codex result summary must not be empty")
+        if not isinstance(payload["changed_files"], list) or not all(
+            isinstance(item, str) for item in payload["changed_files"]
+        ):
+            raise PolicyError("Codex changed_files must be a string list")
 
         acceptance_results = payload.get("acceptance_results")
         if not isinstance(acceptance_results, list) or len(acceptance_results) != len(
@@ -1000,6 +1018,75 @@ This PR was created as a draft. The worker cannot merge it.
         except Exception as exc:
             self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
 
+    def _legacy_delivery_checkpoint_candidate(
+        self,
+        repo: str,
+        issue_number: int,
+        task: dict[str, Any],
+        spec: Any,
+    ) -> dict[str, Any]:
+        branch = str(task.get("branch") or "")
+        worktree_value = str(task.get("worktree") or "")
+        session_id = task.get("session_id")
+        if not branch or not worktree_value or not session_id:
+            raise PolicyError("legacy delivery task evidence is incomplete")
+        worktree = Path(worktree_value)
+        if not worktree.is_dir():
+            raise PolicyError("delivery worktree is missing")
+
+        runs = [
+            run
+            for run in self.store.list_runs(repo, issue_number)
+            if run["finished_at"]
+            and run["exit_code"] == 0
+            and isinstance(run.get("result"), dict)
+            and run["result"].get("termination_reason") is None
+            and run["result"].get("session_id") == session_id
+        ]
+        if len(runs) != 1:
+            raise PolicyError("legacy delivery requires one matching successful run")
+        run_result = runs[0]["result"]
+        last_message = run_result.get("last_message")
+        if not isinstance(last_message, str) or not last_message:
+            raise PolicyError("legacy delivery final message is missing")
+        runner_result = RunnerResult(
+            exit_code=0,
+            session_id=str(session_id),
+            events=(),
+            last_message=last_message,
+            stderr="",
+            model=run_result.get("model"),
+            cli_version=run_result.get("cli_version"),
+        )
+        structured_result = self._require_completed_result(runner_result, spec)
+        project_config = load_project_config(
+            worktree / ".codex-worker" / "project.toml"
+        )
+        verification_commands = project_config.verification.get(
+            spec.verification_profile
+        )
+        if verification_commands is None:
+            raise PolicyError("legacy delivery verification profile is missing")
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            "task_hash": spec.task_hash,
+            "branch": branch,
+            "worktree": worktree_value,
+            "context_commit": spec.context_commit,
+            "commit_sha": self.git.current_head(worktree),
+            "project_config_hash": self._project_config_hash(worktree),
+            "verification_profile": spec.verification_profile,
+            "verification_commands": list(verification_commands),
+            "verification_result": {"passed": False, "commands": []},
+            "structured_result": structured_result,
+            "model": runner_result.model,
+            "cli_version": runner_result.cli_version,
+            "session_id": runner_result.session_id,
+            "phase": "legacy-reconstruction",
+            "retryable": True,
+        }
+
     def retry_delivery(
         self,
         repository: RepositoryConfig,
@@ -1016,11 +1103,11 @@ This PR was created as a draft. The worker cannot merge it.
             if task is not None
             else None
         )
+        attempted_legacy = checkpoint is None
+        legacy_key = f"legacy-delivery-recovery:{repo}#{number}:{task_hash}"
         try:
             if task is None:
                 raise PolicyError("delivery retry task record is missing")
-            if checkpoint is None or checkpoint.get("retryable") is not True:
-                raise PolicyError("delivery checkpoint is not retryable")
 
             deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
             self._validate_issue_author(repo, issue)
@@ -1028,6 +1115,17 @@ This PR was created as a draft. The worker cannot merge it.
             if spec.task_hash != task_hash:
                 raise PolicyError("task body changed after delivery checkpoint")
             self.validate_repository_authority(repository)
+            if checkpoint is None:
+                if self.store.get_worker_state(legacy_key) == "rejected":
+                    raise PolicyError("legacy delivery reconstruction was rejected")
+                checkpoint = self._legacy_delivery_checkpoint_candidate(
+                    repo,
+                    number,
+                    task,
+                    spec,
+                )
+            elif checkpoint.get("retryable") is not True:
+                raise PolicyError("delivery checkpoint is not retryable")
             if branch != str(checkpoint["branch"]):
                 raise PolicyError("delivery branch changed after checkpoint")
             if str(task.get("worktree") or "") != str(checkpoint["worktree"]):
@@ -1145,12 +1243,43 @@ This PR was created as a draft. The worker cannot merge it.
                     "delivery retry verification failed:\n"
                     + self._verification_detail(verification_result)
                 )
-            self.store.update_delivery_verification(
-                repo,
-                number,
-                task_hash,
-                self._serialize_verification(verification_result),
-            )
+            serialized_verification = self._serialize_verification(verification_result)
+            if attempted_legacy:
+                self.store.save_delivery_checkpoint(
+                    repo=repo,
+                    issue_number=number,
+                    task_hash=task_hash,
+                    branch=branch,
+                    worktree=str(worktree),
+                    context_commit=spec.context_commit,
+                    commit_sha=str(checkpoint["commit_sha"]),
+                    project_config_hash=str(checkpoint["project_config_hash"]),
+                    verification_profile=spec.verification_profile,
+                    verification_commands=tuple(
+                        checkpoint["verification_commands"]
+                    ),
+                    verification_result=serialized_verification,
+                    structured_result=checkpoint["structured_result"],
+                    model=checkpoint.get("model"),
+                    cli_version=checkpoint.get("cli_version"),
+                    session_id=checkpoint.get("session_id"),
+                )
+                self.store.set_delivery_checkpoint_state(
+                    repo,
+                    number,
+                    task_hash,
+                    phase="legacy-reconstructed",
+                    retryable=True,
+                    last_error=None,
+                )
+                self.store.set_worker_state(legacy_key, "reconstructed")
+            else:
+                self.store.update_delivery_verification(
+                    repo,
+                    number,
+                    task_hash,
+                    serialized_verification,
+                )
 
             checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
             assert checkpoint is not None
@@ -1179,7 +1308,12 @@ This PR was created as a draft. The worker cannot merge it.
                 )
             return "awaiting-review"
         except Exception as exc:
-            if checkpoint is not None:
+            persisted_checkpoint = self.store.get_delivery_checkpoint(
+                repo,
+                number,
+                task_hash,
+            )
+            if persisted_checkpoint is not None:
                 self.store.set_delivery_checkpoint_state(
                     repo,
                     number,
@@ -1188,6 +1322,8 @@ This PR was created as a draft. The worker cannot merge it.
                     retryable=False,
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
+            elif attempted_legacy:
+                self.store.set_worker_state(legacy_key, "rejected")
             self._mark_attention(
                 repo,
                 issue,
