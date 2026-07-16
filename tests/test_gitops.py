@@ -405,6 +405,148 @@ def test_git_reports_clean_state_and_commit_parents(tmp_path: Path) -> None:
     assert operations.is_clean(source) is False
 
 
+class IntegrationRepository:
+    def __init__(self, tmp_path: Path) -> None:
+        self.source = tmp_path / "integration-source"
+        self.source.mkdir()
+        git(self.source, "init", "-b", "main")
+        git(self.source, "config", "user.name", "Test")
+        git(self.source, "config", "user.email", "test@example.com")
+        (self.source / "base.txt").write_text("base\n", encoding="utf-8")
+        git(self.source, "add", ".")
+        git(self.source, "commit", "-m", "base")
+        self.context = git(self.source, "rev-parse", "HEAD")
+        self.mirror = tmp_path / "integration.git"
+        git(tmp_path, "clone", "--bare", str(self.source), str(self.mirror))
+        git(self.source, "remote", "add", "origin", str(self.mirror))
+        self.operations = GitOperations(
+            cache_root=tmp_path / "cache",
+            worktree_root=tmp_path / "worktrees",
+        )
+        prepared = self.operations.prepare_worktree(
+            repo="owner/repo",
+            mirror=self.mirror,
+            context_commit=self.context,
+            base_branch="main",
+            issue_number=12,
+            slug="integration",
+        )
+        self.worktree = prepared.path
+
+    def commit_task(self, path: str = "feature.txt", content: str = "task\n") -> str:
+        target = self.worktree / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return self.operations.commit(
+            self.worktree,
+            "task",
+            author_name="Worker",
+            author_email="worker@example.com",
+        )
+
+    def advance_main(self, path: str = "docs.md", content: str = "main\n") -> str:
+        target = self.source / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        git(self.source, "add", ".")
+        git(self.source, "commit", "-m", "advance main")
+        git(self.source, "push", "origin", "main")
+        return git(self.source, "rev-parse", "HEAD")
+
+    def integrate(self, *, refresh_count: int = 0):
+        return self.operations.integrate_default(
+            self.worktree,
+            self.mirror,
+            "main",
+            self.context,
+            ("feature.txt",),
+            refresh_count=refresh_count,
+            author_name="Codex Mac Worker",
+            author_email="codex-worker@users.noreply.github.com",
+        )
+
+
+def test_integrate_default_leaves_unchanged_main_alone(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    task_commit = repo.commit_task()
+
+    result = repo.integrate()
+
+    assert result.task_commit == task_commit
+    assert result.integrated_base == repo.context
+    assert result.delivery_head == task_commit
+    assert result.refresh_count == 0
+
+
+def test_integrate_default_merges_advanced_non_overlapping_main(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    task_commit = repo.commit_task()
+    new_main = repo.advance_main("docs.md")
+
+    result = repo.integrate()
+
+    assert result.task_commit == task_commit
+    assert result.integrated_base == new_main
+    assert result.refresh_count == 1
+    assert len(repo.operations.commit_parents(repo.worktree, result.delivery_head)) == 2
+    assert (repo.worktree / "docs.md").read_text(encoding="utf-8") == "main\n"
+
+
+def test_integrate_default_rejects_overlapping_main_change(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    repo.commit_task()
+    repo.advance_main("feature.txt", "main version\n")
+
+    with pytest.raises(GitError, match="overlap"):
+        repo.integrate()
+
+
+def test_integrate_default_rejects_non_ancestor_main(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    repo.commit_task()
+    git(repo.source, "checkout", "--orphan", "replacement")
+    git(repo.source, "rm", "-rf", ".")
+    (repo.source / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+    git(repo.source, "add", ".")
+    git(repo.source, "commit", "-m", "replace main")
+    git(repo.source, "push", "--force", "origin", "HEAD:main")
+
+    with pytest.raises(GitError, match="not a descendant"):
+        repo.integrate()
+
+
+def test_integrate_default_refuses_third_refresh(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    repo.commit_task()
+    repo.advance_main()
+
+    with pytest.raises(GitError, match="more than two"):
+        repo.integrate(refresh_count=2)
+
+
+def test_integrate_default_aborts_failed_merge_and_restores_clean_head(
+    tmp_path: Path,
+) -> None:
+    repo = IntegrationRepository(tmp_path)
+    task_commit = repo.commit_task("conflict.txt", "task\n")
+    repo.advance_main("conflict.txt", "main\n")
+
+    with pytest.raises(GitError, match="merge failed"):
+        repo.operations.integrate_default(
+            repo.worktree,
+            repo.mirror,
+            "main",
+            repo.context,
+            ("different-declared-path.txt",),
+            refresh_count=0,
+            author_name="Codex Mac Worker",
+            author_email="codex-worker@users.noreply.github.com",
+        )
+
+    assert repo.operations.current_head(repo.worktree) == task_commit
+    assert repo.operations.is_clean(repo.worktree) is True
+
+
 def test_push_rejects_expired_delivery_deadline(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

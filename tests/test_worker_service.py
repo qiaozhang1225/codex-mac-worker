@@ -263,6 +263,111 @@ def test_worker_processes_bounded_task_into_draft_pr(
     assert checkpoint["retryable"] is False
 
 
+def advance_remote_after_task_commit(
+    tmp_path: Path,
+    operations: GitOperations,
+    remote: Path,
+    relative_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_commit = operations.commit
+
+    def commit_then_advance(*args: object, **kwargs: object) -> str:
+        task_commit = original_commit(*args, **kwargs)
+        upstream = tmp_path / "upstream-advance"
+        git(tmp_path, "clone", str(remote), str(upstream))
+        git(upstream, "config", "user.name", "Concurrent Developer")
+        git(upstream, "config", "user.email", "developer@example.com")
+        target = upstream / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("concurrent main change\n", encoding="utf-8")
+        git(upstream, "add", ".")
+        git(upstream, "commit", "-m", "advance main concurrently")
+        git(upstream, "push", "origin", "main")
+        return task_commit
+
+    monkeypatch.setattr(operations, "commit", commit_then_advance)
+
+
+def test_worker_integrates_advanced_non_overlapping_main_before_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, store, operations, issue = make_worker_fixture(tmp_path)
+    remote = Path(config.repositories[0].clone_url)
+    advance_remote_after_task_commit(
+        tmp_path, operations, remote, "docs/concurrent.md", monkeypatch
+    )
+    verification_calls = 0
+    real_verification = worker_module.run_verification
+
+    def count_verification(*args: object, **kwargs: object) -> VerificationResult:
+        nonlocal verification_calls
+        verification_calls += 1
+        return real_verification(*args, **kwargs)
+
+    monkeypatch.setattr(worker_module, "run_verification", count_verification)
+
+    service.process_issue(config.repositories[0], issue)
+
+    task_hash = parse_task_body(issue["body"]).task_hash
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, task_hash)
+    assert checkpoint is not None
+    assert checkpoint["integration_refreshes"] == 1
+    assert checkpoint["task_commit_sha"] != checkpoint["commit_sha"]
+    assert checkpoint["integrated_base_sha"] == git(remote, "rev-parse", "main")
+    assert len(operations.commit_parents(Path(checkpoint["worktree"]), checkpoint["commit_sha"])) == 2
+    delivery = parse_delivery_block(github.prs[0]["body"])
+    assert delivery.task_commit == checkpoint["task_commit_sha"]
+    assert delivery.integrated_base == checkpoint["integrated_base_sha"]
+    assert delivery.delivery_commit == checkpoint["commit_sha"]
+    assert verification_calls == 2
+
+
+def test_worker_stops_when_advanced_main_overlaps_task_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, store, operations, issue = make_worker_fixture(tmp_path)
+    remote = Path(config.repositories[0].clone_url)
+    advance_remote_after_task_commit(
+        tmp_path, operations, remote, "src/result.txt", monkeypatch
+    )
+
+    service.process_issue(config.repositories[0], issue)
+
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    assert task["state"] == "needs-attention"
+    assert github.prs == []
+    assert any("overlap" in comment for comment in github.comments)
+
+
+def test_retry_delivery_accepts_checkpointed_integration_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, operations, issue = make_worker_fixture(tmp_path)
+    remote = Path(config.repositories[0].clone_url)
+    advance_remote_after_task_commit(
+        tmp_path, operations, remote, "docs/concurrent.md", monkeypatch
+    )
+    real_push = operations.push
+
+    def fail_push(*args: object, **kwargs: object) -> None:
+        raise GitError("connect timed out", retryable=True)
+
+    monkeypatch.setattr(operations, "push", fail_push)
+    service.process_issue(config.repositories[0], issue)
+    monkeypatch.setattr(operations, "push", real_push)
+
+    outcome = service.retry_delivery(config.repositories[0], issue)
+
+    assert outcome == "awaiting-review"
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["integration_refreshes"] == 1
+
+
 def test_transient_push_failure_persists_retryable_delivery_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

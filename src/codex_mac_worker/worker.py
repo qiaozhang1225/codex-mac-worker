@@ -443,6 +443,8 @@ class WorkerService:
         runner_result: RunnerResult,
         structured_result: dict[str, Any],
         verification_result: Any,
+        task_commit_sha: str | None = None,
+        integrated_base_sha: str | None = None,
     ) -> str:
         acceptance_results = tuple(structured_result["acceptance_results"])
         risks = tuple(structured_result["risks"])
@@ -459,6 +461,8 @@ class WorkerService:
             acceptance_results=acceptance_results,
             risks=risks,
             needs_human=needs_human,
+            task_commit=task_commit_sha,
+            integrated_base=integrated_base_sha,
         )
         acceptance_text = "\n".join(
             f"- [{'x' if item['status'] == 'met' else ' '}] {item['criterion']} "
@@ -498,6 +502,21 @@ This PR was created as a draft. The worker cannot merge it.
         diff = self.git.diff_summary(worktree, spec.context_commit)
         if not diff.changed_paths:
             raise PolicyError("Codex produced no repository changes")
+        validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
+        scan_for_secrets(worktree, diff.changed_paths)
+
+    def _validate_committed_delivery(
+        self,
+        worktree: Path,
+        baseline_head: str,
+        spec: Any,
+        project_config: Any,
+    ) -> None:
+        if not self.git.is_clean(worktree):
+            raise PolicyError("delivery worktree is not clean")
+        diff = self.git.diff_summary(worktree, baseline_head)
+        if not diff.changed_paths:
+            raise PolicyError("delivery commit has no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
         scan_for_secrets(worktree, diff.changed_paths)
 
@@ -612,6 +631,8 @@ This PR was created as a draft. The worker cannot merge it.
             runner_result=runner_result,
             structured_result=checkpoint["structured_result"],
             verification_result=verification_result,
+            task_commit_sha=str(checkpoint["task_commit_sha"]),
+            integrated_base_sha=str(checkpoint["integrated_base_sha"]),
         )
         try:
             self._require_delivery_deadline(deadline_monotonic, "push")
@@ -999,12 +1020,62 @@ This PR was created as a draft. The worker cannot merge it.
             )
             self.validate_repository_authority(repository)
 
-            commit_sha = self.git.commit(
+            task_commit_sha = self.git.commit(
                 prepared.path,
                 f"feat: complete codex task #{number}",
                 author_name="Codex Mac Worker",
                 author_email="codex-worker@users.noreply.github.com",
             )
+            task_diff = self.git.diff_summary(prepared.path, spec.context_commit)
+            self.git.refresh_branch(
+                mirror,
+                clone_url=repository.clone_url,
+                branch=spec.base_branch,
+                token=self.token_provider(),
+            )
+            integration = self.git.integrate_default(
+                prepared.path,
+                mirror,
+                spec.base_branch,
+                spec.context_commit,
+                task_diff.changed_paths,
+                refresh_count=0,
+                author_name="Codex Mac Worker",
+                author_email="codex-worker@users.noreply.github.com",
+            )
+            project_config = load_project_config(
+                prepared.path / ".codex-worker" / "project.toml"
+            )
+            self._validate_project_worker_app(project_config)
+            validate_task_policy(spec, project_config)
+            self._validate_committed_delivery(
+                prepared.path,
+                integration.integrated_base,
+                spec,
+                project_config,
+            )
+            if integration.refresh_count:
+                remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
+                if remaining <= 0:
+                    raise RunnerTimeout(
+                        "task hard timeout exceeded before integration verification"
+                    )
+                verification_result = run_verification(
+                    prepared.path,
+                    project_config,
+                    spec.verification_profile,
+                    timeout_seconds=max(1, min(remaining, 1800)),
+                    codex_path=(
+                        self.config.codex_path if self.config.codex_home else None
+                    ),
+                    codex_home=self.config.codex_home,
+                    control_callback=monitor,
+                )
+                if not verification_result.passed:
+                    raise PolicyError(
+                        "integration verification failed:\n"
+                        + self._verification_detail(verification_result)
+                    )
             self.store.save_delivery_checkpoint(
                 repo=repo,
                 issue_number=number,
@@ -1012,7 +1083,10 @@ This PR was created as a draft. The worker cannot merge it.
                 branch=branch,
                 worktree=str(prepared.path),
                 context_commit=spec.context_commit,
-                commit_sha=commit_sha,
+                commit_sha=integration.delivery_head,
+                task_commit_sha=task_commit_sha,
+                integrated_base_sha=integration.integrated_base,
+                integration_refreshes=integration.refresh_count,
                 project_config_hash=self._project_config_hash(prepared.path),
                 verification_profile=spec.verification_profile,
                 verification_commands=project_config.verification[
@@ -1094,6 +1168,9 @@ This PR was created as a draft. The worker cannot merge it.
             "worktree": worktree_value,
             "context_commit": spec.context_commit,
             "commit_sha": self.git.current_head(worktree),
+            "task_commit_sha": self.git.current_head(worktree),
+            "integrated_base_sha": spec.context_commit,
+            "integration_refreshes": 0,
             "project_config_hash": self._project_config_hash(worktree),
             "verification_profile": spec.verification_profile,
             "verification_commands": list(verification_commands),
@@ -1185,12 +1262,25 @@ This PR was created as a draft. The worker cannot merge it.
                 raise PolicyError("delivery worktree is not clean")
             if self.git.current_head(worktree) != str(checkpoint["commit_sha"]):
                 raise PolicyError("delivery HEAD changed after checkpoint")
-            if self.git.commit_parents(worktree, str(checkpoint["commit_sha"])) != (
+            delivery_parents = self.git.commit_parents(
+                worktree, str(checkpoint["commit_sha"])
+            )
+            task_commit_sha = str(checkpoint["task_commit_sha"])
+            integrated_base_sha = str(checkpoint["integrated_base_sha"])
+            refreshes = int(checkpoint["integration_refreshes"])
+            if self.git.commit_parents(worktree, task_commit_sha) != (
                 spec.context_commit,
             ):
-                raise PolicyError(
-                    "delivery commit must have the context commit as sole parent"
-                )
+                raise PolicyError("task commit must have the context commit as sole parent")
+            if refreshes == 0:
+                if (
+                    str(checkpoint["commit_sha"]) != task_commit_sha
+                    or integrated_base_sha != spec.context_commit
+                    or delivery_parents != (spec.context_commit,)
+                ):
+                    raise PolicyError("non-integrated delivery checkpoint is inconsistent")
+            elif delivery_parents != (task_commit_sha, integrated_base_sha):
+                raise PolicyError("integration delivery parents differ from checkpoint")
             project_config = load_project_config(
                 worktree / ".codex-worker" / "project.toml"
             )
@@ -1212,7 +1302,7 @@ This PR was created as a draft. The worker cannot merge it.
             ) != verification_commands:
                 raise PolicyError("delivery verification commands changed after checkpoint")
 
-            diff = self.git.diff_summary(worktree, spec.context_commit)
+            diff = self.git.diff_summary(worktree, integrated_base_sha)
             if not diff.changed_paths:
                 raise PolicyError("delivery commit has no repository changes")
             validate_changed_paths(
@@ -1312,6 +1402,9 @@ This PR was created as a draft. The worker cannot merge it.
                     worktree=str(worktree),
                     context_commit=spec.context_commit,
                     commit_sha=str(checkpoint["commit_sha"]),
+                    task_commit_sha=str(checkpoint["task_commit_sha"]),
+                    integrated_base_sha=str(checkpoint["integrated_base_sha"]),
+                    integration_refreshes=int(checkpoint["integration_refreshes"]),
                     project_config_hash=str(checkpoint["project_config_hash"]),
                     verification_profile=spec.verification_profile,
                     verification_commands=tuple(

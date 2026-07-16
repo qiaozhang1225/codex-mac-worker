@@ -10,6 +10,8 @@ import tempfile
 import time
 from typing import Callable, Iterator, Mapping
 
+from .coordination import paths_overlap
+
 
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY",
@@ -41,6 +43,14 @@ class PreparedWorktree:
 class DiffSummary:
     changed_paths: tuple[str, ...]
     diff_lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationResult:
+    task_commit: str
+    integrated_base: str
+    delivery_head: str
+    refresh_count: int
 
 
 class GitOperations:
@@ -283,6 +293,27 @@ class GitOperations:
             )
         return mirror
 
+    def refresh_branch(
+        self,
+        mirror: Path,
+        *,
+        clone_url: str,
+        branch: str,
+        token: str | None,
+    ) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or branch.startswith(("/", "-")):
+            raise GitError("invalid branch name for mirror refresh")
+        with self._authentication(token) as env:
+            self._git_network(
+                mirror,
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"+refs/heads/{branch}:refs/heads/{branch}",
+                env=env,
+                proxy_target_url=clone_url,
+            )
+
     def prepare_worktree(
         self,
         *,
@@ -416,6 +447,112 @@ class GitOperations:
         }
         self._git(worktree, "commit", "-m", message, env=env)
         return self._git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+    def changed_paths_between(
+        self,
+        repository: Path,
+        base: str,
+        head: str,
+    ) -> tuple[str, ...]:
+        raw = self._git(
+            repository,
+            "diff",
+            "--name-status",
+            "--find-renames",
+            "-z",
+            f"{base}..{head}",
+            "--",
+        ).stdout
+        fields = raw.split("\0")
+        paths: list[str] = []
+        index = 0
+        while index < len(fields) and fields[index]:
+            status = fields[index]
+            index += 1
+            if index >= len(fields):
+                raise GitError("unable to parse changed paths")
+            if status.startswith(("R", "C")):
+                if index + 1 >= len(fields):
+                    raise GitError("unable to parse renamed paths")
+                paths.extend((fields[index], fields[index + 1]))
+                index += 2
+            else:
+                paths.append(fields[index])
+                index += 1
+        return tuple(dict.fromkeys(paths))
+
+    def integrate_default(
+        self,
+        worktree: Path,
+        mirror: Path,
+        base_branch: str,
+        integrated_base: str,
+        task_paths: tuple[str, ...],
+        *,
+        refresh_count: int = 0,
+        author_name: str,
+        author_email: str,
+    ) -> IntegrationResult:
+        task_commit = self.current_head(worktree)
+        current_base = self._git(
+            mirror,
+            "rev-parse",
+            f"refs/heads/{base_branch}",
+        ).stdout.strip()
+        if current_base == integrated_base:
+            return IntegrationResult(
+                task_commit=task_commit,
+                integrated_base=integrated_base,
+                delivery_head=task_commit,
+                refresh_count=refresh_count,
+            )
+        if refresh_count >= 2:
+            raise GitError("default branch advanced more than two times")
+        ancestor = self._git(
+            mirror,
+            "merge-base",
+            "--is-ancestor",
+            integrated_base,
+            current_base,
+            check=False,
+        )
+        if ancestor.returncode != 0:
+            raise GitError("current default branch is not a descendant of the integrated base")
+        main_paths = self.changed_paths_between(mirror, integrated_base, current_base)
+        if paths_overlap(task_paths, main_paths):
+            raise GitError("default branch changes overlap task paths")
+        if not self.is_clean(worktree):
+            raise GitError("worktree must be clean before default-branch integration")
+
+        environment = {
+            "GIT_AUTHOR_NAME": author_name,
+            "GIT_AUTHOR_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": author_name,
+            "GIT_COMMITTER_EMAIL": author_email,
+        }
+        merged = self._git(
+            worktree,
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            current_base,
+            env=environment,
+            check=False,
+        )
+        if merged.returncode != 0:
+            self._git(worktree, "merge", "--abort", check=False)
+            if self.current_head(worktree) != task_commit or not self.is_clean(worktree):
+                raise GitError("default-branch integration merge cleanup failed")
+            raise GitError(
+                "default-branch integration merge failed: " + merged.stderr.strip()
+            )
+        delivery_head = self.current_head(worktree)
+        return IntegrationResult(
+            task_commit=task_commit,
+            integrated_base=current_base,
+            delivery_head=delivery_head,
+            refresh_count=refresh_count + 1,
+        )
 
     def push(
         self,

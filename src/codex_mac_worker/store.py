@@ -107,6 +107,9 @@ class EventStore:
                 worktree TEXT NOT NULL,
                 context_commit TEXT NOT NULL,
                 commit_sha TEXT NOT NULL,
+                task_commit_sha TEXT NOT NULL,
+                integrated_base_sha TEXT NOT NULL,
+                integration_refreshes INTEGER NOT NULL DEFAULT 0,
                 project_config_hash TEXT NOT NULL,
                 verification_profile TEXT NOT NULL,
                 verification_commands_json TEXT NOT NULL,
@@ -135,6 +138,29 @@ class EventStore:
         ):
             if name not in columns:
                 self.connection.execute(f"ALTER TABLE outbox ADD COLUMN {name} {definition}")
+        checkpoint_columns = {
+            str(row["name"])
+            for row in self.connection.execute(
+                "PRAGMA table_info(delivery_checkpoints)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("task_commit_sha", "TEXT"),
+            ("integrated_base_sha", "TEXT"),
+            ("integration_refreshes", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in checkpoint_columns:
+                self.connection.execute(
+                    f"ALTER TABLE delivery_checkpoints ADD COLUMN {name} {definition}"
+                )
+        self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET task_commit_sha=COALESCE(task_commit_sha, commit_sha),
+                integrated_base_sha=COALESCE(integrated_base_sha, context_commit),
+                integration_refreshes=COALESCE(integration_refreshes, 0)
+            """
+        )
         self.connection.commit()
 
     def upsert_task(
@@ -208,18 +234,23 @@ class EventStore:
         phase: str = "delivery-ready",
         worker_state_key: str | None = None,
         worker_state_value: Any = None,
+        task_commit_sha: str | None = None,
+        integrated_base_sha: str | None = None,
+        integration_refreshes: int = 0,
     ) -> None:
         now = utc_now()
+        task_commit_sha = task_commit_sha or commit_sha
+        integrated_base_sha = integrated_base_sha or context_commit
         with self.connection:
             existing = self.connection.execute(
                 """
-                SELECT branch, worktree, context_commit, commit_sha
+                SELECT branch, worktree, context_commit, commit_sha, task_commit_sha
                 FROM delivery_checkpoints
                 WHERE repo=? AND issue_number=? AND task_hash=?
                 """,
                 (repo, issue_number, task_hash),
             ).fetchone()
-            identity = (branch, worktree, context_commit, commit_sha)
+            identity = (branch, worktree, context_commit, commit_sha, task_commit_sha)
             if existing is not None and tuple(existing) != identity:
                 raise ValueError("delivery checkpoint identity changed")
 
@@ -227,13 +258,14 @@ class EventStore:
                 """
                 INSERT INTO delivery_checkpoints (
                     repo, issue_number, task_hash, branch, worktree,
-                    context_commit, commit_sha, project_config_hash,
+                    context_commit, commit_sha, task_commit_sha,
+                    integrated_base_sha, integration_refreshes, project_config_hash,
                     verification_profile, verification_commands_json,
                     verification_result_json, structured_result_json,
                     model, cli_version, session_id, phase, retryable,
                     last_error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                          ?, 1, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          1, NULL, ?, ?)
                 ON CONFLICT(repo, issue_number, task_hash) DO NOTHING
                 """,
                 (
@@ -244,6 +276,9 @@ class EventStore:
                     worktree,
                     context_commit,
                     commit_sha,
+                    task_commit_sha,
+                    integrated_base_sha,
+                    integration_refreshes,
                     project_config_hash,
                     verification_profile,
                     json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),

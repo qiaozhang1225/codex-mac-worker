@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 from codex_mac_worker.store import EventStore
 
@@ -14,6 +15,9 @@ def checkpoint_payload(tmp_path: Path) -> dict[str, object]:
         "worktree": str(tmp_path / "worktree"),
         "context_commit": "1" * 40,
         "commit_sha": "2" * 40,
+        "task_commit_sha": "2" * 40,
+        "integrated_base_sha": "1" * 40,
+        "integration_refreshes": 0,
         "project_config_hash": "3" * 64,
         "verification_profile": "fast",
         "verification_commands": ("python -m pytest -q",),
@@ -141,6 +145,9 @@ def test_delivery_checkpoint_round_trips_and_updates_state(tmp_path: Path) -> No
     assert checkpoint["phase"] == "push"
     assert checkpoint["retryable"] is True
     assert checkpoint["last_error"] == "GitError: timed out"
+    assert checkpoint["task_commit_sha"] == "2" * 40
+    assert checkpoint["integrated_base_sha"] == "1" * 40
+    assert checkpoint["integration_refreshes"] == 0
 
 
 def test_delivery_checkpoint_survives_reopen(tmp_path: Path) -> None:
@@ -188,6 +195,73 @@ def test_delivery_checkpoint_evidence_is_immutable(tmp_path: Path) -> None:
     assert checkpoint is not None
     assert checkpoint["model"] == "gpt-test"
     assert checkpoint["verification_result"]["passed"] is True
+
+
+def test_delivery_checkpoint_rejects_task_commit_identity_change(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    payload = checkpoint_payload(tmp_path)
+    store.save_delivery_checkpoint(**payload)
+    changed = dict(payload)
+    changed["task_commit_sha"] = "4" * 40
+
+    try:
+        store.save_delivery_checkpoint(**changed)
+    except ValueError as exc:
+        assert str(exc) == "delivery checkpoint identity changed"
+    else:
+        raise AssertionError("expected delivery checkpoint identity rejection")
+
+
+def test_old_database_migrates_delivery_integration_columns(tmp_path: Path) -> None:
+    path = tmp_path / "worker.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE delivery_checkpoints (
+            repo TEXT NOT NULL,
+            issue_number INTEGER NOT NULL,
+            task_hash TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            worktree TEXT NOT NULL,
+            context_commit TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            project_config_hash TEXT NOT NULL,
+            verification_profile TEXT NOT NULL,
+            verification_commands_json TEXT NOT NULL,
+            verification_result_json TEXT NOT NULL,
+            structured_result_json TEXT NOT NULL,
+            model TEXT,
+            cli_version TEXT,
+            session_id TEXT,
+            phase TEXT NOT NULL DEFAULT 'checkpointed',
+            retryable INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (repo, issue_number, task_hash)
+        );
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO delivery_checkpoints VALUES (
+            'owner/repo', 12, ?, 'codex/12-task', '/tmp/worktree', ?, ?, ?,
+            'fast', '[]', '{"passed": true}', '{"status": "completed"}',
+            NULL, NULL, NULL, 'complete', 0, NULL, 'now', 'now'
+        )
+        """,
+        ("a" * 64, "1" * 40, "2" * 40, "3" * 64),
+    )
+    connection.commit()
+    connection.close()
+
+    store = EventStore(path)
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, "a" * 64)
+
+    assert checkpoint is not None
+    assert checkpoint["task_commit_sha"] == "2" * 40
+    assert checkpoint["integrated_base_sha"] == "1" * 40
+    assert checkpoint["integration_refreshes"] == 0
 
 
 def test_legacy_checkpoint_and_reconstruction_marker_are_saved_together(

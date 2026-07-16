@@ -137,3 +137,50 @@ def test_delivery_metadata_round_trip_binds_latest_commit() -> None:
     )
 
     assert parse_delivery_block(render_delivery_block(metadata)) == metadata
+
+
+def test_delivery_metadata_round_trip_records_integration_commits() -> None:
+    metadata = DeliveryMetadata(
+        issue_number=12,
+        task_hash="b" * 64,
+        context_commit="a" * 40,
+        delivery_commit="d" * 40,
+        verification_profile="fast",
+        verification_passed=True,
+        model="gpt-5",
+        cli_version="codex 1.2.3",
+        acceptance_results=(),
+        risks=(),
+        needs_human=(),
+        integrated_base="c" * 40,
+        task_commit="b" * 40,
+    )
+
+    assert parse_delivery_block(render_delivery_block(metadata)) == metadata
+
+
+def test_old_delivery_metadata_defaults_integration_commits() -> None:
+    metadata = DeliveryMetadata(
+        issue_number=12,
+        task_hash="b" * 64,
+        context_commit="a" * 40,
+        delivery_commit="c" * 40,
+        verification_profile="fast",
+        verification_passed=True,
+        model=None,
+        cli_version=None,
+        acceptance_results=(),
+        risks=(),
+        needs_human=(),
+    )
+    legacy = render_delivery_block(metadata)
+    legacy = "\n".join(
+        line
+        for line in legacy.splitlines()
+        if not line.startswith(("integrated_base:", "task_commit:"))
+    )
+
+    parsed = parse_delivery_block(legacy)
+
+    assert parsed.integrated_base == "a" * 40
+    assert parsed.task_commit == "c" * 40
