@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -376,6 +377,53 @@ def test_push_uses_bounded_network_operation(
             "https://example.test/repo.git",
         )
     ]
+
+
+def test_git_reports_clean_state_and_commit_parents(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "-b", "main")
+    git(source, "config", "user.name", "Test")
+    git(source, "config", "user.email", "test@example.com")
+    (source / "one.txt").write_text("one\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "one")
+    parent = git(source, "rev-parse", "HEAD")
+    (source / "two.txt").write_text("two\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "two")
+    head = git(source, "rev-parse", "HEAD")
+    operations = GitOperations(
+        cache_root=tmp_path / "cache",
+        worktree_root=tmp_path / "worktrees",
+    )
+
+    assert operations.is_clean(source) is True
+    assert operations.commit_parents(source, head) == (parent,)
+
+    (source / "two.txt").write_text("changed\n", encoding="utf-8")
+    assert operations.is_clean(source) is False
+
+
+def test_push_rejects_expired_delivery_deadline(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init", "-b", "main")
+    operations = GitOperations(
+        cache_root=tmp_path / "cache",
+        worktree_root=tmp_path / "worktrees",
+    )
+
+    with pytest.raises(GitError, match="deadline") as error:
+        operations.push(
+            source,
+            branch="codex/12-task",
+            clone_url="https://example.test/repo.git",
+            token=None,
+            deadline_monotonic=time.monotonic() - 1,
+        )
+
+    assert error.value.retryable is True
 
 
 def test_prepare_worktree_uses_exact_context_commit(tmp_path: Path) -> None:

@@ -67,6 +67,7 @@ class GitOperations:
         *args: str,
         env: Mapping[str, str | None] | None = None,
         check: bool = True,
+        timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         if env:
@@ -75,14 +76,25 @@ class GitOperations:
                     merged_env.pop(key, None)
                 else:
                     merged_env[key] = value
-        result = subprocess.run(
-            [self.git_path, *args],
-            cwd=cwd,
-            env=merged_env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            result = subprocess.run(
+                [self.git_path, *args],
+                cwd=cwd,
+                env=merged_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            result = subprocess.CompletedProcess(
+                [self.git_path, *args],
+                124,
+                stdout,
+                (stderr + "\ngit delivery deadline expired").strip(),
+            )
         if check and result.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
         return result
@@ -173,6 +185,7 @@ class GitOperations:
         *args: str,
         env: Mapping[str, str | None] | None = None,
         proxy_target_url: str | None = None,
+        deadline_monotonic: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         attempts = len(self.network_retry_delays) + 1
         for attempt in range(attempts):
@@ -184,17 +197,37 @@ class GitOperations:
                         target_url=proxy_target_url,
                     )
                 )
-            result = self._git(cwd, *args, env=attempt_env, check=False)
+            call_options: dict[str, float] = {}
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise GitError("git delivery deadline expired", retryable=True)
+                call_options["timeout_seconds"] = remaining
+            result = self._git(
+                cwd,
+                *args,
+                env=attempt_env,
+                check=False,
+                **call_options,
+            )
             if result.returncode == 0:
                 return result
-            retryable = self._is_retryable_network_failure(result.stderr)
+            retryable = result.returncode == 124 or self._is_retryable_network_failure(
+                result.stderr
+            )
             if not retryable or attempt == attempts - 1:
                 attempt_detail = f" after {attempt + 1} attempts" if retryable else ""
                 raise GitError(
                     f"git {' '.join(args)} failed{attempt_detail}: {result.stderr.strip()}",
                     retryable=retryable,
                 )
-            self._sleep(self.network_retry_delays[attempt])
+            delay = self.network_retry_delays[attempt]
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() + delay >= deadline_monotonic
+            ):
+                raise GitError("git delivery deadline expired", retryable=True)
+            self._sleep(delay)
         raise AssertionError("unreachable")
 
     @contextmanager
@@ -319,6 +352,27 @@ class GitOperations:
     def current_branch(self, worktree: Path) -> str:
         return self._git(worktree, "branch", "--show-current").stdout.strip()
 
+    def is_clean(self, worktree: Path) -> bool:
+        return not self._git(
+            worktree,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ).stdout
+
+    def commit_parents(self, worktree: Path, commit_sha: str) -> tuple[str, ...]:
+        fields = self._git(
+            worktree,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            commit_sha,
+        ).stdout.strip().split()
+        if not fields or fields[0] != commit_sha:
+            raise GitError("delivery commit cannot be resolved")
+        return tuple(fields[1:])
+
     def diff_stat(self, worktree: Path, baseline_head: str) -> str:
         return self._git(worktree, "diff", "--stat", f"{baseline_head}..HEAD", "--").stdout.strip()
 
@@ -370,6 +424,7 @@ class GitOperations:
         branch: str,
         clone_url: str,
         token: str | None,
+        deadline_monotonic: float | None = None,
     ) -> None:
         remote_name = "codex-worker-delivery"
         existing = self._git(worktree, "remote", "get-url", remote_name, check=False)
@@ -378,6 +433,9 @@ class GitOperations:
         else:
             self._git(worktree, "remote", "add", remote_name, clone_url)
         with self._authentication(token) as env:
+            deadline_options: dict[str, float] = {}
+            if deadline_monotonic is not None:
+                deadline_options["deadline_monotonic"] = deadline_monotonic
             self._git_network(
                 worktree,
                 "push",
@@ -385,4 +443,5 @@ class GitOperations:
                 f"HEAD:refs/heads/{branch}",
                 env=env,
                 proxy_target_url=clone_url,
+                **deadline_options,
             )
