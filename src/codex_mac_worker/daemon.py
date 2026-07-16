@@ -69,6 +69,12 @@ class IssueProcessor(Protocol):
         requirements: tuple[str, ...],
     ) -> None: ...
 
+    def retry_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> str: ...
+
 
 class WorkerDaemon:
     """Single-worker polling loop; never claims a second task while one is active."""
@@ -206,81 +212,138 @@ class WorkerDaemon:
             recovered = True
         return recovered
 
+    def _next_control_command(
+        self,
+        repo: str,
+        issue_number: int,
+    ) -> dict[str, Any] | None:
+        for command in self.store.pending_commands(repo, issue_number):
+            action = str(command["action"])
+            author = str(command["author"])
+            if action not in {"resume", "retry", "cancel"}:
+                continue
+            permission = self.github.collaborator_permission(repo, author)  # type: ignore[attr-defined]
+            if author not in self.config.authorized_users or permission not in {
+                "admin",
+                "maintain",
+                "write",
+            }:
+                self.store.mark_command_executed(
+                    str(command["command_id"]),
+                    "authorization-revoked",
+                )
+                continue
+            return command
+
+        for comment in reversed(self.github.list_comments(repo, issue_number)):  # type: ignore[attr-defined]
+            body = str(comment.get("body", ""))
+            if "<!-- codex-command:v1 -->" not in body:
+                continue
+            try:
+                parsed = parse_command_comment(body)
+            except ProtocolError:
+                continue
+            if parsed.issue_number != issue_number or parsed.action not in {
+                "resume",
+                "retry",
+                "cancel",
+            }:
+                continue
+            author = str(comment.get("user", {}).get("login", ""))
+            permission = self.github.collaborator_permission(repo, author)  # type: ignore[attr-defined]
+            if author not in self.config.authorized_users or permission not in {
+                "admin",
+                "maintain",
+                "write",
+            }:
+                continue
+            self.store.record_command(
+                parsed.command_id,
+                repo,
+                issue_number,
+                parsed.action,
+                author,
+            )
+            command = self.store.get_command(parsed.command_id)
+            if command is None or command.get("executed_at") is not None:
+                continue
+            if (
+                command["repo"] != repo
+                or int(command["issue_number"]) != issue_number
+                or command["action"] != parsed.action
+                or command["author"] != author
+            ):
+                continue
+            return command
+        return None
+
     def process_control_commands(self) -> bool:
-        handled = False
         tasks = self.store.tasks_in_states(("paused", "needs-attention"))
         for task in tasks:
             repo = task["repo"]
             issue_number = int(task["issue_number"])
             issue = self.github.get_issue(repo, issue_number)  # type: ignore[attr-defined]
-            for comment in reversed(self.github.list_comments(repo, issue_number)):  # type: ignore[attr-defined]
-                body = str(comment.get("body", ""))
-                if "<!-- codex-command:v1 -->" not in body:
-                    continue
-                try:
-                    command = parse_command_comment(body)
-                except ProtocolError:
-                    continue
-                if command.issue_number != issue_number or command.action not in {"resume", "retry", "cancel"}:
-                    continue
-                author = str(comment.get("user", {}).get("login", ""))
-                permission = self.github.collaborator_permission(repo, author)  # type: ignore[attr-defined]
-                if author not in self.config.authorized_users or permission not in {"admin", "maintain", "write"}:
-                    continue
-                if not self.store.record_command(command.command_id, repo, issue_number, command.action, author):
-                    continue
-                if command.action == "cancel":
-                    self.store.upsert_task(
-                        repo=repo,
-                        issue_number=issue_number,
-                        task_hash=task["task_hash"],
-                        state="cancelled",
-                        branch=task["branch"],
-                        worktree=task["worktree"],
-                    )
-                    self._set_remote_state(repo, issue, "cancelled")
-                else:
-                    if command.action == "retry":
-                        retry_key = f"retryable:{repo}#{issue_number}:{task['task_hash']}"
-                        if self.store.get_worker_state(retry_key, False) is not True:
-                            self.store.mark_command_executed(command.command_id, "not-retryable")
-                            handled = True
-                            break
-                    resume_session_id = None
-                    if command.action == "resume":
-                        resume_session_id = task.get("session_id")
-                        resume_key = f"resume:{repo}#{issue_number}:{task['task_hash']}"
-                        if not resume_session_id or self.store.get_worker_state(resume_key, 0) >= 1:
-                            self.store.upsert_task(
-                                repo=repo,
-                                issue_number=issue_number,
-                                task_hash=task["task_hash"],
-                                state="needs-attention",
-                                branch=task["branch"],
-                                worktree=task["worktree"],
-                            )
-                            self._set_remote_state(repo, issue, "needs-attention")
-                            self.store.mark_command_executed(command.command_id, "resume-limit")
-                            handled = True
-                            break
-                        self.store.set_worker_state(resume_key, 1)
-                    self.store.upsert_task(
-                        repo=repo,
-                        issue_number=issue_number,
-                        task_hash=task["task_hash"],
-                        state="retrying",
-                        branch=task["branch"],
-                        worktree=task["worktree"],
-                    )
-                    self.service.process_issue(
-                        self._repository(repo),
-                        issue,
-                        resume_session_id=resume_session_id,
-                    )
-                self.store.mark_command_executed(command.command_id, command.action)
-                handled = True
-                break
-        return handled
+            command = self._next_control_command(repo, issue_number)
+            if command is None:
+                continue
+            command_id = str(command["command_id"])
+            action = str(command["action"])
+            if action == "cancel":
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=issue_number,
+                    task_hash=task["task_hash"],
+                    state="cancelled",
+                    branch=task["branch"],
+                    worktree=task["worktree"],
+                )
+                self._set_remote_state(repo, issue, "cancelled")
+                self.store.mark_command_executed(command_id, "cancel")
+                return True
+            if action == "retry":
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=issue_number,
+                    task_hash=task["task_hash"],
+                    state="retrying",
+                    branch=task["branch"],
+                    worktree=task["worktree"],
+                )
+                result = self.service.retry_delivery(self._repository(repo), issue)
+                self.store.mark_command_executed(command_id, result)
+                return True
+
+            resume_session_id = task.get("session_id")
+            resume_key = f"resume:{repo}#{issue_number}:{task['task_hash']}"
+            if not resume_session_id or self.store.get_worker_state(resume_key, 0) >= 1:
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=issue_number,
+                    task_hash=task["task_hash"],
+                    state="needs-attention",
+                    branch=task["branch"],
+                    worktree=task["worktree"],
+                )
+                self._set_remote_state(repo, issue, "needs-attention")
+                self.store.mark_command_executed(command_id, "resume-limit")
+                return True
+            self.store.set_worker_state(resume_key, 1)
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=issue_number,
+                task_hash=task["task_hash"],
+                state="retrying",
+                branch=task["branch"],
+                worktree=task["worktree"],
+            )
+            self.service.process_issue(
+                self._repository(repo),
+                issue,
+                resume_session_id=str(resume_session_id),
+            )
+            self.store.mark_command_executed(command_id, "resume")
+            return True
+        return False
 
     def process_review_tasks(self) -> bool:
         """Reconcile merged PRs and authorized revisions without ever merging a PR."""

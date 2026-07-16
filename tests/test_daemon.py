@@ -50,6 +50,7 @@ class FakeService:
     def __init__(self) -> None:
         self.processed: list[int] = []
         self.resumed: list[str | None] = []
+        self.delivery_retried: list[int] = []
         self.validated: list[str] = []
         self.stopped = False
 
@@ -76,6 +77,14 @@ class FakeService:
         requirements: tuple[str, ...],
     ) -> None:
         self.processed.append(issue["number"])
+
+    def retry_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict,
+    ) -> str:
+        self.delivery_retried.append(issue["number"])
+        return "awaiting-review"
 
 
 def config(tmp_path: Path) -> WorkerConfig:
@@ -211,6 +220,132 @@ def test_daemon_executes_authorized_resume_for_paused_task(tmp_path: Path) -> No
     assert daemon.process_control_commands() is True
     assert service.processed == [9]
     assert service.resumed == ["session-paused"]
+
+
+def test_daemon_routes_retry_to_delivery_without_process_issue(tmp_path: Path) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+    service = FakeService()
+
+    class RetryGitHub(FakeGitHub):
+        def list_comments(self, repo: str, issue_number: int) -> list[dict]:
+            return [
+                {
+                    "body": render_command_comment(
+                        action="retry",
+                        issue_number=9,
+                        requirements=(),
+                        command_id="cmd-retry",
+                    ),
+                    "user": {"login": "owner"},
+                }
+            ]
+
+    daemon = WorkerDaemon(settings, RetryGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+    assert service.delivery_retried == [9]
+    assert service.processed == []
+    command = store.get_command("cmd-retry")
+    assert command is not None and command["result"] == "awaiting-review"
+
+
+def test_pending_retry_command_resumes_after_crash_without_comment(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+    store.record_command("cmd-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+    assert service.delivery_retried == [9]
+    command = store.get_command("cmd-retry")
+    assert command is not None and command["executed_at"] is not None
+
+
+def test_executed_historical_retry_command_is_never_replayed(tmp_path: Path) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+    command_id = "503e56c5-64a7-474b-8364-299c6f929272"
+    store.record_command(command_id, "owner/repo", 9, "retry", "owner")
+    store.mark_command_executed(command_id, "not-retryable")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is False
+    assert service.delivery_retried == []
+
+
+def test_retry_command_remains_pending_when_service_crashes(tmp_path: Path) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+
+    class RetryGitHub(FakeGitHub):
+        def list_comments(self, repo: str, issue_number: int) -> list[dict]:
+            return [
+                {
+                    "body": render_command_comment(
+                        action="retry",
+                        issue_number=9,
+                        requirements=(),
+                        command_id="cmd-crash",
+                    ),
+                    "user": {"login": "owner"},
+                }
+            ]
+
+    class CrashService(FakeService):
+        def retry_delivery(
+            self,
+            repository: RepositoryConfig,
+            issue: dict,
+        ) -> str:
+            raise SystemExit("simulated crash")
+
+    with pytest.raises(SystemExit, match="simulated crash"):
+        WorkerDaemon(settings, RetryGitHub([]), store, CrashService()).process_control_commands()
+
+    command = store.get_command("cmd-crash")
+    assert command is not None and command["executed_at"] is None
+    recovery_service = FakeService()
+    recovery_daemon = WorkerDaemon(settings, FakeGitHub([]), store, recovery_service)
+    assert recovery_daemon.recover_active_tasks() is True
+    assert recovery_daemon.process_control_commands() is True
+    assert recovery_service.delivery_retried == [9]
 
 
 def test_daemon_executes_authorized_revision_on_existing_pr(tmp_path: Path) -> None:
