@@ -190,6 +190,86 @@ def test_transient_network_retries_are_bounded(
     assert delays == [0.1, 0.2]
 
 
+def test_proxy_network_retries_alternate_proxy_direct_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations = GitOperations(
+        cache_root=tmp_path / "cache",
+        worktree_root=tmp_path / "worktrees",
+        proxy_url="http://127.0.0.1:7897",
+        network_retry_delays=(0.1, 0.2),
+        sleep=lambda _: None,
+    )
+    environments: list[dict[str, str | None] | None] = []
+
+    def fake_git(
+        cwd: Path,
+        *args: str,
+        env: dict[str, str | None] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        environments.append(env)
+        if len(environments) < 3:
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: Failed to connect to github.com"
+            )
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+    monkeypatch.setattr(operations, "_git", fake_git)
+    operations._git_network(tmp_path, "fetch")
+
+    assert environments[0] is not None
+    assert environments[0]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+    assert environments[1] is not None
+    assert environments[1]["HTTPS_PROXY"] is None
+    assert environments[2] is not None
+    assert environments[2]["HTTPS_PROXY"] == "http://127.0.0.1:7897"
+
+
+def test_direct_route_removes_inherited_proxy_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations = GitOperations(cache_root=tmp_path, worktree_root=tmp_path)
+    monkeypatch.setenv("HTTPS_PROXY", "http://inherited.invalid:1")
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert "HTTPS_PROXY" not in environment
+        return subprocess.CompletedProcess(["git"], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    operations._git(tmp_path, "status", env={"HTTPS_PROXY": None})
+
+
+def test_permanent_failure_does_not_fall_back_from_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations = GitOperations(
+        cache_root=tmp_path,
+        worktree_root=tmp_path,
+        proxy_url="http://127.0.0.1:7897",
+    )
+    environments: list[dict[str, str | None] | None] = []
+
+    def fake_git(
+        cwd: Path,
+        *args: str,
+        env: dict[str, str | None] | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        environments.append(env)
+        return subprocess.CompletedProcess(
+            ["git", *args], 128, "", "fatal: Authentication failed"
+        )
+
+    monkeypatch.setattr(operations, "_git", fake_git)
+    with pytest.raises(GitError, match="Authentication failed"):
+        operations._git_network(tmp_path, "fetch")
+
+    assert len(environments) == 1
+
+
 def test_clone_uses_bounded_network_operation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

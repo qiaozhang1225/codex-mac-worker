@@ -11,6 +11,16 @@ import time
 from typing import Callable, Iterator, Mapping
 
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
 class GitError(RuntimeError):
     """Raised when repository preparation or integrity validation fails."""
 
@@ -39,12 +49,14 @@ class GitOperations:
         cache_root: Path,
         worktree_root: Path,
         git_path: str = "git",
+        proxy_url: str | None = None,
         network_retry_delays: tuple[float, ...] = (1.0, 3.0),
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.cache_root = cache_root
         self.worktree_root = worktree_root
         self.git_path = git_path
+        self.proxy_url = proxy_url
         self.network_retry_delays = network_retry_delays
         self._sleep = sleep
 
@@ -52,12 +64,16 @@ class GitOperations:
         self,
         cwd: Path,
         *args: str,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         if env:
-            merged_env.update(env)
+            for key, value in env.items():
+                if value is None:
+                    merged_env.pop(key, None)
+                else:
+                    merged_env[key] = value
         result = subprocess.run(
             [self.git_path, *args],
             cwd=cwd,
@@ -124,15 +140,24 @@ class GitOperations:
             normalized,
         ) is not None
 
+    def _proxy_environment(self, *, use_proxy: bool) -> dict[str, str | None]:
+        value = self.proxy_url if use_proxy else None
+        return {key: value for key in _PROXY_ENV_KEYS}
+
     def _git_network(
         self,
         cwd: Path,
         *args: str,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         attempts = len(self.network_retry_delays) + 1
         for attempt in range(attempts):
-            result = self._git(cwd, *args, env=env, check=False)
+            attempt_env: dict[str, str | None] = dict(env or {})
+            if self.proxy_url is not None:
+                attempt_env.update(
+                    self._proxy_environment(use_proxy=attempt % 2 == 0)
+                )
+            result = self._git(cwd, *args, env=attempt_env, check=False)
             if result.returncode == 0:
                 return result
             retryable = self._is_retryable_network_failure(result.stderr)
