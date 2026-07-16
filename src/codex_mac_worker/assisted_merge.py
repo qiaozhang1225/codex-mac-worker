@@ -85,7 +85,7 @@ _UNSAFE_RISK_RE = re.compile(
     r"\b(high[-\s]?risk|credentials?|secrets?|passwords?|"
     r"deploy(?:ment|ed|ing)?|migrations?|irreversible|"
     r"prod(?:uction)?[\s_-]+(?:data|databases?|environments?))\b|"
-    r"高风险|凭据|密钥|部署|迁移|不可逆|生产(?:数据|数据库|环境)",
+    r"高风险|凭据|密钥|密码|部署|迁移|不可逆|生产[\s_-]*(?:数据|数据库|环境)",
     re.IGNORECASE,
 )
 

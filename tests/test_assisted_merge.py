@@ -406,6 +406,9 @@ def test_review_allows_benign_production_build_risk(risk: str) -> None:
         "需要修改生产数据",
         "需要迁移生产数据库",
         "需要部署到生产环境",
+        "密码可能泄露",
+        "生产 数据可能被修改",
+        "生产-数据库可能被修改",
     ],
 )
 def test_review_blocks_explicit_production_operation_risk(risk: str) -> None:
