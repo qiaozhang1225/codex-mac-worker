@@ -8,6 +8,12 @@ from typing import Any
 from .store import EventStore
 
 
+class DurableGitHubPolicyError(ValueError):
+    """Permanent local gate failure that must never be replayed from outbox."""
+
+    retryable = False
+
+
 class DurableGitHub:
     """Write-through GitHub proxy backed by a durable SQLite outbox."""
 
@@ -121,7 +127,9 @@ class DurableGitHub:
             pull = self.remote.get_pull_request(payload["repo"], payload["pr_number"])
             observed_head = str(pull.get("head", {}).get("sha", "")).lower()
             if observed_head != payload["expected_head"]:
-                raise ValueError("pull request head differs from expected head")
+                raise DurableGitHubPolicyError(
+                    "pull request head differs from expected head"
+                )
             if pull.get("draft") is False:
                 return pull
             return self.remote.mark_pull_request_ready(
@@ -131,7 +139,9 @@ class DurableGitHub:
             pull = self.remote.get_pull_request(payload["repo"], payload["pr_number"])
             observed_head = str(pull.get("head", {}).get("sha", "")).lower()
             if observed_head != payload["expected_head"]:
-                raise ValueError("pull request head differs from expected head")
+                raise DurableGitHubPolicyError(
+                    "pull request head differs from expected head"
+                )
             if pull.get("merged_at"):
                 return {
                     "merged": True,

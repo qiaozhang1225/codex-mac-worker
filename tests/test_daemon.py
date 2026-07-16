@@ -545,6 +545,36 @@ def test_daemon_auto_merges_existing_awaiting_review_task(tmp_path: Path) -> Non
     }
 
 
+def test_daemon_automatic_mode_reconciles_already_merged_pr_through_service(
+    tmp_path: Path,
+) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="merging",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+
+    class MergedGitHub(FakeGitHub):
+        def get_pull_request(self, repo: str, pr_number: int) -> dict:
+            return {"number": pr_number, "merged_at": "2026-07-17T00:00:00Z"}
+
+    github = MergedGitHub([])
+    service = FakeService()
+    service.auto_merge_result = "needs-attention"
+    daemon = WorkerDaemon(settings, github, store, service)
+
+    assert daemon.process_review_tasks() is True
+    assert service.auto_merge_calls == [9]
+    assert store.get_task("owner/repo", 9)["state"] == "needs-attention"
+    assert github.issue_updates == []
+
+
 def test_daemon_manual_mode_leaves_delivery_for_human_review(tmp_path: Path) -> None:
     settings = config(tmp_path)
     store = EventStore(settings.database_path)

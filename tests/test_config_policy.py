@@ -130,6 +130,22 @@ def test_task_policy_rejects_high_risk_and_unknown_profile(tmp_path: Path) -> No
         validate_task_policy(spec, config)
 
 
+def test_task_policy_rejects_high_even_when_repository_lists_it(tmp_path: Path) -> None:
+    config_path = tmp_path / "project.toml"
+    write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            'allowed_risk_levels = ["low", "medium"]',
+            'allowed_risk_levels = ["low", "medium", "high"]',
+        ),
+        encoding="utf-8",
+    )
+    config = load_project_config(config_path)
+
+    with pytest.raises(PolicyError, match="low or medium"):
+        validate_task_policy(parse_task_body(task_body(risk="high")), config)
+
+
 def test_changed_path_policy_rejects_protected_and_out_of_scope_paths(tmp_path: Path) -> None:
     config_path = tmp_path / "project.toml"
     write_config(config_path)

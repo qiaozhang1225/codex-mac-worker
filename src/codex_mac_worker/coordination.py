@@ -53,12 +53,18 @@ def active_task_conflicts(
     github: Any,
     repo: str,
     allowed_paths: Iterable[str],
+    *,
+    exclude_issue_number: int | None = None,
+    ignore_queued: bool = False,
 ) -> tuple[str, ...]:
     proposed = tuple(allowed_paths)
     # Validate the proposed scope even when the repository has no active tasks.
     paths_overlap(proposed, ())
     conflicts: list[str] = []
     for issue in github.list_issues(repo, state="open"):
+        issue_number = issue.get("number")
+        if exclude_issue_number is not None and issue_number == exclude_issue_number:
+            continue
         labels = _label_names(issue)
         active_labels = {
             label
@@ -66,6 +72,8 @@ def active_task_conflicts(
             if label.startswith("codex:") and label not in TERMINAL_TASK_LABELS
         }
         if not active_labels:
+            continue
+        if ignore_queued and active_labels == {"codex:queued"}:
             continue
         url = str(issue.get("html_url", "")) or f"{repo}#{issue.get('number', '?')}"
         try:

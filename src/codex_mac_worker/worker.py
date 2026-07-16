@@ -19,6 +19,7 @@ from .config import (
     load_project_config,
     parse_project_config,
 )
+from .coordination import active_task_conflicts
 from .gitops import GitOperations
 from .policy import PolicyError, validate_changed_paths, validate_task_policy
 from .prompting import build_execution_prompt, build_revision_prompt, result_schema
@@ -914,6 +915,18 @@ This PR was created as a draft. {merge_note}
             self._validate_issue_author(repo, issue)
             spec = parse_task_body(str(issue.get("body", "")))
             self.validate_repository_authority(repository)
+            conflicts = active_task_conflicts(
+                self.github,
+                repo,
+                spec.allowed_paths,
+                exclude_issue_number=number,
+                ignore_queued=True,
+            )
+            if conflicts:
+                raise PolicyError(
+                    "allowed_paths conflict with active Worker task: "
+                    + ", ".join(conflicts)
+                )
             task_hash = spec.task_hash
             branch = f"codex/{number}-{_slug(str(issue.get('title', 'task')))}"
             self.store.upsert_task(

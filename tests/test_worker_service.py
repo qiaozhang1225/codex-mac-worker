@@ -91,6 +91,7 @@ class FakeRunner:
 class FakeGitHub:
     def __init__(self, issue: dict) -> None:
         self.issue = issue
+        self.issues = [issue]
         self.current_project_config = project_config_text()
         self.labels: list[list[str]] = []
         self.comments: list[str] = []
@@ -99,6 +100,11 @@ class FakeGitHub:
 
     def get_issue(self, repo: str, issue_number: int) -> dict:
         return self.issue
+
+    def list_issues(
+        self, repo: str, *, state: str = "open", labels: str | None = None
+    ) -> list[dict]:
+        return self.issues
 
     def set_labels(self, repo: str, issue_number: int, labels: list[str]) -> dict:
         self.labels.append(labels)
@@ -263,6 +269,37 @@ def test_worker_processes_bounded_task_into_draft_pr(
     assert checkpoint is not None
     assert checkpoint["phase"] == "complete"
     assert checkpoint["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    ("label", "retained_body"),
+    [
+        ("codex:awaiting-review", "valid"),
+        ("codex:merging", "valid"),
+        ("codex:needs-attention", "valid"),
+        ("codex:needs-attention", "malformed"),
+    ],
+)
+def test_worker_rejects_task_overlapping_retained_issue_paths(
+    tmp_path: Path, label: str, retained_body: str
+) -> None:
+    service, config, github, store, _, issue = make_worker_fixture(tmp_path)
+    github.issues.append(
+        {
+            "number": 11,
+            "html_url": "https://github.test/owner/repo/issues/11",
+            "body": issue["body"] if retained_body == "valid" else "malformed task",
+            "labels": [{"name": label}],
+        }
+    )
+
+    service.process_issue(config.repositories[0], issue)
+
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    assert task["state"] == "needs-attention"
+    assert github.prs == []
+    assert any("active Worker task" in comment for comment in github.comments)
 
 
 def advance_remote_after_task_commit(

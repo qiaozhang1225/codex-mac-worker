@@ -276,3 +276,11 @@ def test_durable_merge_rejects_changed_head_before_write(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="head"):
         github.merge_pull_request("owner/repo", 44, expected_head="c" * 40)
+
+    assert store.pending_outbox() == []
+    row = store.connection.execute(
+        "SELECT attempts, failed_at FROM outbox WHERE delivered_at IS NULL"
+    ).fetchone()
+    assert row is not None
+    assert row["attempts"] == 1
+    assert row["failed_at"] is not None

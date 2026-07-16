@@ -406,7 +406,7 @@ class WorkerDaemon:
             issue_number = int(task["issue_number"])
             issue = self.github.get_issue(repo, issue_number)  # type: ignore[attr-defined]
             pr_number = task.get("pr_number")
-            if pr_number is not None:
+            if pr_number is not None and self.config.merge_mode != "automatic":
                 pull = self.github.get_pull_request(repo, int(pr_number))  # type: ignore[attr-defined]
                 if pull.get("merged_at"):
                     labels = []
