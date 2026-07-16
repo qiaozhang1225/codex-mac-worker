@@ -492,6 +492,63 @@ def test_auto_merge_delivery_refreshes_advanced_main_without_codex(
     assert delivery.integrated_base == git(remote, "rev-parse", "main")
 
 
+def test_auto_merge_delivery_retries_refresh_push_without_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, operations, issue = make_worker_fixture(tmp_path)
+    service.process_issue(config.repositories[0], issue)
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    service.config = replace(config, merge_mode="automatic")
+    remote = Path(config.repositories[0].clone_url)
+    upstream = tmp_path / "auto-merge-push-retry"
+    git(tmp_path, "clone", str(remote), str(upstream))
+    git(upstream, "config", "user.name", "Concurrent Developer")
+    git(upstream, "config", "user.email", "developer@example.com")
+    (upstream / "docs" / "concurrent.md").write_text("new main\n", encoding="utf-8")
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "advance before push retry")
+    git(upstream, "push", "origin", "main")
+
+    real_push = operations.push
+    push_calls = 0
+
+    def fail_first_push(*args: object, **kwargs: object) -> None:
+        nonlocal push_calls
+        push_calls += 1
+        if push_calls == 1:
+            raise GitError("connect timed out", retryable=True)
+        real_push(*args, **kwargs)
+
+    monkeypatch.setattr(operations, "push", fail_first_push)
+
+    class MustNotRun:
+        def run(self, *args: object, **kwargs: object) -> RunnerResult:
+            raise AssertionError("auto-merge push retry invoked Codex")
+
+    service.runner = MustNotRun()
+
+    def require_remote_head(
+        github_port: object,
+        operation_store: EventStore,
+        reference: object,
+        *,
+        pr_number: int,
+        expected_head: str,
+        merge_mode: str,
+    ) -> AutomaticMergeResult:
+        assert git(remote, "rev-parse", "codex/12-bounded-task") == expected_head
+        return AutomaticMergeResult(
+            "owner/repo", 12, pr_number, expected_head, "e" * 40, True
+        )
+
+    monkeypatch.setattr(worker_module, "automatic_merge_task", require_remote_head)
+
+    assert service.auto_merge_delivery(config.repositories[0], issue, task) == "merging"
+    assert service.auto_merge_delivery(config.repositories[0], issue, task) == "completed"
+    assert push_calls == 2
+
+
 def test_auto_merge_delivery_bounds_transient_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

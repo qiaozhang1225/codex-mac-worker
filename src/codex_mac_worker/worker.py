@@ -816,27 +816,32 @@ This PR was created as a draft. {merge_note}
                     repo, number, task_hash
                 )
                 assert checkpoint is not None
-                self.git.push(
-                    worktree,
-                    branch=branch,
-                    clone_url=repository.clone_url,
-                    token=self.token_provider(),
-                )
-                runner_result = self._checkpoint_runner_result(checkpoint)
-                pr_body = self._delivery_pr_body(
-                    issue_number=number,
-                    spec=spec,
-                    task_hash=task_hash,
-                    commit_sha=str(checkpoint["commit_sha"]),
-                    runner_result=runner_result,
-                    structured_result=checkpoint["structured_result"],
-                    verification_result=self._restore_verification(
-                        checkpoint["verification_result"]
-                    ),
-                    task_commit_sha=str(checkpoint["task_commit_sha"]),
-                    integrated_base_sha=str(checkpoint["integrated_base_sha"]),
-                )
-                self.github.update_pull_request(repo, pr_number, body=pr_body)
+
+            # Always reconcile the checkpointed head with the remote branch. A
+            # previous process may have persisted an integration refresh and
+            # then failed before push; the next pass must finish that same
+            # delivery instead of invoking Codex or creating another commit.
+            self.git.push(
+                worktree,
+                branch=branch,
+                clone_url=repository.clone_url,
+                token=self.token_provider(),
+            )
+            runner_result = self._checkpoint_runner_result(checkpoint)
+            pr_body = self._delivery_pr_body(
+                issue_number=number,
+                spec=spec,
+                task_hash=task_hash,
+                commit_sha=str(checkpoint["commit_sha"]),
+                runner_result=runner_result,
+                structured_result=checkpoint["structured_result"],
+                verification_result=self._restore_verification(
+                    checkpoint["verification_result"]
+                ),
+                task_commit_sha=str(checkpoint["task_commit_sha"]),
+                integrated_base_sha=str(checkpoint["integrated_base_sha"]),
+            )
+            self.github.update_pull_request(repo, pr_number, body=pr_body)
 
             result = automatic_merge_task(
                 self.github,
