@@ -77,6 +77,7 @@ def test_review_blocks_unattested_pull_author(user: dict[str, str], blocker: str
 ```
 
 Retain the existing `different_app` case so a present App ID of `999` remains blocked against attested App ID `777`.
+Also parameterize malformed non-null metadata (`str`, `list`, `int`, empty dictionaries, missing IDs, and string IDs) and require the GitHub App blocker for every case.
 
 - [ ] **Step 3: Run the focused tests and confirm the missing-metadata case fails**
 
@@ -112,7 +113,10 @@ else:
         blockers.append("PR author is not a GitHub Bot")
     if author_login != worker_login:
         blockers.append("PR author does not match the attested Worker identity")
-    if isinstance(pull_app_metadata, dict) and pull_app_id != worker_app_id:
+    if pull_app_metadata is not None and (
+        not isinstance(pull_app_metadata, dict)
+        or pull_app_id != worker_app_id
+    ):
         blockers.append("PR was not created by the attested Worker GitHub App")
 ```
 
@@ -182,6 +186,9 @@ def test_review_allows_benign_production_build_risk(risk: str) -> None:
         "需要修改生产数据",
         "需要迁移生产数据库",
         "需要部署到生产环境",
+        "密码可能泄露",
+        "生产 数据可能被修改",
+        "生产-数据库可能被修改",
     ],
 )
 def test_review_blocks_explicit_production_operation_risk(risk: str) -> None:
@@ -214,7 +221,7 @@ _UNSAFE_RISK_RE = re.compile(
     r"\b(high[-\s]?risk|credentials?|secrets?|passwords?|"
     r"deploy(?:ment|ed|ing)?|migrations?|irreversible|"
     r"prod(?:uction)?[\s_-]+(?:data|databases?|environments?))\b|"
-    r"高风险|凭据|密钥|部署|迁移|不可逆|生产(?:数据|数据库|环境)",
+    r"高风险|凭据|密钥|密码|部署|迁移|不可逆|生产[\s_-]*(?:数据|数据库|环境)",
     re.IGNORECASE,
 )
 ```

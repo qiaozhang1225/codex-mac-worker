@@ -60,9 +60,10 @@ Focused regression tests will cover:
 - a matching attested bot with null PR App metadata is accepted;
 - present matching App metadata is accepted;
 - present mismatched App metadata is blocked;
+- malformed non-null App metadata is blocked;
 - a matching login with non-bot account type is blocked;
 - a mismatched bot login is blocked;
 - benign English and Chinese production-build risk notes are accepted;
-- explicit English and Chinese production data, environment, and deployment risks are blocked.
+- explicit English and Chinese production data, environment, credential, password, and deployment risks are blocked, including controlled separators in Chinese production-resource phrases.
 
 The complete test suite will run before publishing a Draft PR. After deployment, EaseWise Issue #12 will be reviewed again from live GitHub state; PR #13 will remain unmerged until its exact new review fingerprint receives separate approval.
