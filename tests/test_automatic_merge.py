@@ -120,6 +120,43 @@ def test_auto_merge_reconciles_lost_success_without_second_merge(
     assert remote.merge_calls == 1
 
 
+def test_auto_merge_rejects_unrecorded_already_merged_pr(tmp_path: Path) -> None:
+    remote = AutoMergeGitHub()
+    remote.pull["draft"] = False
+    remote.pull["merged_at"] = "2026-07-17T00:00:00Z"
+    remote.pull["merge_commit_sha"] = "e" * 40
+    github, store = durable(tmp_path, remote)
+
+    with pytest.raises(AutoMergeBlocked, match="no recorded"):
+        automatic_merge_task(
+            github,
+            store,
+            REF,
+            pr_number=44,
+            expected_head=HEAD,
+            merge_mode="automatic",
+        )
+
+
+def test_auto_merge_rejects_already_merged_unexpected_head(tmp_path: Path) -> None:
+    remote = AutoMergeGitHub()
+    remote.pull["draft"] = False
+    remote.pull["merged_at"] = "2026-07-17T00:00:00Z"
+    remote.pull["merge_commit_sha"] = "e" * 40
+    remote.pull["head"]["sha"] = "d" * 40
+    github, store = durable(tmp_path, remote)
+
+    with pytest.raises(AutoMergeBlocked, match="head differs"):
+        automatic_merge_task(
+            github,
+            store,
+            REF,
+            pr_number=44,
+            expected_head=HEAD,
+            merge_mode="automatic",
+        )
+
+
 def test_auto_merge_blocks_head_change_after_ready(tmp_path: Path) -> None:
     class DriftingGitHub(AutoMergeGitHub):
         def mark_pull_request_ready(self, repo: str, pr_number: int) -> dict:
