@@ -11,6 +11,17 @@ import time
 from typing import Callable, Iterator, Mapping
 
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+_PROXY_BYPASS_ENV_KEYS = ("NO_PROXY", "no_proxy")
+
+
 class GitError(RuntimeError):
     """Raised when repository preparation or integrity validation fails."""
 
@@ -39,12 +50,14 @@ class GitOperations:
         cache_root: Path,
         worktree_root: Path,
         git_path: str = "git",
+        proxy_url: str | None = None,
         network_retry_delays: tuple[float, ...] = (1.0, 3.0),
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.cache_root = cache_root
         self.worktree_root = worktree_root
         self.git_path = git_path
+        self.proxy_url = proxy_url
         self.network_retry_delays = network_retry_delays
         self._sleep = sleep
 
@@ -52,12 +65,16 @@ class GitOperations:
         self,
         cwd: Path,
         *args: str,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         if env:
-            merged_env.update(env)
+            for key, value in env.items():
+                if value is None:
+                    merged_env.pop(key, None)
+                else:
+                    merged_env[key] = value
         result = subprocess.run(
             [self.git_path, *args],
             cwd=cwd,
@@ -104,6 +121,8 @@ class GitOperations:
             "operation timed out",
             "could not resolve host",
             "couldn't resolve host",
+            "could not resolve proxy",
+            "couldn't resolve proxy",
             "failed to connect to",
             "connection reset",
             "remote end hung up unexpectedly",
@@ -124,15 +143,48 @@ class GitOperations:
             normalized,
         ) is not None
 
+    def _proxy_environment(
+        self,
+        *,
+        use_proxy: bool,
+        target_url: str,
+    ) -> dict[str, str | None]:
+        value = self.proxy_url if use_proxy else None
+        environment = {key: value for key in _PROXY_ENV_KEYS}
+        environment.update({key: None for key in _PROXY_BYPASS_ENV_KEYS})
+
+        git_proxy_value = self.proxy_url if use_proxy else ""
+        normalized_target = target_url.rstrip("/")
+        config_entries = (
+            ("http.proxy", git_proxy_value),
+            (f"http.{normalized_target}.proxy", git_proxy_value),
+            (f"http.{normalized_target}/.proxy", git_proxy_value),
+        )
+        environment["GIT_CONFIG_PARAMETERS"] = None
+        environment["GIT_CONFIG_COUNT"] = str(len(config_entries))
+        for index, (key, config_value) in enumerate(config_entries):
+            environment[f"GIT_CONFIG_KEY_{index}"] = key
+            environment[f"GIT_CONFIG_VALUE_{index}"] = config_value
+        return environment
+
     def _git_network(
         self,
         cwd: Path,
         *args: str,
-        env: Mapping[str, str] | None = None,
+        env: Mapping[str, str | None] | None = None,
+        proxy_target_url: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         attempts = len(self.network_retry_delays) + 1
         for attempt in range(attempts):
-            result = self._git(cwd, *args, env=env, check=False)
+            attempt_env: dict[str, str | None] = dict(env or {})
+            if self.proxy_url is not None and proxy_target_url is not None:
+                attempt_env.update(
+                    self._proxy_environment(
+                        use_proxy=attempt % 2 == 0,
+                        target_url=proxy_target_url,
+                    )
+                )
+            result = self._git(cwd, *args, env=attempt_env, check=False)
             if result.returncode == 0:
                 return result
             retryable = self._is_retryable_network_failure(result.stderr)
@@ -177,7 +229,14 @@ class GitOperations:
         mirror = self.cache_root / owner / f"{name}.git"
         with self._authentication(token) as env:
             if mirror.exists():
-                self._git_network(mirror, "remote", "update", "--prune", env=env)
+                self._git_network(
+                    mirror,
+                    "remote",
+                    "update",
+                    "--prune",
+                    env=env,
+                    proxy_target_url=clone_url,
+                )
                 return mirror
             mirror.parent.mkdir(parents=True, exist_ok=True)
             self._git_network(
@@ -187,6 +246,7 @@ class GitOperations:
                 clone_url,
                 str(mirror),
                 env=env,
+                proxy_target_url=clone_url,
             )
         return mirror
 
@@ -324,4 +384,5 @@ class GitOperations:
                 remote_name,
                 f"HEAD:refs/heads/{branch}",
                 env=env,
+                proxy_target_url=clone_url,
             )

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import tomllib
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -48,6 +49,7 @@ class WorkerConfig:
     repositories: tuple[RepositoryConfig, ...]
     codex_home: Path | None = None
     discover_installation_repositories: bool = False
+    git_proxy_url: str | None = None
 
 
 def _positive_int(raw: dict[str, Any], key: str) -> int:
@@ -145,6 +147,33 @@ def _worker_numeric_string(raw: dict[str, Any], key: str) -> str:
     return value
 
 
+def _worker_proxy_url(raw: dict[str, Any]) -> str | None:
+    value = raw.get("git_proxy_url")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError("git_proxy_url must be an HTTP(S) URL without credentials")
+    value = value.strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ConfigError("git_proxy_url must contain a valid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError("git_proxy_url must be an HTTP(S) URL without credentials")
+    return value.rstrip("/")
+
+
 def load_worker_config(path: Path) -> WorkerConfig:
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -195,4 +224,5 @@ def load_worker_config(path: Path) -> WorkerConfig:
         repositories=tuple(repositories),
         codex_home=worker_path("codex_home"),
         discover_installation_repositories=discover_installation_repositories,
+        git_proxy_url=_worker_proxy_url(raw),
     )

@@ -223,6 +223,7 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
                     "database_path": str(config.database_path),
                     "codex_path": str(config.codex_path),
                     "codex_home": str(config.codex_home),
+                    "git_proxy_url": config.git_proxy_url,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -239,7 +240,11 @@ def worker_main(argv: Sequence[str] | None = None) -> int:
         store = EventStore(config.database_path)
         try:
             github = DurableGitHub(GitHubClient(token_provider=auth.installation_token), store)
-            git = GitOperations(cache_root=config.cache_root, worktree_root=config.worktree_root)
+            git = GitOperations(
+                cache_root=config.cache_root,
+                worktree_root=config.worktree_root,
+                proxy_url=config.git_proxy_url,
+            )
             runner = CodexRunner(
                 codex_path=config.codex_path,
                 output_root=config.output_root,
