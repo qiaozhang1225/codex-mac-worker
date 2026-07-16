@@ -520,6 +520,49 @@ class EventStore:
         if cursor.rowcount != 1:
             raise KeyError("delivery checkpoint does not exist")
 
+    def update_delivery_integration(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        *,
+        expected_task_commit: str,
+        previous_head: str,
+        delivery_head: str,
+        integrated_base: str,
+        integration_refreshes: int,
+        verification_result: dict[str, Any],
+        verification_commands: tuple[str, ...],
+        project_config_hash: str,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET commit_sha=?, integrated_base_sha=?, integration_refreshes=?,
+                verification_result_json=?, verification_commands_json=?,
+                project_config_hash=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND task_hash=?
+              AND task_commit_sha=? AND commit_sha=?
+            """,
+            (
+                delivery_head,
+                integrated_base,
+                integration_refreshes,
+                json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
+                json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
+                project_config_hash,
+                utc_now(),
+                repo,
+                issue_number,
+                task_hash,
+                expected_task_commit,
+                previous_head,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise ValueError("delivery integration identity changed")
+
     def active_tasks(self) -> list[dict[str, Any]]:
         terminal = ("awaiting-review", "completed", "cancelled", "needs-attention")
         placeholders = ",".join("?" for _ in terminal)

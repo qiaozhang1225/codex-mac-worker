@@ -289,6 +289,33 @@ def test_auto_merge_operation_is_idempotent_and_rejects_identity_drift(
         raise AssertionError("expected auto-merge identity drift rejection")
 
 
+def test_delivery_integration_update_preserves_task_identity(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    payload = checkpoint_payload(tmp_path)
+    store.save_delivery_checkpoint(**payload)
+
+    store.update_delivery_integration(
+        "owner/repo",
+        12,
+        "a" * 64,
+        expected_task_commit="2" * 40,
+        previous_head="2" * 40,
+        delivery_head="4" * 40,
+        integrated_base="5" * 40,
+        integration_refreshes=1,
+        verification_result={"passed": True, "commands": [{"command": "pytest"}]},
+        verification_commands=("pytest",),
+        project_config_hash="6" * 64,
+    )
+
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, "a" * 64)
+    assert checkpoint is not None
+    assert checkpoint["task_commit_sha"] == "2" * 40
+    assert checkpoint["commit_sha"] == "4" * 40
+    assert checkpoint["integrated_base_sha"] == "5" * 40
+    assert checkpoint["integration_refreshes"] == 1
+
+
 def test_legacy_checkpoint_and_reconstruction_marker_are_saved_together(
     tmp_path: Path,
 ) -> None:

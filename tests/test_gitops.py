@@ -524,6 +524,29 @@ def test_integrate_default_refuses_third_refresh(tmp_path: Path) -> None:
         repo.integrate(refresh_count=2)
 
 
+def test_integrate_default_allows_two_bounded_advances(tmp_path: Path) -> None:
+    repo = IntegrationRepository(tmp_path)
+    task_commit = repo.commit_task()
+    repo.advance_main("docs/one.md")
+    first = repo.integrate()
+    repo.advance_main("docs/two.md")
+
+    second = repo.operations.integrate_default(
+        repo.worktree,
+        repo.mirror,
+        "main",
+        first.integrated_base,
+        ("feature.txt",),
+        refresh_count=first.refresh_count,
+        author_name="Codex Mac Worker",
+        author_email="codex-worker@users.noreply.github.com",
+    )
+
+    assert second.refresh_count == 2
+    assert repo.operations.commit_parents(repo.worktree, second.delivery_head)[0] == first.delivery_head
+    assert repo.operations.is_ancestor(repo.worktree, task_commit, second.delivery_head) is True
+
+
 def test_integrate_default_aborts_failed_merge_and_restores_clean_head(
     tmp_path: Path,
 ) -> None:

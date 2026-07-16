@@ -42,8 +42,9 @@ STATUS_LABELS: dict[str, tuple[str, str]] = {
     "codex:verifying": ("bf8700", "Repository-approved checks are running"),
     "codex:retrying": ("d4a72c", "One bounded automatic retry is active"),
     "codex:awaiting-review": ("2da44e", "Draft PR awaits human review"),
+    "codex:merging": ("8957e5", "Verified Worker PR is being auto-merged"),
     "codex:needs-attention": ("cf222e", "Human intervention is required"),
-    "codex:completed": ("0e8a16", "PR was merged by a human"),
+    "codex:completed": ("0e8a16", "Worker delivery was merged"),
     "codex:cancelled": ("6e7781", "Task was cancelled"),
 }
 

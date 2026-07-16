@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from codex_mac_worker.runner import RunnerResult, RunnerTimeout
 from codex_mac_worker.store import EventStore
 from codex_mac_worker.verification import CommandResult, VerificationResult
 from codex_mac_worker.worker import WorkerService
+from codex_mac_worker.automatic_merge import AutoMergeBlocked, AutomaticMergeResult
 
 from .test_protocol import VALID_SHA, task_body
 
@@ -366,6 +368,169 @@ def test_retry_delivery_accepts_checkpointed_integration_commit(
     )
     assert checkpoint is not None
     assert checkpoint["integration_refreshes"] == 1
+
+
+def test_automatic_mode_leaves_verified_draft_in_merging_state(
+    tmp_path: Path,
+) -> None:
+    service, config, github, store, _, issue = make_worker_fixture(tmp_path)
+    service.config = replace(config, merge_mode="automatic")
+
+    service.process_issue(service.config.repositories[0], issue)
+
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    assert task["state"] == "merging"
+    assert task["pr_number"] == 44
+    assert github.labels[-1] == ["codex:merging"]
+
+
+def test_auto_merge_delivery_adopts_checkpoint_without_invoking_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, _, issue = make_worker_fixture(tmp_path)
+    service.process_issue(config.repositories[0], issue)
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    service.config = replace(config, merge_mode="automatic")
+
+    class MustNotRun:
+        def run(self, *args: object, **kwargs: object) -> RunnerResult:
+            raise AssertionError("auto-merge adoption invoked Codex")
+
+    service.runner = MustNotRun()
+    captured: dict[str, object] = {}
+
+    def fake_auto_merge(
+        github: object,
+        operation_store: EventStore,
+        reference: object,
+        *,
+        pr_number: int,
+        expected_head: str,
+        merge_mode: str,
+    ) -> AutomaticMergeResult:
+        captured.update(
+            pr_number=pr_number,
+            expected_head=expected_head,
+            merge_mode=merge_mode,
+        )
+        return AutomaticMergeResult(
+            repo="owner/repo",
+            issue_number=12,
+            pr_number=pr_number,
+            approved_head=expected_head,
+            merge_commit_sha="e" * 40,
+            merged=True,
+        )
+
+    monkeypatch.setattr(worker_module, "automatic_merge_task", fake_auto_merge)
+
+    outcome = service.auto_merge_delivery(
+        service.config.repositories[0], issue, task
+    )
+
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert outcome == "completed"
+    assert captured == {
+        "pr_number": 44,
+        "expected_head": checkpoint["commit_sha"],
+        "merge_mode": "automatic",
+    }
+
+
+def test_auto_merge_delivery_refreshes_advanced_main_without_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, store, _, issue = make_worker_fixture(tmp_path)
+    service.process_issue(config.repositories[0], issue)
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    service.config = replace(config, merge_mode="automatic")
+    remote = Path(config.repositories[0].clone_url)
+    upstream = tmp_path / "auto-merge-upstream"
+    git(tmp_path, "clone", str(remote), str(upstream))
+    git(upstream, "config", "user.name", "Concurrent Developer")
+    git(upstream, "config", "user.email", "developer@example.com")
+    (upstream / "docs" / "concurrent.md").write_text("new main\n", encoding="utf-8")
+    git(upstream, "add", ".")
+    git(upstream, "commit", "-m", "advance before auto merge")
+    git(upstream, "push", "origin", "main")
+    captured_head = ""
+
+    def fake_auto_merge(
+        github_port: object,
+        operation_store: EventStore,
+        reference: object,
+        *,
+        pr_number: int,
+        expected_head: str,
+        merge_mode: str,
+    ) -> AutomaticMergeResult:
+        nonlocal captured_head
+        captured_head = expected_head
+        return AutomaticMergeResult(
+            "owner/repo", 12, pr_number, expected_head, "e" * 40, True
+        )
+
+    monkeypatch.setattr(worker_module, "automatic_merge_task", fake_auto_merge)
+
+    assert service.auto_merge_delivery(config.repositories[0], issue, task) == "completed"
+
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["integration_refreshes"] == 1
+    assert checkpoint["commit_sha"] == captured_head
+    assert git(remote, "rev-parse", "codex/12-bounded-task") == captured_head
+    delivery = parse_delivery_block(github.updated_prs[-1]["body"])
+    assert delivery.delivery_commit == captured_head
+    assert delivery.integrated_base == git(remote, "rev-parse", "main")
+
+
+def test_auto_merge_delivery_bounds_transient_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, _, issue = make_worker_fixture(tmp_path)
+    service.process_issue(config.repositories[0], issue)
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    service.config = replace(config, merge_mode="automatic")
+
+    def transient(*args: object, **kwargs: object) -> AutomaticMergeResult:
+        raise GitHubError("temporary", status_code=503, retryable=True)
+
+    monkeypatch.setattr(worker_module, "automatic_merge_task", transient)
+
+    assert service.auto_merge_delivery(config.repositories[0], issue, task) == "merging"
+    assert (
+        service.auto_merge_delivery(config.repositories[0], issue, task)
+        == "needs-attention"
+    )
+
+
+def test_auto_merge_delivery_does_not_retry_policy_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, _, _, issue = make_worker_fixture(tmp_path)
+    service.process_issue(config.repositories[0], issue)
+    task = service.store.get_task("owner/repo", 12)
+    assert task is not None
+    service.config = replace(config, merge_mode="automatic")
+
+    def blocked(*args: object, **kwargs: object) -> AutomaticMergeResult:
+        raise AutoMergeBlocked("unsafe Ruleset")
+
+    monkeypatch.setattr(worker_module, "automatic_merge_task", blocked)
+
+    assert (
+        service.auto_merge_delivery(config.repositories[0], issue, task)
+        == "needs-attention"
+    )
 
 
 def test_transient_push_failure_persists_retryable_delivery_checkpoint(

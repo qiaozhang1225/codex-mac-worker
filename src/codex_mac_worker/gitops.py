@@ -71,6 +71,10 @@ class GitOperations:
         self.network_retry_delays = network_retry_delays
         self._sleep = sleep
 
+    def mirror_path(self, repo: str) -> Path:
+        owner, name = repo.split("/", 1)
+        return self.cache_root / owner / f"{name}.git"
+
     def _git(
         self,
         cwd: Path,
@@ -268,8 +272,7 @@ class GitOperations:
             askpass.unlink(missing_ok=True)
 
     def ensure_mirror(self, repo: str, clone_url: str, token: str | None = None) -> Path:
-        owner, name = repo.split("/", 1)
-        mirror = self.cache_root / owner / f"{name}.git"
+        mirror = self.mirror_path(repo)
         with self._authentication(token) as env:
             if mirror.exists():
                 self._git_network(
@@ -403,6 +406,19 @@ class GitOperations:
         if not fields or fields[0] != commit_sha:
             raise GitError("delivery commit cannot be resolved")
         return tuple(fields[1:])
+
+    def is_ancestor(self, repository: Path, ancestor: str, descendant: str) -> bool:
+        return (
+            self._git(
+                repository,
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+                check=False,
+            ).returncode
+            == 0
+        )
 
     def diff_stat(self, worktree: Path, baseline_head: str) -> str:
         return self._git(worktree, "diff", "--stat", f"{baseline_head}..HEAD", "--").stdout.strip()
