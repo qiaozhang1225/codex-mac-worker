@@ -205,63 +205,73 @@ class EventStore:
         model: str | None,
         cli_version: str | None,
         session_id: str | None,
+        phase: str = "delivery-ready",
+        worker_state_key: str | None = None,
+        worker_state_value: Any = None,
     ) -> None:
-        existing = self.connection.execute(
-            """
-            SELECT branch, worktree, context_commit, commit_sha
-            FROM delivery_checkpoints
-            WHERE repo=? AND issue_number=? AND task_hash=?
-            """,
-            (repo, issue_number, task_hash),
-        ).fetchone()
-        identity = (branch, worktree, context_commit, commit_sha)
-        if existing is not None and tuple(existing) != identity:
-            raise ValueError("delivery checkpoint identity changed")
-
         now = utc_now()
-        self.connection.execute(
-            """
-            INSERT INTO delivery_checkpoints (
-                repo, issue_number, task_hash, branch, worktree,
-                context_commit, commit_sha, project_config_hash,
-                verification_profile, verification_commands_json,
-                verification_result_json, structured_result_json,
-                model, cli_version, session_id, phase, retryable,
-                last_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      'checkpointed', 0, NULL, ?, ?)
-            ON CONFLICT(repo, issue_number, task_hash) DO UPDATE SET
-                project_config_hash=excluded.project_config_hash,
-                verification_profile=excluded.verification_profile,
-                verification_commands_json=excluded.verification_commands_json,
-                verification_result_json=excluded.verification_result_json,
-                structured_result_json=excluded.structured_result_json,
-                model=excluded.model,
-                cli_version=excluded.cli_version,
-                session_id=excluded.session_id,
-                updated_at=excluded.updated_at
-            """,
-            (
-                repo,
-                issue_number,
-                task_hash,
-                branch,
-                worktree,
-                context_commit,
-                commit_sha,
-                project_config_hash,
-                verification_profile,
-                json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
-                json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
-                json.dumps(structured_result, ensure_ascii=False, sort_keys=True),
-                model,
-                cli_version,
-                session_id,
-                now,
-                now,
-            ),
-        )
-        self.connection.commit()
+        with self.connection:
+            existing = self.connection.execute(
+                """
+                SELECT branch, worktree, context_commit, commit_sha
+                FROM delivery_checkpoints
+                WHERE repo=? AND issue_number=? AND task_hash=?
+                """,
+                (repo, issue_number, task_hash),
+            ).fetchone()
+            identity = (branch, worktree, context_commit, commit_sha)
+            if existing is not None and tuple(existing) != identity:
+                raise ValueError("delivery checkpoint identity changed")
+
+            self.connection.execute(
+                """
+                INSERT INTO delivery_checkpoints (
+                    repo, issue_number, task_hash, branch, worktree,
+                    context_commit, commit_sha, project_config_hash,
+                    verification_profile, verification_commands_json,
+                    verification_result_json, structured_result_json,
+                    model, cli_version, session_id, phase, retryable,
+                    last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, 1, NULL, ?, ?)
+                ON CONFLICT(repo, issue_number, task_hash) DO NOTHING
+                """,
+                (
+                    repo,
+                    issue_number,
+                    task_hash,
+                    branch,
+                    worktree,
+                    context_commit,
+                    commit_sha,
+                    project_config_hash,
+                    verification_profile,
+                    json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
+                    json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
+                    json.dumps(structured_result, ensure_ascii=False, sort_keys=True),
+                    model,
+                    cli_version,
+                    session_id,
+                    phase,
+                    now,
+                    now,
+                ),
+            )
+            if worker_state_key is not None:
+                self.connection.execute(
+                    """
+                    INSERT INTO worker_state(key, value_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json=excluded.value_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        worker_state_key,
+                        json.dumps(worker_state_value, sort_keys=True),
+                        now,
+                    ),
+                )
 
     def get_delivery_checkpoint(
         self,

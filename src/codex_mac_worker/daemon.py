@@ -313,6 +313,26 @@ class WorkerDaemon:
                 self.store.mark_command_executed(command_id, result)
                 return True
 
+            checkpoint = self.store.get_delivery_checkpoint(
+                repo, issue_number, str(task["task_hash"])
+            )
+            if (
+                checkpoint is not None
+                and checkpoint.get("phase") == "paused-verification"
+                and checkpoint.get("retryable") is True
+            ):
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=issue_number,
+                    task_hash=task["task_hash"],
+                    state="retrying",
+                    branch=task["branch"],
+                    worktree=task["worktree"],
+                )
+                result = self.service.retry_delivery(self._repository(repo), issue)
+                self.store.mark_command_executed(command_id, result)
+                return True
+
             resume_session_id = task.get("session_id")
             resume_key = f"resume:{repo}#{issue_number}:{task['task_hash']}"
             if not resume_session_id or self.store.get_worker_state(resume_key, 0) >= 1:
@@ -343,6 +363,28 @@ class WorkerDaemon:
             )
             self.store.mark_command_executed(command_id, "resume")
             return True
+        return False
+
+    def reconcile_stable_commands(self) -> bool:
+        """Acknowledge commands whose durable task outcome already proves completion."""
+        for task in self.store.tasks_in_states(
+            ("awaiting-review", "completed", "cancelled")
+        ):
+            for command in self.store.pending_commands(
+                str(task["repo"]), int(task["issue_number"])
+            ):
+                action = str(command["action"])
+                state = str(task["state"])
+                if action == "retry" and state in {"awaiting-review", "completed"}:
+                    self.store.mark_command_executed(
+                        str(command["command_id"]), state
+                    )
+                    return True
+                if action == "cancel" and state == "cancelled":
+                    self.store.mark_command_executed(
+                        str(command["command_id"]), "cancelled"
+                    )
+                    return True
         return False
 
     def process_review_tasks(self) -> bool:
@@ -414,6 +456,8 @@ class WorkerDaemon:
         flush = getattr(self.github, "flush", None)
         if flush is not None:
             flush()
+        if self.reconcile_stable_commands():
+            return True
         if self.process_review_tasks():
             return True
         if self.process_control_commands():

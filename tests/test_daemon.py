@@ -281,6 +281,83 @@ def test_pending_retry_command_resumes_after_crash_without_comment(
     assert command is not None and command["executed_at"] is not None
 
 
+def test_pending_retry_command_is_reconciled_after_delivery_completed(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="awaiting-review",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+    store.record_command("cmd-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.run_once() is True
+
+    command = store.get_command("cmd-retry")
+    assert command is not None
+    assert command["result"] == "awaiting-review"
+    assert command["executed_at"] is not None
+    assert service.delivery_retried == []
+
+
+def test_resume_paused_delivery_verification_never_invokes_codex(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="paused",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        session_id="codex-session-must-not-resume",
+    )
+    store.save_delivery_checkpoint(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        context_commit="1" * 40,
+        commit_sha="2" * 40,
+        project_config_hash="3" * 64,
+        verification_profile="fast",
+        verification_commands=("pytest -q",),
+        verification_result={"passed": True, "commands": []},
+        structured_result={"status": "completed"},
+        model="gpt-test",
+        cli_version="codex-test",
+        session_id="codex-session-must-not-resume",
+    )
+    store.set_delivery_checkpoint_state(
+        "owner/repo",
+        9,
+        "hash",
+        phase="paused-verification",
+        retryable=True,
+        last_error=None,
+    )
+    store.record_command("cmd-resume", "owner/repo", 9, "resume", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+
+    assert service.delivery_retried == [9]
+    assert service.processed == []
+    assert store.get_command("cmd-resume")["result"] == "awaiting-review"
+
+
 def test_executed_historical_retry_command_is_never_replayed(tmp_path: Path) -> None:
     settings = config(tmp_path)
     store = EventStore(settings.database_path)

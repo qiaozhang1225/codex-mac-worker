@@ -160,6 +160,8 @@ class WorkerService:
         task_hash: str,
         branch: str,
         detail: str,
+        *,
+        allow_remote: bool = True,
     ) -> None:
         number = int(issue["number"])
         self.store.upsert_task(
@@ -169,18 +171,19 @@ class WorkerService:
             state="needs-attention",
             branch=branch or None,
         )
-        self._set_state(repo, issue, "needs-attention")
-        self.github.add_comment(
-            repo,
-            number,
-            self._status_body(
-                task_hash=task_hash,
-                state="needs-attention",
-                branch=branch,
-                progress_at=iso_now(),
-                detail=detail[:4000],
-            ),
-        )
+        if allow_remote:
+            self._set_state(repo, issue, "needs-attention")
+            self.github.add_comment(
+                repo,
+                number,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="needs-attention",
+                    branch=branch,
+                    progress_at=iso_now(),
+                    detail=detail[:4000],
+                ),
+            )
 
     def _validate_context_files(self, worktree: Path, paths: tuple[str, ...]) -> None:
         root = worktree.resolve()
@@ -555,6 +558,16 @@ This PR was created as a draft. The worker cannot merge it.
             last_error=f"{type(exc).__name__}: {exc}",
         )
 
+    @staticmethod
+    def _require_delivery_deadline(
+        deadline_monotonic: float | None,
+        phase: str,
+    ) -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise RunnerTimeout(
+                f"delivery retry hard timeout exceeded before {phase}"
+            )
+
     def _checkpoint_runner_result(
         self,
         checkpoint: dict[str, Any],
@@ -600,6 +613,7 @@ This PR was created as a draft. The worker cannot merge it.
             verification_result=verification_result,
         )
         try:
+            self._require_delivery_deadline(deadline_monotonic, "push")
             self.git.push(
                 worktree,
                 branch=branch,
@@ -611,6 +625,7 @@ This PR was created as a draft. The worker cannot merge it.
             self._set_delivery_failure(repo, number, task_hash, "push", exc)
             raise
         try:
+            self._require_delivery_deadline(deadline_monotonic, "pull request")
             pr = self.github.create_draft_pr(
                 repo,
                 branch,
@@ -622,17 +637,9 @@ This PR was created as a draft. The worker cannot merge it.
             self._set_delivery_failure(repo, number, task_hash, "pull-request", exc)
             raise
         try:
-            self.store.upsert_task(
-                repo=repo,
-                issue_number=number,
-                task_hash=task_hash,
-                state="awaiting-review",
-                branch=branch,
-                worktree=str(worktree),
-                session_id=checkpoint.get("session_id"),
-                pr_number=int(pr["number"]),
-            )
+            self._require_delivery_deadline(deadline_monotonic, "finalization")
             self._set_state(repo, issue, "awaiting-review")
+            self._require_delivery_deadline(deadline_monotonic, "status comment")
             self.github.update_comment(
                 repo,
                 status_comment_id,
@@ -643,6 +650,17 @@ This PR was created as a draft. The worker cannot merge it.
                     progress_at=iso_now(),
                     detail=str(pr.get("html_url", "")),
                 ),
+            )
+            self._require_delivery_deadline(deadline_monotonic, "local finalization")
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
+                state="awaiting-review",
+                branch=branch,
+                worktree=str(worktree),
+                session_id=checkpoint.get("session_id"),
+                pr_number=int(pr["number"]),
             )
         except Exception as exc:
             self._set_delivery_failure(repo, number, task_hash, "finalize", exc)
@@ -1105,16 +1123,21 @@ This PR was created as a draft. The worker cannot merge it.
         )
         attempted_legacy = checkpoint is None
         legacy_key = f"legacy-delivery-recovery:{repo}#{number}:{task_hash}"
+        deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
+        deadline_at = datetime.now(UTC) + timedelta(
+            seconds=DELIVERY_RETRY_TIMEOUT_SECONDS
+        )
         try:
             if task is None:
                 raise PolicyError("delivery retry task record is missing")
 
-            deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
             self._validate_issue_author(repo, issue)
+            self._require_delivery_deadline(deadline, "task authorization")
             spec = parse_task_body(str(issue.get("body", "")))
             if spec.task_hash != task_hash:
                 raise PolicyError("task body changed after delivery checkpoint")
             self.validate_repository_authority(repository)
+            self._require_delivery_deadline(deadline, "repository authorization")
             if checkpoint is None:
                 if self.store.get_worker_state(legacy_key) == "rejected":
                     raise PolicyError("legacy delivery reconstruction was rejected")
@@ -1191,7 +1214,9 @@ This PR was created as a draft. The worker cannot merge it.
                 worktree=str(worktree),
                 session_id=task.get("session_id"),
             )
+            self._require_delivery_deadline(deadline, "retry status label")
             self._set_state(repo, issue, "retrying")
+            self._require_delivery_deadline(deadline, "retry status comment")
             status = self.github.add_comment(
                 repo,
                 number,
@@ -1200,14 +1225,12 @@ This PR was created as a draft. The worker cannot merge it.
                     state="retrying",
                     branch=branch,
                     progress_at=iso_now(),
-                    hard_deadline_at=(
-                        datetime.now(UTC)
-                        + timedelta(seconds=DELIVERY_RETRY_TIMEOUT_SECONDS)
-                    ).isoformat(),
+                    hard_deadline_at=deadline_at.isoformat(),
                     detail=f"delivery retry phase: {checkpoint['phase']}",
                 ),
             )
             status_comment_id = int(status["id"])
+            self._require_delivery_deadline(deadline, "verification")
             verification_result = run_verification(
                 worktree,
                 project_config,
@@ -1222,6 +1245,18 @@ This PR was created as a draft. The worker cannot merge it.
                     "cancelled"
                     if verification_result.termination_reason == "cancel"
                     else "paused"
+                )
+                self.store.set_delivery_checkpoint_state(
+                    repo,
+                    number,
+                    task_hash,
+                    phase=(
+                        "cancelled"
+                        if state == "cancelled"
+                        else "paused-verification"
+                    ),
+                    retryable=state == "paused",
+                    last_error=None,
                 )
                 self.store.upsert_task(
                     repo=repo,
@@ -1238,6 +1273,7 @@ This PR was created as a draft. The worker cannot merge it.
                     "cancelled" if state == "cancelled" else "claimed",
                 )
                 return state
+            self._require_delivery_deadline(deadline, "delivery checkpoint update")
             if not verification_result.passed:
                 raise PolicyError(
                     "delivery retry verification failed:\n"
@@ -1263,16 +1299,10 @@ This PR was created as a draft. The worker cannot merge it.
                     model=checkpoint.get("model"),
                     cli_version=checkpoint.get("cli_version"),
                     session_id=checkpoint.get("session_id"),
-                )
-                self.store.set_delivery_checkpoint_state(
-                    repo,
-                    number,
-                    task_hash,
                     phase="legacy-reconstructed",
-                    retryable=True,
-                    last_error=None,
+                    worker_state_key=legacy_key,
+                    worker_state_value="reconstructed",
                 )
-                self.store.set_worker_state(legacy_key, "reconstructed")
             else:
                 self.store.update_delivery_verification(
                     repo,
@@ -1300,6 +1330,7 @@ This PR was created as a draft. The worker cannot merge it.
                     task_hash,
                     branch,
                     f"{type(exc).__name__}: {exc}",
+                    allow_remote=time.monotonic() < deadline,
                 )
                 return (
                     "needs-attention"
@@ -1308,6 +1339,7 @@ This PR was created as a draft. The worker cannot merge it.
                 )
             return "awaiting-review"
         except Exception as exc:
+            retryable = getattr(exc, "retryable", False) is True
             persisted_checkpoint = self.store.get_delivery_checkpoint(
                 repo,
                 number,
@@ -1318,11 +1350,11 @@ This PR was created as a draft. The worker cannot merge it.
                     repo,
                     number,
                     task_hash,
-                    phase="validation",
-                    retryable=False,
+                    phase="preflight" if retryable else "validation",
+                    retryable=retryable,
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
-            elif attempted_legacy:
+            elif attempted_legacy and not retryable:
                 self.store.set_worker_state(legacy_key, "rejected")
             self._mark_attention(
                 repo,
@@ -1330,8 +1362,9 @@ This PR was created as a draft. The worker cannot merge it.
                 task_hash,
                 branch,
                 f"{type(exc).__name__}: {exc}",
+                allow_remote=time.monotonic() < deadline,
             )
-            return "not-retryable"
+            return "needs-attention" if retryable else "not-retryable"
 
     def revise_issue(
         self,

@@ -25,7 +25,7 @@ class DurableGitHub:
     def _remote_id(result: Any) -> str | None:
         if not isinstance(result, dict):
             return None
-        value = result.get("id") or result.get("number")
+        value = result.get("number") or result.get("id")
         return str(value) if value is not None else None
 
     def _write(self, payload: dict[str, Any]) -> Any:
@@ -33,6 +33,15 @@ class DurableGitHub:
         existing = self.store.get_outbox(outbox_id)
         if existing and existing["delivered_at"]:
             remote_id = existing.get("remote_id")
+            if payload["operation"] == "create_draft_pr":
+                finder = getattr(self.remote, "find_open_pull_request", None)
+                if finder is not None:
+                    pull = finder(payload["repo"], payload["head"])
+                    if pull is not None:
+                        return pull
+                if remote_id and str(remote_id).isdigit():
+                    number = int(remote_id)
+                    return {"id": number, "number": number}
             return {"id": int(remote_id)} if remote_id and str(remote_id).isdigit() else {}
         if existing and existing.get("failed_at"):
             raise RuntimeError(f"outbox delivery permanently failed: {existing.get('last_error', '')}")

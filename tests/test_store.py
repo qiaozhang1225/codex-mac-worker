@@ -154,6 +154,8 @@ def test_delivery_checkpoint_survives_reopen(tmp_path: Path) -> None:
 
     assert checkpoint is not None
     assert checkpoint["commit_sha"] == "2" * 40
+    assert checkpoint["phase"] == "delivery-ready"
+    assert checkpoint["retryable"] is True
 
 
 def test_delivery_checkpoint_rejects_identity_change(tmp_path: Path) -> None:
@@ -170,3 +172,41 @@ def test_delivery_checkpoint_rejects_identity_change(tmp_path: Path) -> None:
         assert str(exc) == "delivery checkpoint identity changed"
     else:
         raise AssertionError("expected delivery checkpoint identity rejection")
+
+
+def test_delivery_checkpoint_evidence_is_immutable(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    payload = checkpoint_payload(tmp_path)
+    store.save_delivery_checkpoint(**payload)
+    changed = dict(payload)
+    changed["model"] = "unexpected-model"
+    changed["verification_result"] = {"passed": False, "commands": []}
+
+    store.save_delivery_checkpoint(**changed)
+
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, "a" * 64)
+    assert checkpoint is not None
+    assert checkpoint["model"] == "gpt-test"
+    assert checkpoint["verification_result"]["passed"] is True
+
+
+def test_legacy_checkpoint_and_reconstruction_marker_are_saved_together(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+    payload = checkpoint_payload(tmp_path)
+
+    store.save_delivery_checkpoint(
+        **payload,
+        phase="legacy-reconstructed",
+        worker_state_key="legacy-delivery-recovery:owner/repo#12:hash",
+        worker_state_value="reconstructed",
+    )
+
+    checkpoint = store.get_delivery_checkpoint("owner/repo", 12, "a" * 64)
+    assert checkpoint is not None
+    assert checkpoint["phase"] == "legacy-reconstructed"
+    assert checkpoint["retryable"] is True
+    assert store.get_worker_state(
+        "legacy-delivery-recovery:owner/repo#12:hash"
+    ) == "reconstructed"
