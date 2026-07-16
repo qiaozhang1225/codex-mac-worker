@@ -87,7 +87,7 @@ class ReviewGitHub:
             ),
             "base": {"ref": "main", "sha": "a" * 40},
             "head": {"ref": "codex/12-bounded", "sha": "c" * 40},
-            "user": {"login": "worker-app[bot]"},
+            "user": {"login": "worker-app[bot]", "type": "Bot"},
             "performed_via_github_app": {"id": 777, "slug": "worker-app"},
             "draft": True,
             "mergeable": True,
@@ -297,6 +297,14 @@ class ReviewGitHub:
         return {"id": len(self.comments)}
 
 
+def github_with_delivery_risk(risk: str) -> ReviewGitHub:
+    github = ReviewGitHub.happy_path()
+    github.pull["body"] = github.pull["body"].replace(
+        "risks: []", f"risks:\n- {risk}"
+    )
+    return github
+
+
 def reviewed_fingerprint(github: ReviewGitHub) -> str:
     from codex_mac_worker.assisted_merge import review_task
 
@@ -316,6 +324,102 @@ def test_review_snapshot_binds_issue_pr_checks_paths_and_threads() -> None:
     assert snapshot.gates.allowed is True
     assert len(snapshot.approval_fingerprint) == 64
     assert snapshot.model == "gpt-test"
+
+
+def test_review_allows_attested_bot_when_pull_app_metadata_is_absent() -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["performed_via_github_app"] = None
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is True
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "malformed",
+        [],
+        777,
+        {},
+        {"slug": "worker-app"},
+        {"id": "777", "slug": "worker-app"},
+    ],
+)
+def test_review_blocks_malformed_pull_app_metadata(metadata: object) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["performed_via_github_app"] = metadata
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is False
+    assert any("GitHub App" in item for item in snapshot.gates.blockers)
+
+
+@pytest.mark.parametrize(
+    ("user", "blocker"),
+    [
+        ({"login": "worker-app[bot]", "type": "User"}, "Bot"),
+        ({"login": "other-worker[bot]", "type": "Bot"}, "identity"),
+    ],
+)
+def test_review_blocks_unattested_pull_author(user: dict[str, str], blocker: str) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["user"] = user
+    github.pull["performed_via_github_app"] = None
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is False
+    assert any(blocker.lower() in item.lower() for item in snapshot.gates.blockers)
+
+
+@pytest.mark.parametrize(
+    "risk",
+    [
+        "Production build has an existing bundle-size warning",
+        "生产构建存在既有的大分块体积警告",
+    ],
+)
+def test_review_allows_benign_production_build_risk(risk: str) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    snapshot = review_task(
+        github_with_delivery_risk(risk), IssueReference("owner/repo", 12)
+    )
+
+    assert snapshot.gates.allowed is True
+
+
+@pytest.mark.parametrize(
+    "risk",
+    [
+        "Production data may be modified",
+        "Production database migration is required",
+        "Production environment deployment is required",
+        "需要修改生产数据",
+        "需要迁移生产数据库",
+        "需要部署到生产环境",
+        "密码可能泄露",
+        "生产 数据可能被修改",
+        "生产-数据库可能被修改",
+    ],
+)
+def test_review_blocks_explicit_production_operation_risk(risk: str) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    snapshot = review_task(
+        github_with_delivery_risk(risk), IssueReference("owner/repo", 12)
+    )
+
+    assert snapshot.gates.allowed is False
+    assert any("risks" in item for item in snapshot.gates.blockers)
 
 
 def test_review_keeps_attested_worker_identity_after_default_branch_advances() -> None:

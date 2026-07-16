@@ -82,9 +82,10 @@ class MergeResult:
 APPROVAL_MARKER = "<!-- codex-human-approval:v1 -->"
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _UNSAFE_RISK_RE = re.compile(
-    r"\b(high|credentials?|secrets?|passwords?|prod(?:uction)?|"
-    r"deploy(?:ment|ed|ing)?|migrations?|irreversible)\b|"
-    r"高风险|凭据|密钥|生产|部署|迁移|不可逆",
+    r"\b(high[-\s]?risk|credentials?|secrets?|passwords?|"
+    r"deploy(?:ment|ed|ing)?|migrations?|irreversible|"
+    r"prod(?:uction)?[\s_-]+(?:data|databases?|environments?))\b|"
+    r"高风险|凭据|密钥|密码|部署|迁移|不可逆|生产[\s_-]*(?:数据|数据库|环境)",
     re.IGNORECASE,
 )
 
@@ -282,7 +283,9 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
     if not head_branch.startswith("codex/"):
         blockers.append("source branch must begin with codex/")
     worker_identity = _authoritative_worker_identity(github, reference.repo)
-    author_login = str(pull.get("user", {}).get("login", ""))
+    pull_user = pull.get("user", {})
+    author_login = str(pull_user.get("login", ""))
+    author_type = str(pull_user.get("type", ""))
     pull_app_metadata = pull.get("performed_via_github_app")
     pull_app_id = (
         pull_app_metadata.get("id")
@@ -295,9 +298,14 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
         )
     else:
         worker_login, worker_app_id = worker_identity
+        if author_type != "Bot":
+            blockers.append("PR author is not a GitHub Bot")
         if author_login != worker_login:
             blockers.append("PR author does not match the attested Worker identity")
-        if pull_app_id != worker_app_id:
+        if pull_app_metadata is not None and (
+            not isinstance(pull_app_metadata, dict)
+            or pull_app_id != worker_app_id
+        ):
             blockers.append("PR was not created by the attested Worker GitHub App")
     if delivery.task_hash != spec.task_hash:
         blockers.append("delivery task hash differs from the frozen Issue task hash")
