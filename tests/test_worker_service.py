@@ -8,7 +8,8 @@ import pytest
 
 import codex_mac_worker.worker as worker_module
 from codex_mac_worker.config import RepositoryConfig, WorkerConfig
-from codex_mac_worker.gitops import GitOperations
+from codex_mac_worker.github import GitHubError
+from codex_mac_worker.gitops import GitError, GitOperations
 from codex_mac_worker.protocol import parse_delivery_block, parse_task_body
 from codex_mac_worker.runner import RunnerResult
 from codex_mac_worker.store import EventStore
@@ -136,6 +137,56 @@ class FakeGitHub:
         return payload
 
 
+def make_worker_fixture(
+    tmp_path: Path,
+) -> tuple[
+    WorkerService,
+    WorkerConfig,
+    FakeGitHub,
+    EventStore,
+    GitOperations,
+    dict,
+]:
+    remote, sha = make_project_remote(tmp_path)
+    issue = {
+        "number": 12,
+        "title": "Bounded task",
+        "body": task_body(sha=sha),
+        "labels": [{"name": "codex:queued"}],
+        "user": {"login": "owner"},
+    }
+    github = FakeGitHub(issue)
+    config = WorkerConfig(
+        "mac-mini",
+        60,
+        120,
+        tmp_path / "state.sqlite3",
+        tmp_path / "cache",
+        tmp_path / "worktrees",
+        tmp_path / "outputs",
+        Path("/tmp/codex"),
+        "123",
+        "456",
+        tmp_path / "app.pem",
+        ("owner",),
+        (RepositoryConfig("owner/repo", str(remote)),),
+    )
+    store = EventStore(config.database_path)
+    operations = GitOperations(
+        cache_root=config.cache_root,
+        worktree_root=config.worktree_root,
+    )
+    service = WorkerService(
+        config=config,
+        github=github,
+        token_provider=lambda: "token",
+        store=store,
+        git=operations,
+        runner=FakeRunner(),
+    )
+    return service, config, github, store, operations, issue
+
+
 def test_worker_processes_bounded_task_into_draft_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -202,6 +253,76 @@ def test_worker_processes_bounded_task_into_draft_pr(
     assert git(tmp_path / "remote.git", "show", "codex/12-bounded-task:src/result.txt") == "implemented"
     assert len(store.list_runs("owner/repo", 12)) == 1
     assert preparation_profiles == ["codex-worker-preparation"]
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(body).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["phase"] == "complete"
+    assert checkpoint["retryable"] is False
+
+
+def test_transient_push_failure_persists_retryable_delivery_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, operations, issue = make_worker_fixture(tmp_path)
+
+    def fail_push(*args: object, **kwargs: object) -> None:
+        raise GitError("connect timed out", retryable=True)
+
+    monkeypatch.setattr(operations, "push", fail_push)
+
+    service.process_issue(config.repositories[0], issue)
+
+    task = store.get_task("owner/repo", 12)
+    assert task is not None and task["state"] == "needs-attention"
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["commit_sha"] == git(Path(task["worktree"]), "rev-parse", "HEAD")
+    assert checkpoint["phase"] == "push"
+    assert checkpoint["retryable"] is True
+    assert checkpoint["model"] == "gpt-test"
+
+
+def test_permanent_push_failure_clears_delivery_retry_eligibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, operations, issue = make_worker_fixture(tmp_path)
+
+    def fail_push(*args: object, **kwargs: object) -> None:
+        raise GitError("authentication failed", retryable=False)
+
+    monkeypatch.setattr(operations, "push", fail_push)
+
+    service.process_issue(config.repositories[0], issue)
+
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["phase"] == "push"
+    assert checkpoint["retryable"] is False
+
+
+def test_transient_pr_failure_preserves_delivery_retry_eligibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, store, _, issue = make_worker_fixture(tmp_path)
+
+    def fail_pr(*args: object, **kwargs: object) -> dict:
+        raise GitHubError("service unavailable", status_code=503, retryable=True)
+
+    monkeypatch.setattr(github, "create_draft_pr", fail_pr)
+
+    service.process_issue(config.repositories[0], issue)
+
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None
+    assert checkpoint["phase"] == "pull-request"
+    assert checkpoint["retryable"] is True
 
 
 def test_worker_rejects_unauthorized_issue_author(tmp_path: Path) -> None:

@@ -31,7 +31,12 @@ from .protocol import (
 )
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
 from .store import EventStore
-from .verification import run_commands, run_verification, scan_for_secrets
+from .verification import (
+    VerificationResult,
+    run_commands,
+    run_verification,
+    scan_for_secrets,
+)
 
 
 STATUS_PREFIX = "codex:"
@@ -478,6 +483,43 @@ This PR was created as a draft. The worker cannot merge it.
             for item in result.commands
         )
 
+    def _serialize_verification(self, result: VerificationResult) -> dict[str, Any]:
+        return {
+            "passed": result.passed,
+            "termination_reason": result.termination_reason,
+            "commands": [
+                {
+                    "command": item.command,
+                    "exit_code": item.exit_code,
+                    "output": item.output[-3000:],
+                }
+                for item in result.commands
+            ],
+        }
+
+    def _project_config_hash(self, worktree: Path) -> str:
+        text = (worktree / ".codex-worker" / "project.toml").read_text(
+            encoding="utf-8"
+        )
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _set_delivery_failure(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        phase: str,
+        exc: Exception,
+    ) -> None:
+        self.store.set_delivery_checkpoint_state(
+            repo,
+            issue_number,
+            task_hash,
+            phase=phase,
+            retryable=getattr(exc, "retryable", False) is True,
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+
     def _command_monitor(self, repo: str, issue_number: int) -> Callable[[], str | None]:
         last_checked = 0.0
         seen = {item["command_id"] for item in self.store.pending_commands(repo, issue_number)}
@@ -807,11 +849,24 @@ This PR was created as a draft. The worker cannot merge it.
                 author_name="Codex Mac Worker",
                 author_email="codex-worker@users.noreply.github.com",
             )
-            self.git.push(
-                prepared.path,
+            self.store.save_delivery_checkpoint(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
                 branch=branch,
-                clone_url=repository.clone_url,
-                token=self.token_provider(),
+                worktree=str(prepared.path),
+                context_commit=spec.context_commit,
+                commit_sha=commit_sha,
+                project_config_hash=self._project_config_hash(prepared.path),
+                verification_profile=spec.verification_profile,
+                verification_commands=project_config.verification[
+                    spec.verification_profile
+                ],
+                verification_result=self._serialize_verification(verification_result),
+                structured_result=structured_result,
+                model=runner_result.model,
+                cli_version=runner_result.cli_version,
+                session_id=runner_result.session_id,
             )
             pr_body = self._delivery_pr_body(
                 issue_number=number,
@@ -822,34 +877,66 @@ This PR was created as a draft. The worker cannot merge it.
                 structured_result=structured_result,
                 verification_result=verification_result,
             )
-            pr = self.github.create_draft_pr(
-                repo,
-                branch,
-                spec.base_branch,
-                f"[Codex #{number}] {issue.get('title', 'Task')}",
-                pr_body,
-            )
-            self.store.upsert_task(
-                repo=repo,
-                issue_number=number,
-                task_hash=task_hash,
-                state="awaiting-review",
-                branch=branch,
-                worktree=str(prepared.path),
-                session_id=runner_result.session_id,
-                pr_number=int(pr["number"]),
-            )
-            self._set_state(repo, issue, "awaiting-review")
-            self.github.update_comment(
-                repo,
-                status_comment_id,
-                self._status_body(
+            try:
+                self.git.push(
+                    prepared.path,
+                    branch=branch,
+                    clone_url=repository.clone_url,
+                    token=self.token_provider(),
+                )
+            except Exception as exc:
+                self._set_delivery_failure(repo, number, task_hash, "push", exc)
+                raise
+            try:
+                pr = self.github.create_draft_pr(
+                    repo,
+                    branch,
+                    spec.base_branch,
+                    f"[Codex #{number}] {issue.get('title', 'Task')}",
+                    pr_body,
+                )
+            except Exception as exc:
+                self._set_delivery_failure(
+                    repo,
+                    number,
+                    task_hash,
+                    "pull-request",
+                    exc,
+                )
+                raise
+            try:
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=number,
                     task_hash=task_hash,
                     state="awaiting-review",
                     branch=branch,
-                    progress_at=iso_now(),
-                    detail=str(pr.get("html_url", "")),
-                ),
+                    worktree=str(prepared.path),
+                    session_id=runner_result.session_id,
+                    pr_number=int(pr["number"]),
+                )
+                self._set_state(repo, issue, "awaiting-review")
+                self.github.update_comment(
+                    repo,
+                    status_comment_id,
+                    self._status_body(
+                        task_hash=task_hash,
+                        state="awaiting-review",
+                        branch=branch,
+                        progress_at=iso_now(),
+                        detail=str(pr.get("html_url", "")),
+                    ),
+                )
+            except Exception as exc:
+                self._set_delivery_failure(repo, number, task_hash, "finalize", exc)
+                raise
+            self.store.set_delivery_checkpoint_state(
+                repo,
+                number,
+                task_hash,
+                phase="complete",
+                retryable=False,
+                last_error=None,
             )
         except Exception as exc:
             self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
