@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -31,12 +32,19 @@ from .protocol import (
 )
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
 from .store import EventStore
-from .verification import run_commands, run_verification, scan_for_secrets
+from .verification import (
+    CommandResult,
+    VerificationResult,
+    run_commands,
+    run_verification,
+    scan_for_secrets,
+)
 
 
 STATUS_PREFIX = "codex:"
 TERMINAL_STATES = {"awaiting-review", "needs-attention", "completed", "cancelled"}
 AUTHORIZED_PERMISSIONS = {"admin", "maintain", "write"}
+DELIVERY_RETRY_TIMEOUT_SECONDS = 1800
 
 
 class GitHubPort(Protocol):
@@ -153,6 +161,8 @@ class WorkerService:
         task_hash: str,
         branch: str,
         detail: str,
+        *,
+        allow_remote: bool = True,
     ) -> None:
         number = int(issue["number"])
         self.store.upsert_task(
@@ -162,18 +172,19 @@ class WorkerService:
             state="needs-attention",
             branch=branch or None,
         )
-        self._set_state(repo, issue, "needs-attention")
-        self.github.add_comment(
-            repo,
-            number,
-            self._status_body(
-                task_hash=task_hash,
-                state="needs-attention",
-                branch=branch,
-                progress_at=iso_now(),
-                detail=detail[:4000],
-            ),
-        )
+        if allow_remote:
+            self._set_state(repo, issue, "needs-attention")
+            self.github.add_comment(
+                repo,
+                number,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="needs-attention",
+                    branch=branch,
+                    progress_at=iso_now(),
+                    detail=detail[:4000],
+                ),
+            )
 
     def _validate_context_files(self, worktree: Path, paths: tuple[str, ...]) -> None:
         root = worktree.resolve()
@@ -377,8 +388,26 @@ class WorkerService:
             payload = json.loads(result.last_message)
         except json.JSONDecodeError as exc:
             raise PolicyError("Codex returned an invalid structured result") from exc
-        if not isinstance(payload, dict) or payload.get("status") != "completed":
+        if not isinstance(payload, dict):
+            raise PolicyError("Codex returned an invalid structured result")
+        if payload.get("status") != "completed":
             raise PolicyError("Codex reported blocked instead of completed")
+        required_keys = {
+            "status",
+            "summary",
+            "changed_files",
+            "risks",
+            "needs_human",
+            "acceptance_results",
+        }
+        if set(payload) != required_keys:
+            raise PolicyError("Codex result fields do not match the frozen result schema")
+        if not isinstance(payload["summary"], str) or not payload["summary"].strip():
+            raise PolicyError("Codex result summary must not be empty")
+        if not isinstance(payload["changed_files"], list) or not all(
+            isinstance(item, str) for item in payload["changed_files"]
+        ):
+            raise PolicyError("Codex changed_files must be a string list")
 
         acceptance_results = payload.get("acceptance_results")
         if not isinstance(acceptance_results, list) or len(acceptance_results) != len(
@@ -477,6 +506,175 @@ This PR was created as a draft. The worker cannot merge it.
             f"$ {item.command}\nexit={item.exit_code}\n{item.output[-3000:]}"
             for item in result.commands
         )
+
+    def _serialize_verification(self, result: VerificationResult) -> dict[str, Any]:
+        return {
+            "passed": result.passed,
+            "termination_reason": result.termination_reason,
+            "commands": [
+                {
+                    "command": item.command,
+                    "exit_code": item.exit_code,
+                    "output": item.output[-3000:],
+                }
+                for item in result.commands
+            ],
+        }
+
+    def _project_config_hash(self, worktree: Path) -> str:
+        text = (worktree / ".codex-worker" / "project.toml").read_text(
+            encoding="utf-8"
+        )
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _restore_verification(self, payload: dict[str, Any]) -> VerificationResult:
+        commands = tuple(
+            CommandResult(
+                command=str(item["command"]),
+                exit_code=int(item["exit_code"]),
+                output=str(item["output"]),
+            )
+            for item in payload["commands"]
+        )
+        return VerificationResult(
+            passed=bool(payload["passed"]),
+            commands=commands,
+            termination_reason=payload.get("termination_reason"),
+        )
+
+    def _set_delivery_failure(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        phase: str,
+        exc: Exception,
+    ) -> None:
+        self.store.set_delivery_checkpoint_state(
+            repo,
+            issue_number,
+            task_hash,
+            phase=phase,
+            retryable=getattr(exc, "retryable", False) is True,
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+
+    @staticmethod
+    def _require_delivery_deadline(
+        deadline_monotonic: float | None,
+        phase: str,
+    ) -> None:
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise RunnerTimeout(
+                f"delivery retry hard timeout exceeded before {phase}"
+            )
+
+    def _checkpoint_runner_result(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> RunnerResult:
+        return RunnerResult(
+            exit_code=0,
+            session_id=checkpoint.get("session_id"),
+            events=(),
+            last_message=json.dumps(
+                checkpoint["structured_result"],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            stderr="",
+            model=checkpoint.get("model"),
+            cli_version=checkpoint.get("cli_version"),
+        )
+
+    def _deliver_checkpoint(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        spec: Any,
+        checkpoint: dict[str, Any],
+        verification_result: VerificationResult,
+        *,
+        status_comment_id: int,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        repo = repository.name
+        number = int(issue["number"])
+        task_hash = str(checkpoint["task_hash"])
+        branch = str(checkpoint["branch"])
+        worktree = Path(str(checkpoint["worktree"]))
+        runner_result = self._checkpoint_runner_result(checkpoint)
+        pr_body = self._delivery_pr_body(
+            issue_number=number,
+            spec=spec,
+            task_hash=task_hash,
+            commit_sha=str(checkpoint["commit_sha"]),
+            runner_result=runner_result,
+            structured_result=checkpoint["structured_result"],
+            verification_result=verification_result,
+        )
+        try:
+            self._require_delivery_deadline(deadline_monotonic, "push")
+            self.git.push(
+                worktree,
+                branch=branch,
+                clone_url=repository.clone_url,
+                token=self.token_provider(),
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "push", exc)
+            raise
+        try:
+            self._require_delivery_deadline(deadline_monotonic, "pull request")
+            pr = self.github.create_draft_pr(
+                repo,
+                branch,
+                spec.base_branch,
+                f"[Codex #{number}] {issue.get('title', 'Task')}",
+                pr_body,
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "pull-request", exc)
+            raise
+        try:
+            self._require_delivery_deadline(deadline_monotonic, "finalization")
+            self._set_state(repo, issue, "awaiting-review")
+            self._require_delivery_deadline(deadline_monotonic, "status comment")
+            self.github.update_comment(
+                repo,
+                status_comment_id,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="awaiting-review",
+                    branch=branch,
+                    progress_at=iso_now(),
+                    detail=str(pr.get("html_url", "")),
+                ),
+            )
+            self._require_delivery_deadline(deadline_monotonic, "local finalization")
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
+                state="awaiting-review",
+                branch=branch,
+                worktree=str(worktree),
+                session_id=checkpoint.get("session_id"),
+                pr_number=int(pr["number"]),
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "finalize", exc)
+            raise
+        self.store.set_delivery_checkpoint_state(
+            repo,
+            number,
+            task_hash,
+            phase="complete",
+            retryable=False,
+            last_error=None,
+        )
+        return pr
 
     def _command_monitor(self, repo: str, issue_number: int) -> Callable[[], str | None]:
         last_checked = 0.0
@@ -807,52 +1005,389 @@ This PR was created as a draft. The worker cannot merge it.
                 author_name="Codex Mac Worker",
                 author_email="codex-worker@users.noreply.github.com",
             )
-            self.git.push(
-                prepared.path,
-                branch=branch,
-                clone_url=repository.clone_url,
-                token=self.token_provider(),
-            )
-            pr_body = self._delivery_pr_body(
+            self.store.save_delivery_checkpoint(
+                repo=repo,
                 issue_number=number,
-                spec=spec,
                 task_hash=task_hash,
+                branch=branch,
+                worktree=str(prepared.path),
+                context_commit=spec.context_commit,
                 commit_sha=commit_sha,
-                runner_result=runner_result,
+                project_config_hash=self._project_config_hash(prepared.path),
+                verification_profile=spec.verification_profile,
+                verification_commands=project_config.verification[
+                    spec.verification_profile
+                ],
+                verification_result=self._serialize_verification(verification_result),
                 structured_result=structured_result,
-                verification_result=verification_result,
+                model=runner_result.model,
+                cli_version=runner_result.cli_version,
+                session_id=runner_result.session_id,
             )
-            pr = self.github.create_draft_pr(
-                repo,
-                branch,
-                spec.base_branch,
-                f"[Codex #{number}] {issue.get('title', 'Task')}",
-                pr_body,
+            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+            assert checkpoint is not None
+            self._deliver_checkpoint(
+                repository,
+                issue,
+                spec,
+                checkpoint,
+                verification_result,
+                status_comment_id=status_comment_id,
             )
+        except Exception as exc:
+            self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
+
+    def _legacy_delivery_checkpoint_candidate(
+        self,
+        repo: str,
+        issue_number: int,
+        task: dict[str, Any],
+        spec: Any,
+    ) -> dict[str, Any]:
+        branch = str(task.get("branch") or "")
+        worktree_value = str(task.get("worktree") or "")
+        session_id = task.get("session_id")
+        if not branch or not worktree_value or not session_id:
+            raise PolicyError("legacy delivery task evidence is incomplete")
+        worktree = Path(worktree_value)
+        if not worktree.is_dir():
+            raise PolicyError("delivery worktree is missing")
+
+        runs = [
+            run
+            for run in self.store.list_runs(repo, issue_number)
+            if run["finished_at"]
+            and run["exit_code"] == 0
+            and isinstance(run.get("result"), dict)
+            and run["result"].get("termination_reason") is None
+            and run["result"].get("session_id") == session_id
+        ]
+        if len(runs) != 1:
+            raise PolicyError("legacy delivery requires one matching successful run")
+        run_result = runs[0]["result"]
+        last_message = run_result.get("last_message")
+        if not isinstance(last_message, str) or not last_message:
+            raise PolicyError("legacy delivery final message is missing")
+        runner_result = RunnerResult(
+            exit_code=0,
+            session_id=str(session_id),
+            events=(),
+            last_message=last_message,
+            stderr="",
+            model=run_result.get("model"),
+            cli_version=run_result.get("cli_version"),
+        )
+        structured_result = self._require_completed_result(runner_result, spec)
+        project_config = load_project_config(
+            worktree / ".codex-worker" / "project.toml"
+        )
+        verification_commands = project_config.verification.get(
+            spec.verification_profile
+        )
+        if verification_commands is None:
+            raise PolicyError("legacy delivery verification profile is missing")
+        return {
+            "repo": repo,
+            "issue_number": issue_number,
+            "task_hash": spec.task_hash,
+            "branch": branch,
+            "worktree": worktree_value,
+            "context_commit": spec.context_commit,
+            "commit_sha": self.git.current_head(worktree),
+            "project_config_hash": self._project_config_hash(worktree),
+            "verification_profile": spec.verification_profile,
+            "verification_commands": list(verification_commands),
+            "verification_result": {"passed": False, "commands": []},
+            "structured_result": structured_result,
+            "model": runner_result.model,
+            "cli_version": runner_result.cli_version,
+            "session_id": runner_result.session_id,
+            "phase": "legacy-reconstruction",
+            "retryable": True,
+        }
+
+    def retry_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> str:
+        """Retry only a retained verified delivery commit; never invoke Codex."""
+        deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
+        deadline_at = datetime.now(UTC) + timedelta(
+            seconds=DELIVERY_RETRY_TIMEOUT_SECONDS
+        )
+        scope_factory = getattr(self.github, "request_deadline", None)
+        scope = (
+            scope_factory(deadline)
+            if scope_factory is not None
+            else nullcontext()
+        )
+        with scope:
+            return self._retry_delivery_bounded(
+                repository,
+                issue,
+                deadline=deadline,
+                deadline_at=deadline_at,
+            )
+
+    def _retry_delivery_bounded(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        *,
+        deadline: float,
+        deadline_at: datetime,
+    ) -> str:
+        repo = repository.name
+        number = int(issue["number"])
+        task = self.store.get_task(repo, number)
+        task_hash = str(task.get("task_hash", "invalid")) if task else "invalid"
+        branch = str(task.get("branch") or "") if task else ""
+        checkpoint = (
+            self.store.get_delivery_checkpoint(repo, number, task_hash)
+            if task is not None
+            else None
+        )
+        attempted_legacy = checkpoint is None
+        legacy_key = f"legacy-delivery-recovery:{repo}#{number}:{task_hash}"
+        try:
+            if task is None:
+                raise PolicyError("delivery retry task record is missing")
+
+            self._validate_issue_author(repo, issue)
+            self._require_delivery_deadline(deadline, "task authorization")
+            spec = parse_task_body(str(issue.get("body", "")))
+            if spec.task_hash != task_hash:
+                raise PolicyError("task body changed after delivery checkpoint")
+            self.validate_repository_authority(repository)
+            self._require_delivery_deadline(deadline, "repository authorization")
+            if checkpoint is None:
+                if self.store.get_worker_state(legacy_key) == "rejected":
+                    raise PolicyError("legacy delivery reconstruction was rejected")
+                checkpoint = self._legacy_delivery_checkpoint_candidate(
+                    repo,
+                    number,
+                    task,
+                    spec,
+                )
+            elif checkpoint.get("retryable") is not True:
+                raise PolicyError("delivery checkpoint is not retryable")
+            if branch != str(checkpoint["branch"]):
+                raise PolicyError("delivery branch changed after checkpoint")
+            if str(task.get("worktree") or "") != str(checkpoint["worktree"]):
+                raise PolicyError("delivery worktree changed after checkpoint")
+            worktree = Path(str(checkpoint["worktree"]))
+            if not worktree.is_dir():
+                raise PolicyError("delivery worktree is missing")
+            if self.git.current_branch(worktree) != branch:
+                raise PolicyError("delivery branch changed after checkpoint")
+            if not self.git.is_clean(worktree):
+                raise PolicyError("delivery worktree is not clean")
+            if self.git.current_head(worktree) != str(checkpoint["commit_sha"]):
+                raise PolicyError("delivery HEAD changed after checkpoint")
+            if self.git.commit_parents(worktree, str(checkpoint["commit_sha"])) != (
+                spec.context_commit,
+            ):
+                raise PolicyError(
+                    "delivery commit must have the context commit as sole parent"
+                )
+            project_config = load_project_config(
+                worktree / ".codex-worker" / "project.toml"
+            )
+            self._validate_project_worker_app(project_config)
+            self._validate_runtime_policy(worktree)
+            validate_task_policy(spec, project_config)
+            self._validate_context_files(worktree, spec.context_files)
+            if self._project_config_hash(worktree) != str(
+                checkpoint["project_config_hash"]
+            ):
+                raise PolicyError("delivery project config changed after checkpoint")
+            if str(checkpoint["verification_profile"]) != spec.verification_profile:
+                raise PolicyError("delivery verification profile changed after checkpoint")
+            verification_commands = project_config.verification.get(
+                spec.verification_profile
+            )
+            if verification_commands is None or tuple(
+                checkpoint["verification_commands"]
+            ) != verification_commands:
+                raise PolicyError("delivery verification commands changed after checkpoint")
+
+            diff = self.git.diff_summary(worktree, spec.context_commit)
+            if not diff.changed_paths:
+                raise PolicyError("delivery commit has no repository changes")
+            validate_changed_paths(
+                spec,
+                project_config,
+                diff.changed_paths,
+                diff.diff_lines,
+            )
+            scan_for_secrets(worktree, diff.changed_paths)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerTimeout(
+                    "delivery retry hard timeout exceeded before verification"
+                )
             self.store.upsert_task(
                 repo=repo,
                 issue_number=number,
                 task_hash=task_hash,
-                state="awaiting-review",
+                state="retrying",
                 branch=branch,
-                worktree=str(prepared.path),
-                session_id=runner_result.session_id,
-                pr_number=int(pr["number"]),
+                worktree=str(worktree),
+                session_id=task.get("session_id"),
             )
-            self._set_state(repo, issue, "awaiting-review")
-            self.github.update_comment(
+            self._require_delivery_deadline(deadline, "retry status label")
+            self._set_state(repo, issue, "retrying")
+            self._require_delivery_deadline(deadline, "retry status comment")
+            status = self.github.add_comment(
                 repo,
-                status_comment_id,
+                number,
                 self._status_body(
                     task_hash=task_hash,
-                    state="awaiting-review",
+                    state="retrying",
                     branch=branch,
                     progress_at=iso_now(),
-                    detail=str(pr.get("html_url", "")),
+                    hard_deadline_at=deadline_at.isoformat(),
+                    detail=f"delivery retry phase: {checkpoint['phase']}",
                 ),
             )
+            status_comment_id = int(status["id"])
+            self._require_delivery_deadline(deadline, "verification")
+            verification_result = run_verification(
+                worktree,
+                project_config,
+                spec.verification_profile,
+                timeout_seconds=min(remaining, 1800),
+                codex_path=self.config.codex_path if self.config.codex_home else None,
+                codex_home=self.config.codex_home,
+                control_callback=self._command_monitor(repo, number),
+            )
+            if verification_result.termination_reason:
+                state = (
+                    "cancelled"
+                    if verification_result.termination_reason == "cancel"
+                    else "paused"
+                )
+                self.store.set_delivery_checkpoint_state(
+                    repo,
+                    number,
+                    task_hash,
+                    phase=(
+                        "cancelled"
+                        if state == "cancelled"
+                        else "paused-verification"
+                    ),
+                    retryable=state == "paused",
+                    last_error=None,
+                )
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=number,
+                    task_hash=task_hash,
+                    state=state,
+                    branch=branch,
+                    worktree=str(worktree),
+                    session_id=task.get("session_id"),
+                )
+                self._set_state(
+                    repo,
+                    issue,
+                    "cancelled" if state == "cancelled" else "claimed",
+                )
+                return state
+            self._require_delivery_deadline(deadline, "delivery checkpoint update")
+            if not verification_result.passed:
+                raise PolicyError(
+                    "delivery retry verification failed:\n"
+                    + self._verification_detail(verification_result)
+                )
+            serialized_verification = self._serialize_verification(verification_result)
+            if attempted_legacy:
+                self.store.save_delivery_checkpoint(
+                    repo=repo,
+                    issue_number=number,
+                    task_hash=task_hash,
+                    branch=branch,
+                    worktree=str(worktree),
+                    context_commit=spec.context_commit,
+                    commit_sha=str(checkpoint["commit_sha"]),
+                    project_config_hash=str(checkpoint["project_config_hash"]),
+                    verification_profile=spec.verification_profile,
+                    verification_commands=tuple(
+                        checkpoint["verification_commands"]
+                    ),
+                    verification_result=serialized_verification,
+                    structured_result=checkpoint["structured_result"],
+                    model=checkpoint.get("model"),
+                    cli_version=checkpoint.get("cli_version"),
+                    session_id=checkpoint.get("session_id"),
+                    phase="legacy-reconstructed",
+                    worker_state_key=legacy_key,
+                    worker_state_value="reconstructed",
+                )
+            else:
+                self.store.update_delivery_verification(
+                    repo,
+                    number,
+                    task_hash,
+                    serialized_verification,
+                )
+
+            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+            assert checkpoint is not None
+            try:
+                self._deliver_checkpoint(
+                    repository,
+                    issue,
+                    spec,
+                    checkpoint,
+                    verification_result,
+                    status_comment_id=status_comment_id,
+                    deadline_monotonic=deadline,
+                )
+            except Exception as exc:
+                self._mark_attention(
+                    repo,
+                    issue,
+                    task_hash,
+                    branch,
+                    f"{type(exc).__name__}: {exc}",
+                    allow_remote=time.monotonic() < deadline,
+                )
+                return (
+                    "needs-attention"
+                    if getattr(exc, "retryable", False) is True
+                    else "not-retryable"
+                )
+            return "awaiting-review"
         except Exception as exc:
-            self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
+            retryable = getattr(exc, "retryable", False) is True
+            persisted_checkpoint = self.store.get_delivery_checkpoint(
+                repo,
+                number,
+                task_hash,
+            )
+            if persisted_checkpoint is not None:
+                self.store.set_delivery_checkpoint_state(
+                    repo,
+                    number,
+                    task_hash,
+                    phase="preflight" if retryable else "validation",
+                    retryable=retryable,
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+            elif attempted_legacy and not retryable:
+                self.store.set_worker_state(legacy_key, "rejected")
+            self._mark_attention(
+                repo,
+                issue,
+                task_hash,
+                branch,
+                f"{type(exc).__name__}: {exc}",
+                allow_remote=time.monotonic() < deadline,
+            )
+            return "needs-attention" if retryable else "not-retryable"
 
     def revise_issue(
         self,

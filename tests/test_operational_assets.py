@@ -109,6 +109,10 @@ def test_shell_scripts_parse_and_docs_cover_manual_boundaries() -> None:
     assert "codexctl" in macbook
     assert "git_proxy_url" in setup
     assert "proxy → direct → proxy" in operations
+    assert "delivery checkpoint" in operations
+    assert "does not rerun Codex" in operations
+    assert "30-minute" in operations
+    assert "new command ID" in operations
     combined = "\n".join((setup, operations, macbook, (ROOT / "docs" / "SECURITY.md").read_text()))
     for required in (
         "discover_installation_repositories",

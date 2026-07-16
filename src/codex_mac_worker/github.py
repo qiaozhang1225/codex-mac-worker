@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -42,6 +44,32 @@ class GitHubAppAuth:
         )
         self._cached_token: str | None = None
         self._expires_at: datetime | None = None
+        self._deadline_monotonic: float | None = None
+
+    @contextmanager
+    def request_deadline(self, deadline_monotonic: float):
+        previous = self._deadline_monotonic
+        self._deadline_monotonic = (
+            deadline_monotonic
+            if previous is None
+            else min(previous, deadline_monotonic)
+        )
+        try:
+            yield
+        finally:
+            self._deadline_monotonic = previous
+
+    def _request_timeout(self) -> float | None:
+        if self._deadline_monotonic is None:
+            return None
+        remaining = self._deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise GitHubError(
+                "GitHub request deadline exceeded",
+                status_code=None,
+                retryable=False,
+            )
+        return min(30.0, remaining)
 
     def app_jwt(self) -> str:
         now = datetime.now(UTC)
@@ -64,6 +92,10 @@ class GitHubAppAuth:
             and self._expires_at - now > timedelta(minutes=2)
         ):
             return self._cached_token
+        request_options: dict[str, Any] = {}
+        timeout = self._request_timeout()
+        if timeout is not None:
+            request_options["timeout"] = timeout
         response = self._client.post(
             f"/app/installations/{self.installation_id}/access_tokens",
             headers={
@@ -71,6 +103,7 @@ class GitHubAppAuth:
                 "Authorization": f"Bearer {self.app_jwt()}",
                 "X-GitHub-Api-Version": API_VERSION,
             },
+            **request_options,
         )
         if response.status_code != 201:
             raise GitHubError(
@@ -99,6 +132,40 @@ class GitHubClient:
             timeout=30,
             trust_env=False,
         )
+        self._deadline_monotonic: float | None = None
+
+    @contextmanager
+    def request_deadline(self, deadline_monotonic: float):
+        previous = self._deadline_monotonic
+        self._deadline_monotonic = (
+            deadline_monotonic
+            if previous is None
+            else min(previous, deadline_monotonic)
+        )
+        provider_owner = getattr(self._token_provider, "__self__", None)
+        provider_scope = getattr(provider_owner, "request_deadline", None)
+        scope = (
+            provider_scope(self._deadline_monotonic)
+            if provider_scope is not None
+            else nullcontext()
+        )
+        try:
+            with scope:
+                yield
+        finally:
+            self._deadline_monotonic = previous
+
+    def _request_timeout(self) -> float | None:
+        if self._deadline_monotonic is None:
+            return None
+        remaining = self._deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise GitHubError(
+                "GitHub request deadline exceeded",
+                status_code=None,
+                retryable=False,
+            )
+        return min(30.0, remaining)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = {
@@ -106,8 +173,16 @@ class GitHubClient:
             "Authorization": f"Bearer {self._token_provider()}",
             "X-GitHub-Api-Version": API_VERSION,
         }
+        timeout = self._request_timeout()
         try:
-            response = self._client.request(method, path, headers=headers, **kwargs)
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            response = self._client.request(
+                method,
+                path,
+                headers=headers,
+                **kwargs,
+            )
         except httpx.HTTPError as exc:
             raise GitHubError(str(exc), status_code=None, retryable=True) from exc
         if response.status_code >= 400:
