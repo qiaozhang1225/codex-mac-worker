@@ -98,6 +98,30 @@ class EventStore:
                 value_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS delivery_checkpoints (
+                repo TEXT NOT NULL,
+                issue_number INTEGER NOT NULL,
+                task_hash TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                worktree TEXT NOT NULL,
+                context_commit TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                project_config_hash TEXT NOT NULL,
+                verification_profile TEXT NOT NULL,
+                verification_commands_json TEXT NOT NULL,
+                verification_result_json TEXT NOT NULL,
+                structured_result_json TEXT NOT NULL,
+                model TEXT,
+                cli_version TEXT,
+                session_id TEXT,
+                phase TEXT NOT NULL DEFAULT 'checkpointed',
+                retryable INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (repo, issue_number, task_hash)
+            );
             """
         )
         columns = {
@@ -162,6 +186,163 @@ class EventStore:
             (repo, issue_number),
         ).fetchone()
         return dict(row) if row else None
+
+    def save_delivery_checkpoint(
+        self,
+        *,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        branch: str,
+        worktree: str,
+        context_commit: str,
+        commit_sha: str,
+        project_config_hash: str,
+        verification_profile: str,
+        verification_commands: tuple[str, ...],
+        verification_result: dict[str, Any],
+        structured_result: dict[str, Any],
+        model: str | None,
+        cli_version: str | None,
+        session_id: str | None,
+    ) -> None:
+        existing = self.connection.execute(
+            """
+            SELECT branch, worktree, context_commit, commit_sha
+            FROM delivery_checkpoints
+            WHERE repo=? AND issue_number=? AND task_hash=?
+            """,
+            (repo, issue_number, task_hash),
+        ).fetchone()
+        identity = (branch, worktree, context_commit, commit_sha)
+        if existing is not None and tuple(existing) != identity:
+            raise ValueError("delivery checkpoint identity changed")
+
+        now = utc_now()
+        self.connection.execute(
+            """
+            INSERT INTO delivery_checkpoints (
+                repo, issue_number, task_hash, branch, worktree,
+                context_commit, commit_sha, project_config_hash,
+                verification_profile, verification_commands_json,
+                verification_result_json, structured_result_json,
+                model, cli_version, session_id, phase, retryable,
+                last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'checkpointed', 0, NULL, ?, ?)
+            ON CONFLICT(repo, issue_number, task_hash) DO UPDATE SET
+                project_config_hash=excluded.project_config_hash,
+                verification_profile=excluded.verification_profile,
+                verification_commands_json=excluded.verification_commands_json,
+                verification_result_json=excluded.verification_result_json,
+                structured_result_json=excluded.structured_result_json,
+                model=excluded.model,
+                cli_version=excluded.cli_version,
+                session_id=excluded.session_id,
+                updated_at=excluded.updated_at
+            """,
+            (
+                repo,
+                issue_number,
+                task_hash,
+                branch,
+                worktree,
+                context_commit,
+                commit_sha,
+                project_config_hash,
+                verification_profile,
+                json.dumps(verification_commands, ensure_ascii=False, sort_keys=True),
+                json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
+                json.dumps(structured_result, ensure_ascii=False, sort_keys=True),
+                model,
+                cli_version,
+                session_id,
+                now,
+                now,
+            ),
+        )
+        self.connection.commit()
+
+    def get_delivery_checkpoint(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM delivery_checkpoints
+            WHERE repo=? AND issue_number=? AND task_hash=?
+            """,
+            (repo, issue_number, task_hash),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["verification_commands"] = json.loads(
+            item.pop("verification_commands_json")
+        )
+        item["verification_result"] = json.loads(
+            item.pop("verification_result_json")
+        )
+        item["structured_result"] = json.loads(item.pop("structured_result_json"))
+        item["retryable"] = bool(item["retryable"])
+        return item
+
+    def set_delivery_checkpoint_state(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        *,
+        phase: str,
+        retryable: bool,
+        last_error: str | None,
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET phase=?, retryable=?, last_error=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND task_hash=?
+            """,
+            (
+                phase,
+                int(retryable),
+                last_error[:4000] if last_error is not None else None,
+                utc_now(),
+                repo,
+                issue_number,
+                task_hash,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("delivery checkpoint does not exist")
+
+    def update_delivery_verification(
+        self,
+        repo: str,
+        issue_number: int,
+        task_hash: str,
+        verification_result: dict[str, Any],
+    ) -> None:
+        cursor = self.connection.execute(
+            """
+            UPDATE delivery_checkpoints
+            SET verification_result_json=?, updated_at=?
+            WHERE repo=? AND issue_number=? AND task_hash=?
+            """,
+            (
+                json.dumps(verification_result, ensure_ascii=False, sort_keys=True),
+                utc_now(),
+                repo,
+                issue_number,
+                task_hash,
+            ),
+        )
+        self.connection.commit()
+        if cursor.rowcount != 1:
+            raise KeyError("delivery checkpoint does not exist")
 
     def active_tasks(self) -> list[dict[str, Any]]:
         terminal = ("awaiting-review", "completed", "cancelled", "needs-attention")
@@ -292,6 +473,13 @@ class EventStore:
         )
         self.connection.commit()
         return cursor.rowcount == 1
+
+    def get_command(self, command_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM commands WHERE command_id=?",
+            (command_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def pending_commands(self, repo: str, issue_number: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
