@@ -112,6 +112,14 @@ codexctl repo finalize OWNER/REPO#PR --expected-head FULL_HEAD_SHA
 
 将生成的 `worker.toml.example` 复制为 `worker.toml`，填写 GitHub 登录名、数字 App ID 和数字 Installation ID，并启用 `discover_installation_repositories = true`。升级旧安装时保留已有 `[[repositories]]`，先启用发现并验证，再逐步移除静态项。Worker 只发现 App installation 返回、默认分支配置有效且 `worker_github_app_id` 匹配本机 App 的仓库。验证 `codex_path` 与本机实际路径一致。
 
+若 Mac mini 使用可信的本地 HTTP(S) CONNECT 代理，在 `worker.toml` 中明确配置：
+
+```toml
+git_proxy_url = "http://127.0.0.1:7897"
+```
+
+该地址只用于 Worker 自己的 Git 网络命令，不会传给 Codex、preparation 命令或 GitHub API 客户端。代理 URL 不允许包含用户名或密码；留空即关闭。由于 LaunchDaemon 不自动继承 macOS 图形界面的系统代理，仅设置“系统设置”中的代理并不能让 Worker Git 使用它。
+
 再次运行安装：
 
 ```bash

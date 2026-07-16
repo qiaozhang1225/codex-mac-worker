@@ -107,6 +107,8 @@ def test_shell_scripts_parse_and_docs_cover_manual_boundaries() -> None:
         assert required in operations
     assert "dispatch-codex-task" in macbook
     assert "codexctl" in macbook
+    assert "git_proxy_url" in setup
+    assert "proxy → direct → proxy" in operations
     combined = "\n".join((setup, operations, macbook, (ROOT / "docs" / "SECURITY.md").read_text()))
     for required in (
         "discover_installation_repositories",

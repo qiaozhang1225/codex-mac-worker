@@ -30,6 +30,8 @@ codexctl task revise ISSUE_URL --requirements revision.yaml
 
 高风险、权限拒绝、认证失败、磁盘不足、冲突、任务非法、范围越界和测试持续失败都需要人工处理，不应 retry。
 
+配置 `git_proxy_url` 后，Git 网络命令保持三次总尝试上限，路由顺序固定为 `proxy → direct → proxy`。瞬态连接错误才会切换路由；认证、权限、证书、仓库不存在和本地 ref 冲突会立即停止。若本地代理未启动，第二次尝试仍可通过直连完成冷启动任务。
+
 ## 服务与日志
 
 ```bash
