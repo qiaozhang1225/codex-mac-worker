@@ -77,15 +77,23 @@ def _security_fields(payload: dict[str, Any]) -> tuple[Any, ...] | None:
     ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
     if not isinstance(ref_name, dict):
         return None
+    included_refs = ref_name.get("include")
+    excluded_refs = ref_name.get("exclude")
+    merge_methods = pull_request.get("allowed_merge_methods")
+    if not all(
+        isinstance(items, list) and all(isinstance(item, str) for item in items)
+        for items in (included_refs, excluded_refs, merge_methods)
+    ):
+        return None
     return (
         payload.get("name"),
         payload.get("target"),
         payload.get("enforcement"),
-        tuple(ref_name.get("include", [])),
-        tuple(ref_name.get("exclude", [])),
+        tuple(included_refs),
+        tuple(excluded_refs),
         tuple(normalized_bypass),
         tuple(sorted(required_types)),
-        tuple(pull_request.get("allowed_merge_methods", [])),
+        tuple(merge_methods),
         pull_request.get("dismiss_stale_reviews_on_push"),
         pull_request.get("require_code_owner_review"),
         pull_request.get("require_last_push_approval"),

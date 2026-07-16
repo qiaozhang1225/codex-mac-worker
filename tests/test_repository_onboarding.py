@@ -414,6 +414,29 @@ def test_ruleset_classifier_rejects_hybrid_review_settings() -> None:
     assert classify_ruleset(hybrid) is None
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("conditions", "ref_name", "include"), None),
+        (("conditions", "ref_name", "exclude"), "main"),
+        (("rules", "pull_request", "allowed_merge_methods"), None),
+    ],
+)
+def test_ruleset_classifier_rejects_malformed_sequence_fields(
+    path: tuple[str, ...], value: object
+) -> None:
+    payload = ruleset_payload("automatic")
+    if path[0] == "conditions":
+        payload["conditions"]["ref_name"][path[-1]] = value
+    else:
+        pull_request = next(
+            rule for rule in payload["rules"] if rule["type"] == "pull_request"
+        )
+        pull_request["parameters"][path[-1]] = value
+
+    assert classify_ruleset(payload) is None
+
+
 def test_prepare_onboarding_creates_and_pushes_exact_standard_branch(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
