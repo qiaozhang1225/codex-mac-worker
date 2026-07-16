@@ -10,6 +10,7 @@ worktree_root = "__HOME__/Library/Application Support/CodexWorker/worktrees"
 output_root = "__HOME__/Library/Application Support/CodexWorker/outputs"
 codex_path = "/Applications/ChatGPT.app/Contents/Resources/codex"
 codex_home = "__HOME__/Library/Application Support/CodexWorker/codex-home"
+git_proxy_url = ""
 
 github_app_id = "REPLACE_WITH_APP_ID"
 github_installation_id = "REPLACE_WITH_INSTALLATION_ID"

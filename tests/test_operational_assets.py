@@ -42,6 +42,7 @@ clone_url = "https://github.com/owner/repo.git"
     output = capsys.readouterr().out
     assert '"worker_id": "test"' in output
     assert '"discover_installation_repositories": false' in output
+    assert '"git_proxy_url": null' in output
 
 
 def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
@@ -59,6 +60,7 @@ def test_templates_are_valid_and_example_config_loads(tmp_path: Path) -> None:
     assert config.repositories[0].name == "owner/EaseWise"
     assert config.codex_home == tmp_path / "Library/Application Support/CodexWorker/codex-home"
     assert config.discover_installation_repositories is True
+    assert config.git_proxy_url is None
 
     permissions = tomllib.loads(
         (ROOT / "templates" / "codex-worker.config.toml").read_text(encoding="utf-8")
