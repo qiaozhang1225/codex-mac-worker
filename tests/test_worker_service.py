@@ -8,12 +8,13 @@ import pytest
 
 import codex_mac_worker.worker as worker_module
 from codex_mac_worker.config import RepositoryConfig, WorkerConfig
+from codex_mac_worker.durable_github import DurableGitHub
 from codex_mac_worker.github import GitHubError
 from codex_mac_worker.gitops import GitError, GitOperations
 from codex_mac_worker.protocol import parse_delivery_block, parse_task_body
 from codex_mac_worker.runner import RunnerResult
 from codex_mac_worker.store import EventStore
-from codex_mac_worker.verification import VerificationResult
+from codex_mac_worker.verification import CommandResult, VerificationResult
 from codex_mac_worker.worker import WorkerService
 
 from .test_protocol import VALID_SHA, task_body
@@ -323,6 +324,215 @@ def test_transient_pr_failure_preserves_delivery_retry_eligibility(
     assert checkpoint is not None
     assert checkpoint["phase"] == "pull-request"
     assert checkpoint["retryable"] is True
+
+
+def prepare_transient_push_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[WorkerService, WorkerConfig, FakeGitHub, EventStore, dict]:
+    service, config, github, store, operations, issue = make_worker_fixture(tmp_path)
+    real_push = operations.push
+
+    def fail_push(*args: object, **kwargs: object) -> None:
+        raise GitError("connect timed out", retryable=True)
+
+    monkeypatch.setattr(operations, "push", fail_push)
+    service.process_issue(config.repositories[0], issue)
+    monkeypatch.setattr(operations, "push", real_push)
+    return service, config, github, store, issue
+
+
+def test_retry_delivery_reuses_checkpoint_without_running_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+    task_hash = parse_task_body(issue["body"]).task_hash
+    original = store.get_delivery_checkpoint("owner/repo", 12, task_hash)
+    assert original is not None and original["retryable"] is True
+
+    class MustNotRun:
+        def run(self, *args: object, **kwargs: object) -> RunnerResult:
+            raise AssertionError("delivery retry invoked Codex")
+
+    service.runner = MustNotRun()
+
+    outcome = service.retry_delivery(config.repositories[0], issue)
+
+    assert outcome == "awaiting-review"
+    task = store.get_task("owner/repo", 12)
+    assert task is not None and task["pr_number"] == 44
+    assert git(tmp_path / "remote.git", "rev-parse", "codex/12-bounded-task") == original[
+        "commit_sha"
+    ]
+    completed = store.get_delivery_checkpoint("owner/repo", 12, task_hash)
+    assert completed is not None and completed["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation, expected",
+    [
+        ("task-body", "task body changed"),
+        ("branch", "branch changed"),
+        ("head", "HEAD changed"),
+        ("dirty", "worktree is not clean"),
+    ],
+)
+def test_retry_delivery_rejects_integrity_drift_before_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected: str,
+) -> None:
+    service, config, github, store, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    worktree = Path(task["worktree"])
+    if mutation == "task-body":
+        issue["body"] = issue["body"].replace("Unit tests pass", "Changed criterion")
+    elif mutation == "branch":
+        git(worktree, "switch", "-c", "unexpected-branch")
+    elif mutation == "head":
+        git(worktree, "config", "user.name", "Test")
+        git(worktree, "config", "user.email", "test@example.com")
+        git(worktree, "commit", "--allow-empty", "-m", "unexpected")
+    elif mutation == "dirty":
+        (worktree / "src" / "result.txt").write_text("dirty\n", encoding="utf-8")
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    pushed = False
+
+    def forbidden_push(*args: object, **kwargs: object) -> None:
+        nonlocal pushed
+        pushed = True
+
+    monkeypatch.setattr(service.git, "push", forbidden_push)
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+    assert pushed is False
+    assert expected in github.comments[-1]
+
+
+def test_retry_delivery_rejects_multiple_parents_before_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, _, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+    spec = parse_task_body(issue["body"])
+    monkeypatch.setattr(
+        service.git,
+        "commit_parents",
+        lambda worktree, commit_sha: (spec.context_commit, "4" * 40),
+    )
+    monkeypatch.setattr(
+        service.git,
+        "push",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("push called")),
+    )
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+    assert "sole parent" in github.comments[-1]
+
+
+def test_retry_delivery_rejects_project_config_hash_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, github, _, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(service, "_project_config_hash", lambda worktree: "f" * 64)
+    monkeypatch.setattr(
+        service.git,
+        "push",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("push called")),
+    )
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+    assert "project config changed" in github.comments[-1]
+
+
+def test_retry_delivery_stops_when_fresh_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "run_verification",
+        lambda *args, **kwargs: VerificationResult(
+            False,
+            (CommandResult("pytest", 1, "failed"),),
+        ),
+    )
+    monkeypatch.setattr(
+        service.git,
+        "push",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("push called")),
+    )
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+    checkpoint = store.get_delivery_checkpoint(
+        "owner/repo", 12, parse_task_body(issue["body"]).task_hash
+    )
+    assert checkpoint is not None and checkpoint["retryable"] is False
+
+
+def test_retry_delivery_rejects_expired_hard_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, _, issue = prepare_transient_push_failure(tmp_path, monkeypatch)
+    monkeypatch.setattr(worker_module, "DELIVERY_RETRY_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(
+        service.git,
+        "push",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("push called")),
+    )
+
+    assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
+
+
+def test_retry_delivery_reconciles_existing_pr_after_ambiguous_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, store, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+
+    class AmbiguousRemote(FakeGitHub):
+        def __init__(self, current_issue: dict) -> None:
+            super().__init__(current_issue)
+            self.existing: dict | None = None
+            self.create_calls = 0
+
+        def find_open_pull_request(self, repo: str, head: str) -> dict | None:
+            if self.existing and self.existing["head"] == head:
+                return self.existing
+            return None
+
+        def create_draft_pr(
+            self,
+            repo: str,
+            head: str,
+            base: str,
+            title: str,
+            body: str,
+        ) -> dict:
+            self.create_calls += 1
+            self.existing = super().create_draft_pr(repo, head, base, title, body)
+            raise GitHubError("response lost", status_code=None, retryable=True)
+
+    remote = AmbiguousRemote(issue)
+    service.github = DurableGitHub(remote, store)
+
+    assert service.retry_delivery(config.repositories[0], issue) == "needs-attention"
+    assert service.retry_delivery(config.repositories[0], issue) == "awaiting-review"
+    assert remote.create_calls == 1
+    assert len(remote.prs) == 1
 
 
 def test_worker_rejects_unauthorized_issue_author(tmp_path: Path) -> None:

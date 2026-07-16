@@ -32,6 +32,7 @@ from .protocol import (
 from .runner import CodexRunner, RunnerResult, RunnerTimeout
 from .store import EventStore
 from .verification import (
+    CommandResult,
     VerificationResult,
     run_commands,
     run_verification,
@@ -42,6 +43,7 @@ from .verification import (
 STATUS_PREFIX = "codex:"
 TERMINAL_STATES = {"awaiting-review", "needs-attention", "completed", "cancelled"}
 AUTHORIZED_PERMISSIONS = {"admin", "maintain", "write"}
+DELIVERY_RETRY_TIMEOUT_SECONDS = 1800
 
 
 class GitHubPort(Protocol):
@@ -503,6 +505,21 @@ This PR was created as a draft. The worker cannot merge it.
         )
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    def _restore_verification(self, payload: dict[str, Any]) -> VerificationResult:
+        commands = tuple(
+            CommandResult(
+                command=str(item["command"]),
+                exit_code=int(item["exit_code"]),
+                output=str(item["output"]),
+            )
+            for item in payload["commands"]
+        )
+        return VerificationResult(
+            passed=bool(payload["passed"]),
+            commands=commands,
+            termination_reason=payload.get("termination_reason"),
+        )
+
     def _set_delivery_failure(
         self,
         repo: str,
@@ -519,6 +536,108 @@ This PR was created as a draft. The worker cannot merge it.
             retryable=getattr(exc, "retryable", False) is True,
             last_error=f"{type(exc).__name__}: {exc}",
         )
+
+    def _checkpoint_runner_result(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> RunnerResult:
+        return RunnerResult(
+            exit_code=0,
+            session_id=checkpoint.get("session_id"),
+            events=(),
+            last_message=json.dumps(
+                checkpoint["structured_result"],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            stderr="",
+            model=checkpoint.get("model"),
+            cli_version=checkpoint.get("cli_version"),
+        )
+
+    def _deliver_checkpoint(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        spec: Any,
+        checkpoint: dict[str, Any],
+        verification_result: VerificationResult,
+        *,
+        status_comment_id: int,
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        repo = repository.name
+        number = int(issue["number"])
+        task_hash = str(checkpoint["task_hash"])
+        branch = str(checkpoint["branch"])
+        worktree = Path(str(checkpoint["worktree"]))
+        runner_result = self._checkpoint_runner_result(checkpoint)
+        pr_body = self._delivery_pr_body(
+            issue_number=number,
+            spec=spec,
+            task_hash=task_hash,
+            commit_sha=str(checkpoint["commit_sha"]),
+            runner_result=runner_result,
+            structured_result=checkpoint["structured_result"],
+            verification_result=verification_result,
+        )
+        try:
+            self.git.push(
+                worktree,
+                branch=branch,
+                clone_url=repository.clone_url,
+                token=self.token_provider(),
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "push", exc)
+            raise
+        try:
+            pr = self.github.create_draft_pr(
+                repo,
+                branch,
+                spec.base_branch,
+                f"[Codex #{number}] {issue.get('title', 'Task')}",
+                pr_body,
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "pull-request", exc)
+            raise
+        try:
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
+                state="awaiting-review",
+                branch=branch,
+                worktree=str(worktree),
+                session_id=checkpoint.get("session_id"),
+                pr_number=int(pr["number"]),
+            )
+            self._set_state(repo, issue, "awaiting-review")
+            self.github.update_comment(
+                repo,
+                status_comment_id,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="awaiting-review",
+                    branch=branch,
+                    progress_at=iso_now(),
+                    detail=str(pr.get("html_url", "")),
+                ),
+            )
+        except Exception as exc:
+            self._set_delivery_failure(repo, number, task_hash, "finalize", exc)
+            raise
+        self.store.set_delivery_checkpoint_state(
+            repo,
+            number,
+            task_hash,
+            phase="complete",
+            retryable=False,
+            last_error=None,
+        )
+        return pr
 
     def _command_monitor(self, repo: str, issue_number: int) -> Callable[[], str | None]:
         last_checked = 0.0
@@ -868,78 +987,215 @@ This PR was created as a draft. The worker cannot merge it.
                 cli_version=runner_result.cli_version,
                 session_id=runner_result.session_id,
             )
-            pr_body = self._delivery_pr_body(
-                issue_number=number,
-                spec=spec,
-                task_hash=task_hash,
-                commit_sha=commit_sha,
-                runner_result=runner_result,
-                structured_result=structured_result,
-                verification_result=verification_result,
+            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+            assert checkpoint is not None
+            self._deliver_checkpoint(
+                repository,
+                issue,
+                spec,
+                checkpoint,
+                verification_result,
+                status_comment_id=status_comment_id,
             )
-            try:
-                self.git.push(
-                    prepared.path,
+        except Exception as exc:
+            self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
+
+    def retry_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> str:
+        """Retry only a retained verified delivery commit; never invoke Codex."""
+        repo = repository.name
+        number = int(issue["number"])
+        task = self.store.get_task(repo, number)
+        task_hash = str(task.get("task_hash", "invalid")) if task else "invalid"
+        branch = str(task.get("branch") or "") if task else ""
+        checkpoint = (
+            self.store.get_delivery_checkpoint(repo, number, task_hash)
+            if task is not None
+            else None
+        )
+        try:
+            if task is None:
+                raise PolicyError("delivery retry task record is missing")
+            if checkpoint is None or checkpoint.get("retryable") is not True:
+                raise PolicyError("delivery checkpoint is not retryable")
+
+            deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
+            self._validate_issue_author(repo, issue)
+            spec = parse_task_body(str(issue.get("body", "")))
+            if spec.task_hash != task_hash:
+                raise PolicyError("task body changed after delivery checkpoint")
+            self.validate_repository_authority(repository)
+            if branch != str(checkpoint["branch"]):
+                raise PolicyError("delivery branch changed after checkpoint")
+            if str(task.get("worktree") or "") != str(checkpoint["worktree"]):
+                raise PolicyError("delivery worktree changed after checkpoint")
+            worktree = Path(str(checkpoint["worktree"]))
+            if not worktree.is_dir():
+                raise PolicyError("delivery worktree is missing")
+            if self.git.current_branch(worktree) != branch:
+                raise PolicyError("delivery branch changed after checkpoint")
+            if not self.git.is_clean(worktree):
+                raise PolicyError("delivery worktree is not clean")
+            if self.git.current_head(worktree) != str(checkpoint["commit_sha"]):
+                raise PolicyError("delivery HEAD changed after checkpoint")
+            if self.git.commit_parents(worktree, str(checkpoint["commit_sha"])) != (
+                spec.context_commit,
+            ):
+                raise PolicyError(
+                    "delivery commit must have the context commit as sole parent"
+                )
+            project_config = load_project_config(
+                worktree / ".codex-worker" / "project.toml"
+            )
+            self._validate_project_worker_app(project_config)
+            self._validate_runtime_policy(worktree)
+            validate_task_policy(spec, project_config)
+            self._validate_context_files(worktree, spec.context_files)
+            if self._project_config_hash(worktree) != str(
+                checkpoint["project_config_hash"]
+            ):
+                raise PolicyError("delivery project config changed after checkpoint")
+            if str(checkpoint["verification_profile"]) != spec.verification_profile:
+                raise PolicyError("delivery verification profile changed after checkpoint")
+            verification_commands = project_config.verification.get(
+                spec.verification_profile
+            )
+            if verification_commands is None or tuple(
+                checkpoint["verification_commands"]
+            ) != verification_commands:
+                raise PolicyError("delivery verification commands changed after checkpoint")
+
+            diff = self.git.diff_summary(worktree, spec.context_commit)
+            if not diff.changed_paths:
+                raise PolicyError("delivery commit has no repository changes")
+            validate_changed_paths(
+                spec,
+                project_config,
+                diff.changed_paths,
+                diff.diff_lines,
+            )
+            scan_for_secrets(worktree, diff.changed_paths)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerTimeout(
+                    "delivery retry hard timeout exceeded before verification"
+                )
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
+                state="retrying",
+                branch=branch,
+                worktree=str(worktree),
+                session_id=task.get("session_id"),
+            )
+            self._set_state(repo, issue, "retrying")
+            status = self.github.add_comment(
+                repo,
+                number,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="retrying",
                     branch=branch,
-                    clone_url=repository.clone_url,
-                    token=self.token_provider(),
+                    progress_at=iso_now(),
+                    hard_deadline_at=(
+                        datetime.now(UTC)
+                        + timedelta(seconds=DELIVERY_RETRY_TIMEOUT_SECONDS)
+                    ).isoformat(),
+                    detail=f"delivery retry phase: {checkpoint['phase']}",
+                ),
+            )
+            status_comment_id = int(status["id"])
+            verification_result = run_verification(
+                worktree,
+                project_config,
+                spec.verification_profile,
+                timeout_seconds=min(remaining, 1800),
+                codex_path=self.config.codex_path if self.config.codex_home else None,
+                codex_home=self.config.codex_home,
+                control_callback=self._command_monitor(repo, number),
+            )
+            if verification_result.termination_reason:
+                state = (
+                    "cancelled"
+                    if verification_result.termination_reason == "cancel"
+                    else "paused"
                 )
-            except Exception as exc:
-                self._set_delivery_failure(repo, number, task_hash, "push", exc)
-                raise
-            try:
-                pr = self.github.create_draft_pr(
-                    repo,
-                    branch,
-                    spec.base_branch,
-                    f"[Codex #{number}] {issue.get('title', 'Task')}",
-                    pr_body,
-                )
-            except Exception as exc:
-                self._set_delivery_failure(
-                    repo,
-                    number,
-                    task_hash,
-                    "pull-request",
-                    exc,
-                )
-                raise
-            try:
                 self.store.upsert_task(
                     repo=repo,
                     issue_number=number,
                     task_hash=task_hash,
-                    state="awaiting-review",
+                    state=state,
                     branch=branch,
-                    worktree=str(prepared.path),
-                    session_id=runner_result.session_id,
-                    pr_number=int(pr["number"]),
+                    worktree=str(worktree),
+                    session_id=task.get("session_id"),
                 )
-                self._set_state(repo, issue, "awaiting-review")
-                self.github.update_comment(
+                self._set_state(
                     repo,
-                    status_comment_id,
-                    self._status_body(
-                        task_hash=task_hash,
-                        state="awaiting-review",
-                        branch=branch,
-                        progress_at=iso_now(),
-                        detail=str(pr.get("html_url", "")),
-                    ),
+                    issue,
+                    "cancelled" if state == "cancelled" else "claimed",
                 )
-            except Exception as exc:
-                self._set_delivery_failure(repo, number, task_hash, "finalize", exc)
-                raise
-            self.store.set_delivery_checkpoint_state(
+                return state
+            if not verification_result.passed:
+                raise PolicyError(
+                    "delivery retry verification failed:\n"
+                    + self._verification_detail(verification_result)
+                )
+            self.store.update_delivery_verification(
                 repo,
                 number,
                 task_hash,
-                phase="complete",
-                retryable=False,
-                last_error=None,
+                self._serialize_verification(verification_result),
             )
+
+            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+            assert checkpoint is not None
+            try:
+                self._deliver_checkpoint(
+                    repository,
+                    issue,
+                    spec,
+                    checkpoint,
+                    verification_result,
+                    status_comment_id=status_comment_id,
+                    deadline_monotonic=deadline,
+                )
+            except Exception as exc:
+                self._mark_attention(
+                    repo,
+                    issue,
+                    task_hash,
+                    branch,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                return (
+                    "needs-attention"
+                    if getattr(exc, "retryable", False) is True
+                    else "not-retryable"
+                )
+            return "awaiting-review"
         except Exception as exc:
-            self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
+            if checkpoint is not None:
+                self.store.set_delivery_checkpoint_state(
+                    repo,
+                    number,
+                    task_hash,
+                    phase="validation",
+                    retryable=False,
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+            self._mark_attention(
+                repo,
+                issue,
+                task_hash,
+                branch,
+                f"{type(exc).__name__}: {exc}",
+            )
+            return "not-retryable"
 
     def revise_issue(
         self,
