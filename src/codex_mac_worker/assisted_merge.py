@@ -302,7 +302,10 @@ def review_task(github: Any, reference: IssueReference) -> ReviewSnapshot:
             blockers.append("PR author is not a GitHub Bot")
         if author_login != worker_login:
             blockers.append("PR author does not match the attested Worker identity")
-        if isinstance(pull_app_metadata, dict) and pull_app_id != worker_app_id:
+        if pull_app_metadata is not None and (
+            not isinstance(pull_app_metadata, dict)
+            or pull_app_id != worker_app_id
+        ):
             blockers.append("PR was not created by the attested Worker GitHub App")
     if delivery.task_hash != spec.task_hash:
         blockers.append("delivery task hash differs from the frozen Issue task hash")

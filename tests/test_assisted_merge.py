@@ -338,6 +338,29 @@ def test_review_allows_attested_bot_when_pull_app_metadata_is_absent() -> None:
 
 
 @pytest.mark.parametrize(
+    "metadata",
+    [
+        "malformed",
+        [],
+        777,
+        {},
+        {"slug": "worker-app"},
+        {"id": "777", "slug": "worker-app"},
+    ],
+)
+def test_review_blocks_malformed_pull_app_metadata(metadata: object) -> None:
+    from codex_mac_worker.assisted_merge import review_task
+
+    github = ReviewGitHub.happy_path()
+    github.pull["performed_via_github_app"] = metadata
+
+    snapshot = review_task(github, IssueReference("owner/repo", 12))
+
+    assert snapshot.gates.allowed is False
+    assert any("GitHub App" in item for item in snapshot.gates.blockers)
+
+
+@pytest.mark.parametrize(
     ("user", "blocker"),
     [
         ({"login": "worker-app[bot]", "type": "User"}, "Bot"),
