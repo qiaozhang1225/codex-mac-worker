@@ -743,6 +743,23 @@ This PR was created as a draft. {merge_note}
                 raise PolicyError("automatic merge worktree is not clean")
             self.validate_repository_authority(repository)
 
+            # A merge API call may have succeeded before its response was
+            # persisted. Reconcile that exact remote result before refreshing
+            # main: the squash merge now changes the same paths as the task and
+            # would correctly look like an integration conflict otherwise.
+            pull = self.github.get_pull_request(repo, pr_number)
+            if pull.get("merged_at"):
+                result = automatic_merge_task(
+                    self.github,
+                    self.store,
+                    IssueReference(repo, number),
+                    pr_number=pr_number,
+                    expected_head=str(checkpoint["commit_sha"]),
+                    merge_mode=self.config.merge_mode,
+                )
+                self.store.set_worker_state(attempt_key, 0)
+                return "completed" if result.merged else "merging"
+
             mirror = self.git.mirror_path(repo)
             if not mirror.is_dir():
                 raise PolicyError("automatic merge repository mirror is missing")
