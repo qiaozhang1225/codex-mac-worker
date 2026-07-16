@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 from .store import EventStore
@@ -16,6 +17,17 @@ class DurableGitHub:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.remote, name)
+
+    @contextmanager
+    def request_deadline(self, deadline_monotonic: float):
+        remote_scope = getattr(self.remote, "request_deadline", None)
+        scope = (
+            remote_scope(deadline_monotonic)
+            if remote_scope is not None
+            else nullcontext()
+        )
+        with scope:
+            yield
 
     def _key(self, payload: dict[str, Any]) -> str:
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

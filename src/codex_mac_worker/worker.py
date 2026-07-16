@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -1111,6 +1112,32 @@ This PR was created as a draft. The worker cannot merge it.
         issue: dict[str, Any],
     ) -> str:
         """Retry only a retained verified delivery commit; never invoke Codex."""
+        deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
+        deadline_at = datetime.now(UTC) + timedelta(
+            seconds=DELIVERY_RETRY_TIMEOUT_SECONDS
+        )
+        scope_factory = getattr(self.github, "request_deadline", None)
+        scope = (
+            scope_factory(deadline)
+            if scope_factory is not None
+            else nullcontext()
+        )
+        with scope:
+            return self._retry_delivery_bounded(
+                repository,
+                issue,
+                deadline=deadline,
+                deadline_at=deadline_at,
+            )
+
+    def _retry_delivery_bounded(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        *,
+        deadline: float,
+        deadline_at: datetime,
+    ) -> str:
         repo = repository.name
         number = int(issue["number"])
         task = self.store.get_task(repo, number)
@@ -1123,10 +1150,6 @@ This PR was created as a draft. The worker cannot merge it.
         )
         attempted_legacy = checkpoint is None
         legacy_key = f"legacy-delivery-recovery:{repo}#{number}:{task_hash}"
-        deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
-        deadline_at = datetime.now(UTC) + timedelta(
-            seconds=DELIVERY_RETRY_TIMEOUT_SECONDS
-        )
         try:
             if task is None:
                 raise PolicyError("delivery retry task record is missing")

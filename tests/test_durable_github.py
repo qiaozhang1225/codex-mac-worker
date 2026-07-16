@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -176,3 +177,37 @@ def test_delivered_draft_pr_outbox_rehydrates_full_pull_request(
     assert second["number"] == 44
     assert second["html_url"].endswith("/44")
     assert remote.create_calls == 1
+
+
+def test_durable_github_propagates_request_deadline_to_remote(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "worker.sqlite3")
+
+    class Remote:
+        def __init__(self) -> None:
+            self.active_deadline: float | None = None
+
+        @contextmanager
+        def request_deadline(self, deadline_monotonic: float):
+            self.active_deadline = deadline_monotonic
+            try:
+                yield
+            finally:
+                self.active_deadline = None
+
+        def list_comments(self, repo: str, issue_number: int) -> list[dict]:
+            assert self.active_deadline == 123.0
+            return []
+
+        def add_comment(self, repo: str, issue_number: int, body: str) -> dict:
+            assert self.active_deadline == 123.0
+            return {"id": 99}
+
+    remote = Remote()
+    github = DurableGitHub(remote, store)
+
+    with github.request_deadline(123.0):
+        github.add_comment("owner/repo", 12, "bounded")
+
+    assert remote.active_deadline is None

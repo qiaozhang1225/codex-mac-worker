@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 import sys
@@ -609,6 +610,45 @@ def test_retry_delivery_deadline_stops_before_draft_pr_creation(
 
     assert service.retry_delivery(config.repositories[0], issue) == "not-retryable"
     assert github.prs == []
+
+
+def test_retry_delivery_scopes_all_github_requests_to_hard_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, config, _, _, issue = prepare_transient_push_failure(
+        tmp_path, monkeypatch
+    )
+
+    class DeadlineAwareGitHub(FakeGitHub):
+        def __init__(self, current_issue: dict) -> None:
+            super().__init__(current_issue)
+            self.active_deadline: float | None = None
+            self.seen_deadlines: list[float] = []
+
+        @contextmanager
+        def request_deadline(self, deadline_monotonic: float):
+            self.active_deadline = deadline_monotonic
+            self.seen_deadlines.append(deadline_monotonic)
+            try:
+                yield
+            finally:
+                self.active_deadline = None
+
+        def get_repository(self, repo: str) -> dict:
+            assert self.active_deadline is not None
+            return super().get_repository(repo)
+
+        def create_draft_pr(
+            self, repo: str, head: str, base: str, title: str, body: str
+        ) -> dict:
+            assert self.active_deadline is not None
+            return super().create_draft_pr(repo, head, base, title, body)
+
+    github = DeadlineAwareGitHub(issue)
+    service.github = github
+
+    assert service.retry_delivery(config.repositories[0], issue) == "awaiting-review"
+    assert len(github.seen_deadlines) == 1
 
 
 def test_delivery_phase_rechecks_deadline_after_push(

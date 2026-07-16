@@ -36,7 +36,7 @@ codexctl task revise ISSUE_URL --requirements revision.yaml
 
 checkpoint 在第一次网络写入前以单个 SQLite 事务进入可恢复状态，证据之后不可改写。若重新验证期间收到 `pause`，后续 `resume` 仍走交付重试路径，不会恢复 Codex 会话；若已创建 Draft PR 但命令确认尚未落盘，重启后会用稳定任务状态对账并确认原命令，不会再次执行。
 
-每次交付重试都有独立的 **30-minute** 硬上限。Worker 会在联网前重新核对任务哈希、授权、branch、worktree、HEAD、唯一父提交、项目配置哈希、验证命令、范围、secret 和二进制限制。认证、权限、配置漂移、范围越界或验证失败会永久取消重试资格；只有经过分类的瞬态 Git/GitHub 交付错误可以再次请求重试。
+每次交付重试都有独立的 **30-minute** 硬上限。Worker 会在联网前重新核对任务哈希、授权、branch、worktree、HEAD、唯一父提交、项目配置哈希、验证命令、范围、secret 和二进制限制；GitHub API 和安装令牌请求的单次 HTTP timeout 也会收缩到剩余时间，分页或后续写入不能越过该上限。认证、权限、配置漂移、范围越界或验证失败会永久取消重试资格；只有经过分类的瞬态 Git/GitHub 交付错误可以再次请求重试。
 
 每次操作必须由新的 **new command ID** 和新的明确批准触发。已执行命令即使 Worker 重启也不会重放；进程在命令执行中崩溃时，未完成的命令记录会在恢复后继续，并依靠相同提交和 Draft PR head 分支对账避免重复外部写入。不要直接编辑 SQLite、delivery checkpoint 或 outbox。
 

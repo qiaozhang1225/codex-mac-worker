@@ -5,7 +5,9 @@ from pathlib import Path
 
 import httpx
 import jwt
+import pytest
 
+import codex_mac_worker.github as github_module
 from codex_mac_worker.github import GitHubAppAuth, GitHubClient, GitHubError
 
 
@@ -115,6 +117,101 @@ def test_client_classifies_retryable_and_permission_errors() -> None:
         assert exc.status_code == 403
     else:
         raise AssertionError("expected permission GitHubError")
+
+
+def test_client_caps_each_http_request_to_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_timeouts: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"full_name": "owner/repo"})
+
+    monkeypatch.setattr(github_module.time, "monotonic", lambda: 100.0)
+    client = GitHubClient(
+        token_provider=lambda: "token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with client.request_deadline(101.0):
+        client.get_repository("owner/repo")
+
+    assert seen_timeouts == [
+        {"connect": 1.0, "read": 1.0, "write": 1.0, "pool": 1.0}
+    ]
+
+
+def test_client_does_not_start_next_paginated_request_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    moments = iter((100.0, 102.0))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=[{"id": index} for index in range(100)])
+
+    monkeypatch.setattr(github_module.time, "monotonic", lambda: next(moments))
+    client = GitHubClient(
+        token_provider=lambda: "token",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(GitHubError, match="deadline exceeded"):
+        with client.request_deadline(101.0):
+            client.list_issues("owner/repo")
+
+    assert calls == 1
+
+
+def test_client_deadline_also_caps_installation_token_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    key_path = tmp_path / "app.pem"
+    generate_private_key(key_path)
+    seen_timeouts: list[dict[str, float]] = []
+
+    def auth_handler(request: httpx.Request) -> httpx.Response:
+        seen_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(
+            201,
+            json={
+                "token": "installation-token",
+                "expires_at": (
+                    datetime.now(UTC) + timedelta(minutes=30)
+                ).isoformat(),
+            },
+        )
+
+    def api_handler(request: httpx.Request) -> httpx.Response:
+        seen_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"full_name": "owner/repo"})
+
+    moments = iter((100.0, 100.9))
+    monkeypatch.setattr(github_module.time, "monotonic", lambda: next(moments))
+    auth = GitHubAppAuth(
+        app_id="123",
+        installation_id="456",
+        private_key_path=key_path,
+        transport=httpx.MockTransport(auth_handler),
+    )
+    client = GitHubClient(
+        token_provider=auth.installation_token,
+        transport=httpx.MockTransport(api_handler),
+    )
+
+    with client.request_deadline(101.0):
+        client.get_repository("owner/repo")
+
+    assert seen_timeouts == [
+        {"connect": 1.0, "read": 1.0, "write": 1.0, "pool": 1.0},
+        pytest.approx(
+            {"connect": 0.1, "read": 0.1, "write": 0.1, "pool": 0.1}
+        ),
+    ]
 
 
 def test_client_sends_expected_issue_and_pr_requests() -> None:
