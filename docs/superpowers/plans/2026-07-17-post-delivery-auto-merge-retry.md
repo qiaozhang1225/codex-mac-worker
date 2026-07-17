@@ -21,10 +21,12 @@
 
 **Files:**
 - Modify: `src/codex_mac_worker/daemon.py`
+- Modify: `src/codex_mac_worker/store.py`
 - Test: `tests/test_daemon.py`
 
 **Interfaces:**
 - Consumes: `EventStore.get_delivery_checkpoint(repo, issue_number, task_hash) -> dict[str, Any] | None`
+- Consumes: `EventStore.has_executed_command_result(repo, issue_number, results) -> bool`
 - Produces: `WorkerDaemon.process_control_commands() -> bool` routes an eligible `retry` to durable state `merging` without calling `WorkerService.retry_delivery`
 
 - [ ] **Step 1: Write the failing regression test**
@@ -77,9 +79,16 @@ completed_automatic_delivery = (
     and not isinstance(task.get("pr_number"), bool)
     and checkpoint is not None
     and checkpoint.get("phase") == "complete"
-    and checkpoint.get("retryable") is False
+and checkpoint.get("retryable") is False
 )
 ```
+
+For the one legacy state produced by the old retry path, also accept
+`phase="validation"` only when `last_error` exactly equals
+`PolicyError: delivery checkpoint is not retryable` and an earlier executed
+command result is `awaiting-review` or `merging`. Add a negative assertion that
+the same validation checkpoint without prior success evidence still calls
+`retry_delivery`.
 
 When true, upsert the task as `merging` while preserving branch, worktree,
 session ID, and PR number; call `_set_remote_state(..., "merging")`; mark the
@@ -112,7 +121,7 @@ Expected: both commands exit `0`.
 ```bash
 git add docs/superpowers/specs/2026-07-17-post-delivery-auto-merge-retry-design.md \
   docs/superpowers/plans/2026-07-17-post-delivery-auto-merge-retry.md \
-  src/codex_mac_worker/daemon.py tests/test_daemon.py
+  src/codex_mac_worker/daemon.py src/codex_mac_worker/store.py tests/test_daemon.py
 git commit -m "Fix automatic merge policy retries"
 ```
 

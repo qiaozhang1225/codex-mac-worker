@@ -292,6 +292,175 @@ def test_daemon_routes_retry_to_delivery_without_process_issue(tmp_path: Path) -
     assert command is not None and command["result"] == "awaiting-review"
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_phase", "checkpoint_error", "prior_command_result"),
+    [
+        ("complete", None, None),
+        (
+            "validation",
+            "PolicyError: delivery checkpoint is not retryable",
+            "awaiting-review",
+        ),
+    ],
+)
+def test_retry_rearms_completed_automatic_delivery_for_merge_loop(
+    tmp_path: Path,
+    checkpoint_phase: str,
+    checkpoint_error: str | None,
+    prior_command_result: str | None,
+) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        session_id="codex-session-must-not-run",
+        pr_number=44,
+    )
+    store.save_delivery_checkpoint(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        context_commit="1" * 40,
+        commit_sha="2" * 40,
+        project_config_hash="3" * 64,
+        verification_profile="fast",
+        verification_commands=("pytest -q",),
+        verification_result={"passed": True, "commands": []},
+        structured_result={"status": "completed"},
+        model="gpt-test",
+        cli_version="codex-test",
+        session_id="codex-session-must-not-run",
+    )
+    store.set_delivery_checkpoint_state(
+        "owner/repo",
+        9,
+        "hash",
+        phase=checkpoint_phase,
+        retryable=False,
+        last_error=checkpoint_error,
+    )
+    if prior_command_result is not None:
+        store.record_command(
+            "cmd-prior-delivery", "owner/repo", 9, "retry", "owner"
+        )
+        store.mark_command_executed(
+            "cmd-prior-delivery", prior_command_result
+        )
+    store.record_command("cmd-auto-retry", "owner/repo", 9, "retry", "owner")
+
+    class LabelGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.label_updates: list[list[str]] = []
+
+        def get_issue(self, repo: str, issue_number: int) -> dict:
+            return {
+                "number": issue_number,
+                "labels": [{"name": "codex:needs-attention"}],
+            }
+
+        def set_labels(
+            self,
+            repo: str,
+            issue_number: int,
+            labels: list[str],
+        ) -> dict:
+            self.label_updates.append(labels)
+            return {"labels": labels}
+
+    github = LabelGitHub()
+    service = FakeService()
+    daemon = WorkerDaemon(settings, github, store, service)
+
+    assert daemon.process_control_commands() is True
+
+    task = store.get_task("owner/repo", 9)
+    command = store.get_command("cmd-auto-retry")
+    assert task is not None and task["state"] == "merging"
+    assert task["pr_number"] == 44
+    assert task["session_id"] == "codex-session-must-not-run"
+    assert command is not None and command["result"] == "merging"
+    assert service.delivery_retried == []
+    assert service.processed == []
+    assert github.label_updates[-1] == ["codex:merging"]
+
+    assert daemon.process_review_tasks() is True
+    assert service.auto_merge_calls == [9]
+    assert store.get_task("owner/repo", 9)["state"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("task_state", "checkpoint_phase", "checkpoint_error"),
+    [
+        (
+            "needs-attention",
+            "validation",
+            "PolicyError: delivery checkpoint is not retryable",
+        ),
+        ("paused", "complete", None),
+    ],
+)
+def test_retry_does_not_adopt_checkpoint_outside_eligible_state(
+    tmp_path: Path,
+    task_state: str,
+    checkpoint_phase: str,
+    checkpoint_error: str | None,
+) -> None:
+    settings = automatic_config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state=task_state,
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        pr_number=44,
+    )
+    store.save_delivery_checkpoint(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+        context_commit="1" * 40,
+        commit_sha="2" * 40,
+        project_config_hash="3" * 64,
+        verification_profile="fast",
+        verification_commands=("pytest -q",),
+        verification_result={"passed": True, "commands": []},
+        structured_result={"status": "completed"},
+        model="gpt-test",
+        cli_version="codex-test",
+        session_id=None,
+    )
+    store.set_delivery_checkpoint_state(
+        "owner/repo",
+        9,
+        "hash",
+        phase=checkpoint_phase,
+        retryable=False,
+        last_error=checkpoint_error,
+    )
+    store.record_command("cmd-unsafe-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+
+    assert service.delivery_retried == [9]
+    assert store.get_task("owner/repo", 9)["state"] == "retrying"
+    command = store.get_command("cmd-unsafe-retry")
+    assert command is not None and command["result"] == "awaiting-review"
+
+
 def test_pending_retry_command_resumes_after_crash_without_comment(
     tmp_path: Path,
 ) -> None:

@@ -19,6 +19,13 @@ automatic merge when all of the following durable facts are present:
 - the matching delivery checkpoint exists;
 - the checkpoint phase is `complete` and `retryable` is false.
 
+One bounded legacy-recovery case is also accepted for a checkpoint that an
+older Worker already changed from `complete` to `validation`: its exact error
+must be `PolicyError: delivery checkpoint is not retryable`, and the commands
+table must contain an earlier executed delivery command whose result was
+`awaiting-review` or `merging`. Without that prior success evidence, a
+validation checkpoint remains on the ordinary delivery-retry path.
+
 The daemon changes the task state to `merging`, updates the remote lifecycle
 label, and records the command result as `merging`. It does not call
 `retry_delivery`, `process_issue`, or the Codex runner. The normal automatic

@@ -308,6 +308,48 @@ class WorkerDaemon:
                 self.store.mark_command_executed(command_id, "cancel")
                 return True
             if action == "retry":
+                checkpoint = self.store.get_delivery_checkpoint(
+                    repo, issue_number, str(task["task_hash"])
+                )
+                pr_number = task.get("pr_number")
+                legacy_completed_delivery = (
+                    checkpoint is not None
+                    and checkpoint.get("phase") == "validation"
+                    and checkpoint.get("retryable") is False
+                    and checkpoint.get("last_error")
+                    == "PolicyError: delivery checkpoint is not retryable"
+                    and self.store.has_executed_command_result(
+                        repo,
+                        issue_number,
+                        ("awaiting-review", "merging"),
+                    )
+                )
+                completed_automatic_delivery = (
+                    self.config.merge_mode == "automatic"
+                    and task.get("state") == "needs-attention"
+                    and isinstance(pr_number, int)
+                    and not isinstance(pr_number, bool)
+                    and checkpoint is not None
+                    and checkpoint.get("retryable") is False
+                    and (
+                        checkpoint.get("phase") == "complete"
+                        or legacy_completed_delivery
+                    )
+                )
+                if completed_automatic_delivery:
+                    self.store.upsert_task(
+                        repo=repo,
+                        issue_number=issue_number,
+                        task_hash=task["task_hash"],
+                        state="merging",
+                        branch=task["branch"],
+                        worktree=task["worktree"],
+                        session_id=task.get("session_id"),
+                        pr_number=pr_number,
+                    )
+                    self._set_remote_state(repo, issue, "merging")
+                    self.store.mark_command_executed(command_id, "merging")
+                    return True
                 self.store.upsert_task(
                     repo=repo,
                     issue_number=issue_number,
