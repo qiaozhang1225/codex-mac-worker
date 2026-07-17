@@ -395,6 +395,11 @@ def test_ruleset_classifier_distinguishes_manual_and_automatic() -> None:
     manual = ruleset_payload("manual")
     automatic = ruleset_payload("automatic")
 
+    manual_types = {rule["type"] for rule in manual["rules"]}
+    automatic_types = {rule["type"] for rule in automatic["rules"]}
+    assert "update" in manual_types
+    assert "update" not in automatic_types
+
     assert classify_ruleset(manual) == "manual"
     assert classify_ruleset(automatic) == "automatic"
 
