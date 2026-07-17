@@ -711,6 +711,26 @@ class EventStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def has_executed_command_result(
+        self,
+        repo: str,
+        issue_number: int,
+        results: tuple[str, ...],
+    ) -> bool:
+        if not results:
+            return False
+        placeholders = ",".join("?" for _ in results)
+        row = self.connection.execute(
+            f"""
+            SELECT 1 FROM commands
+            WHERE repo=? AND issue_number=? AND executed_at IS NOT NULL
+              AND result IN ({placeholders})
+            LIMIT 1
+            """,
+            (repo, issue_number, *results),
+        ).fetchone()
+        return row is not None
+
     def mark_command_executed(self, command_id: str, result: str) -> None:
         self.connection.execute(
             "UPDATE commands SET executed_at=?, result=? WHERE command_id=?",
