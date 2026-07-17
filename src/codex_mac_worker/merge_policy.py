@@ -13,6 +13,25 @@ def ruleset_payload(profile: str = MANUAL) -> dict[str, Any]:
     if profile not in MERGE_MODES:
         raise ValueError(f"unknown Ruleset profile: {profile}")
     automatic = profile == AUTOMATIC
+    rules: list[dict[str, Any]] = [
+        {"type": "deletion"},
+        {"type": "non_fast_forward"},
+    ]
+    if not automatic:
+        rules.append({"type": "update"})
+    rules.append(
+        {
+            "type": "pull_request",
+            "parameters": {
+                "allowed_merge_methods": ["squash"],
+                "dismiss_stale_reviews_on_push": True,
+                "require_code_owner_review": False,
+                "require_last_push_approval": not automatic,
+                "required_approving_review_count": 0 if automatic else 1,
+                "required_review_thread_resolution": True,
+            },
+        }
+    )
     return {
         "name": RULESET_NAME,
         "target": "branch",
@@ -27,22 +46,7 @@ def ruleset_payload(profile: str = MANUAL) -> dict[str, Any]:
                 "bypass_mode": "pull_request",
             }
         ],
-        "rules": [
-            {"type": "deletion"},
-            {"type": "non_fast_forward"},
-            {"type": "update"},
-            {
-                "type": "pull_request",
-                "parameters": {
-                    "allowed_merge_methods": ["squash"],
-                    "dismiss_stale_reviews_on_push": True,
-                    "require_code_owner_review": False,
-                    "require_last_push_approval": not automatic,
-                    "required_approving_review_count": 0 if automatic else 1,
-                    "required_review_thread_resolution": True,
-                },
-            },
-        ],
+        "rules": rules,
     }
 
 
@@ -66,7 +70,7 @@ def _security_fields(payload: dict[str, Any]) -> tuple[Any, ...] | None:
         for item in raw_rules
         if isinstance(item, dict) and isinstance(item.get("type"), str)
     }
-    required_types = frozenset({"deletion", "non_fast_forward", "update", "pull_request"})
+    required_types = frozenset({"deletion", "non_fast_forward", "pull_request"})
     if not required_types.issubset(rules):
         return None
     pull_request = rules["pull_request"].get("parameters")
@@ -92,7 +96,7 @@ def _security_fields(payload: dict[str, Any]) -> tuple[Any, ...] | None:
         tuple(included_refs),
         tuple(excluded_refs),
         tuple(normalized_bypass),
-        tuple(sorted(required_types)),
+        "update" in rules,
         tuple(merge_methods),
         pull_request.get("dismiss_stale_reviews_on_push"),
         pull_request.get("require_code_owner_review"),

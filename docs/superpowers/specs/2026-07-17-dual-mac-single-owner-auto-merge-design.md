@@ -90,6 +90,8 @@ The accepted automatic profile is:
 - no Integration bypass actor;
 - the existing RepositoryRole pull-request bypass is allowed, but the Worker App is not added to a bypass list.
 
+The automatic profile deliberately omits GitHub's `Restrict updates` rule. That rule permits branch updates only by bypass actors; because the Worker App is intentionally not a bypass actor, enabling it would also block the Worker's compliant PR merge. Requiring a PR and blocking non-fast-forward updates still reject direct and history-rewriting pushes.
+
 The current EaseWise Ruleset is this profile and must not be “repaired” back to simulated multi-person approval. A separate manual profile with one approval and last-push approval remains valid for repositories that choose it.
 
 Auto-merge occurs only when both the local mode and repository profile are automatic. Any mismatch leaves the task in manual review or `needs-attention`; it never silently weakens repository policy.
