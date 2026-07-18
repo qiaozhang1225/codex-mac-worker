@@ -969,6 +969,16 @@ This PR was created as a draft. {merge_note}
 
             token = self.token_provider()
             mirror = self.git.ensure_mirror(repo, repository.clone_url, token)
+            # ensure_mirror refreshes remote-tracking refs without touching
+            # branches that may be checked out by retained task worktrees.
+            # Refresh only the requested base branch into refs/heads before
+            # validating the frozen context commit against it.
+            self.git.refresh_branch(
+                mirror,
+                clone_url=repository.clone_url,
+                branch=spec.base_branch,
+                token=token,
+            )
             prepared = self.git.prepare_worktree(
                 repo=repo,
                 mirror=mirror,

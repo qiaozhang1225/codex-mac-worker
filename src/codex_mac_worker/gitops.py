@@ -275,6 +275,17 @@ class GitOperations:
         mirror = self.mirror_path(repo)
         with self._authentication(token) as env:
             if mirror.exists():
+                # A mirror clone maps remote heads directly into refs/heads by
+                # default. Once a task worktree checks out one of those heads,
+                # `remote update` refuses to overwrite it. Keep fetched remote
+                # heads in the normal tracking namespace instead.
+                self._git(
+                    mirror,
+                    "config",
+                    "--replace-all",
+                    "remote.origin.fetch",
+                    "+refs/heads/*:refs/remotes/origin/*",
+                )
                 self._git_network(
                     mirror,
                     "remote",

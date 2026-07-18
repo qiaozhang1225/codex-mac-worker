@@ -350,6 +350,26 @@ class WorkerDaemon:
                     self._set_remote_state(repo, issue, "merging")
                     self.store.mark_command_executed(command_id, "merging")
                     return True
+                pre_execution_failure = (
+                    checkpoint is None
+                    and not task.get("worktree")
+                    and not task.get("session_id")
+                    and not self.store.list_runs(repo, issue_number)
+                )
+                if pre_execution_failure:
+                    self.store.upsert_task(
+                        repo=repo,
+                        issue_number=issue_number,
+                        task_hash=task["task_hash"],
+                        state="retrying",
+                        branch=task["branch"],
+                    )
+                    self._set_remote_state(repo, issue, "retrying")
+                    self.service.process_issue(self._repository(repo), issue)
+                    self.store.mark_command_executed(
+                        command_id, "pre-execution-retry"
+                    )
+                    return True
                 self.store.upsert_task(
                     repo=repo,
                     issue_number=issue_number,
