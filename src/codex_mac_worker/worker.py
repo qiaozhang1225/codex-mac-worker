@@ -436,6 +436,46 @@ class WorkerService:
                 raise PolicyError(f"Codex result field {key} must be a string list")
         return payload
 
+    def _successful_execution_result(
+        self,
+        repo: str,
+        issue_number: int,
+        task: dict[str, Any],
+    ) -> RunnerResult:
+        expected_session_id = task.get("session_id")
+        candidates: list[dict[str, Any]] = []
+        for run in self.store.list_runs(repo, issue_number):
+            result = run.get("result")
+            if (
+                not run.get("finished_at")
+                or run.get("exit_code") != 0
+                or not isinstance(result, dict)
+                or result.get("termination_reason") is not None
+            ):
+                continue
+            session_id = result.get("session_id")
+            last_message = result.get("last_message")
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            if not isinstance(last_message, str) or not last_message:
+                continue
+            if expected_session_id and session_id != expected_session_id:
+                continue
+            candidates.append(result)
+
+        if len(candidates) != 1:
+            raise PolicyError("post-execution recovery requires one successful Codex run")
+        result = candidates[0]
+        return RunnerResult(
+            exit_code=0,
+            session_id=result["session_id"],
+            events=(),
+            last_message=result["last_message"],
+            stderr="",
+            model=result.get("model"),
+            cli_version=result.get("cli_version"),
+        )
+
     def _delivery_pr_body(
         self,
         *,
@@ -1109,6 +1149,20 @@ This PR was created as a draft. {merge_note}
                         "cli_version": runner_result.cli_version,
                     },
                 )
+                if (
+                    runner_result.exit_code == 0
+                    and runner_result.termination_reason is None
+                    and runner_result.session_id
+                ):
+                    self.store.upsert_task(
+                        repo=repo,
+                        issue_number=number,
+                        task_hash=task_hash,
+                        state="running",
+                        branch=branch,
+                        worktree=str(prepared.path),
+                        session_id=runner_result.session_id,
+                    )
                 if runner_result.termination_reason == "cancel":
                     self.store.upsert_task(
                         repo=repo,

@@ -13,6 +13,7 @@ from codex_mac_worker.config import RepositoryConfig, WorkerConfig
 from codex_mac_worker.durable_github import DurableGitHub
 from codex_mac_worker.github import GitHubError
 from codex_mac_worker.gitops import GitError, GitOperations
+from codex_mac_worker.policy import PolicyError
 from codex_mac_worker.protocol import parse_delivery_block, parse_task_body
 from codex_mac_worker.runner import RunnerResult, RunnerTimeout
 from codex_mac_worker.store import EventStore
@@ -273,6 +274,127 @@ def test_worker_processes_bounded_task_into_draft_pr(
     assert checkpoint is not None
     assert checkpoint["phase"] == "complete"
     assert checkpoint["retryable"] is False
+
+
+def test_successful_session_is_persisted_before_delivery_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, config, _, store, _, issue = make_worker_fixture(tmp_path)
+
+    def fail_delivery_guard(*args: object, **kwargs: object) -> None:
+        raise VerificationError("forced guard failure")
+
+    monkeypatch.setattr(service, "_validate_delivery_diff", fail_delivery_guard)
+
+    service.process_issue(config.repositories[0], issue)
+
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+    assert task["state"] == "needs-attention"
+    assert task["worktree"]
+    assert task["session_id"] == "session-1"
+
+
+def prepare_post_execution_failure(
+    tmp_path: Path,
+    *,
+    damage: str | None = None,
+) -> tuple[WorkerService, WorkerConfig, FakeGitHub, EventStore, dict]:
+    service, config, github, store, operations, issue = make_worker_fixture(tmp_path)
+    spec = parse_task_body(issue["body"])
+    mirror = operations.ensure_mirror(
+        "owner/repo",
+        config.repositories[0].clone_url,
+        token="token",
+    )
+    prepared = operations.prepare_worktree(
+        repo="owner/repo",
+        mirror=mirror,
+        context_commit=spec.context_commit,
+        base_branch=spec.base_branch,
+        issue_number=12,
+        slug="bounded-task",
+    )
+    result = FakeRunner().run(prepared.path, "prompt", tmp_path / "schema.json")
+
+    def record_run(
+        *,
+        session_id: str,
+        exit_code: int = 0,
+        termination_reason: str | None = None,
+    ) -> None:
+        run_id = store.start_run("owner/repo", 12)
+        store.finish_run(
+            run_id,
+            exit_code=exit_code,
+            result={
+                "session_id": session_id,
+                "termination_reason": termination_reason,
+                "event_count": len(result.events),
+                "last_message": result.last_message,
+                "model": result.model,
+                "cli_version": result.cli_version,
+            },
+        )
+
+    if damage != "missing-run":
+        record_run(
+            session_id=result.session_id or "session-1",
+            exit_code=1 if damage == "failed-run" else 0,
+            termination_reason="pause" if damage == "terminated-run" else None,
+        )
+    if damage == "ambiguous-run":
+        record_run(session_id="session-2")
+
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=12,
+        task_hash=spec.task_hash,
+        state="needs-attention",
+        branch=prepared.branch,
+        worktree=str(prepared.path),
+        session_id="different-session" if damage == "session-mismatch" else None,
+    )
+    return service, config, github, store, issue
+
+
+def test_successful_execution_result_accepts_issue_19_evidence(
+    tmp_path: Path,
+) -> None:
+    service, _, _, store, _ = prepare_post_execution_failure(tmp_path)
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+
+    result = service._successful_execution_result("owner/repo", 12, task)
+
+    assert result.exit_code == 0
+    assert result.session_id == "session-1"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-run",
+        "failed-run",
+        "terminated-run",
+        "ambiguous-run",
+        "session-mismatch",
+    ],
+)
+def test_successful_execution_result_rejects_ambiguous_evidence(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    service, _, _, store, _ = prepare_post_execution_failure(
+        tmp_path,
+        damage=damage,
+    )
+    task = store.get_task("owner/repo", 12)
+    assert task is not None
+
+    with pytest.raises(PolicyError):
+        service._successful_execution_result("owner/repo", 12, task)
 
 
 @pytest.mark.parametrize(
