@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 import os
@@ -39,17 +40,47 @@ _SECRET_PATTERNS = (
     re.compile(r"LTAI[A-Za-z0-9]{16,}"),
     re.compile(
         r"(?i)(?:api[_-]?key|access[_-]?(?:key[_-]?secret|token)|client[_-]?secret|password)"
-        r"\s*[:=]\s*['\"][^'\"]{12,}"
+        r"['\"]?\s*[:=]\s*['\"][^'\"]{12,}"
     ),
 )
+
+
+def _secret_matches(text: str) -> Counter[str]:
+    return Counter(
+        match.group(0)
+        for pattern in _SECRET_PATTERNS
+        for match in pattern.finditer(text)
+    )
+
+
+def _baseline_text(worktree: Path, baseline_ref: str, relative: str) -> str:
+    result = subprocess.run(
+        ["git", "show", f"{baseline_ref}:{relative}"],
+        cwd=worktree,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.decode("utf-8", errors="replace")
 
 
 def scan_for_secrets(
     worktree: Path,
     changed_paths: list[str] | tuple[str, ...],
     *,
+    baseline_ref: str | None = None,
     max_binary_bytes: int = 1_000_000,
 ) -> None:
+    if baseline_ref is not None:
+        baseline = subprocess.run(
+            ["git", "cat-file", "-e", f"{baseline_ref}^{{commit}}"],
+            cwd=worktree,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if baseline.returncode != 0:
+            raise VerificationError("secret scan baseline commit is unavailable")
     for relative in changed_paths:
         path = worktree / relative
         if not path.exists() or path.is_dir():
@@ -60,7 +91,12 @@ def scan_for_secrets(
                 raise VerificationError(f"binary file exceeds limit: {relative}")
             continue
         text = data.decode("utf-8", errors="replace")
-        if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
+        matches = _secret_matches(text)
+        if baseline_ref is not None:
+            matches -= _secret_matches(
+                _baseline_text(worktree, baseline_ref, relative)
+            )
+        if matches:
             raise VerificationError(f"secret-like content detected: {relative}")
 
 

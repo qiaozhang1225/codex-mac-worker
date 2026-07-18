@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import stat
+import subprocess
 import sys
 
 import pytest
@@ -19,6 +20,16 @@ from codex_mac_worker.verification import (
 
 from .test_config_policy import write_config
 from .test_protocol import task_body
+
+
+def git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
 
 
 def test_execution_prompt_is_bounded_and_never_mentions_goal_mode(tmp_path: Path) -> None:
@@ -259,6 +270,64 @@ def test_secret_scanner_rejects_private_keys_and_tokens(tmp_path: Path) -> None:
 
     with pytest.raises(VerificationError, match="secret-like"):
         scan_for_secrets(tmp_path, ["safe.txt", "unsafe.txt"])
+
+
+def test_secret_scanner_ignores_match_unchanged_from_baseline(
+    tmp_path: Path,
+) -> None:
+    git(tmp_path, "init", "-b", "main")
+    git(tmp_path, "config", "user.name", "Test")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    target = tmp_path / "database.py"
+    target.write_text(
+        "query = \"\"\"UPDATE keys SET secret_ref = "
+        "'admin:aliyun:bailian_api_key:' || id\n"
+        "WHERE provider = 'aliyun'\"\"\"\nvalue = 1\n",
+        encoding="utf-8",
+    )
+    git(tmp_path, "add", "database.py")
+    git(tmp_path, "commit", "-m", "baseline")
+    baseline = git(tmp_path, "rev-parse", "HEAD")
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("value = 1", "value = 2"),
+        encoding="utf-8",
+    )
+
+    scan_for_secrets(tmp_path, ["database.py"], baseline_ref=baseline)
+
+
+@pytest.mark.parametrize(
+    ("baseline_content", "current_content"),
+    [
+        ("safe = True\n", 'password = "this-is-a-new-password"\n'),
+        ("safe = True\n", 'config = {"api_key": "abcdefghijklmnop"}\n'),
+        ("safe = True\n", "-----BEGIN PRIVATE KEY-----\nsecret\n"),
+        ("safe = True\n", "ghp_abcdefghijklmnopqrstuvwxyz123456\n"),
+        ("safe = True\n", "AKIA1234567890ABCDEF\n"),
+        ("safe = True\n", "LTAI5tExampleAccessKey1234\n"),
+        (
+            'password = "this-is-the-old-password"\n',
+            'password = "this-is-the-new-password"\n',
+        ),
+    ],
+)
+def test_baseline_secret_scanner_rejects_new_or_changed_matches(
+    tmp_path: Path,
+    baseline_content: str,
+    current_content: str,
+) -> None:
+    git(tmp_path, "init", "-b", "main")
+    git(tmp_path, "config", "user.name", "Test")
+    git(tmp_path, "config", "user.email", "test@example.com")
+    target = tmp_path / "settings.txt"
+    target.write_text(baseline_content, encoding="utf-8")
+    git(tmp_path, "add", "settings.txt")
+    git(tmp_path, "commit", "-m", "baseline")
+    baseline = git(tmp_path, "rev-parse", "HEAD")
+    target.write_text(current_content, encoding="utf-8")
+
+    with pytest.raises(VerificationError, match="secret-like content detected: settings.txt"):
+        scan_for_secrets(tmp_path, ["settings.txt"], baseline_ref=baseline)
 
 
 @pytest.mark.parametrize(

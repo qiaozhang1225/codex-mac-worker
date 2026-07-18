@@ -54,6 +54,7 @@ class FakeService:
         self.processed: list[int] = []
         self.resumed: list[str | None] = []
         self.delivery_retried: list[int] = []
+        self.execution_retried: list[int] = []
         self.validated: list[str] = []
         self.stopped = False
         self.auto_merge_calls: list[int] = []
@@ -89,6 +90,14 @@ class FakeService:
         issue: dict,
     ) -> str:
         self.delivery_retried.append(issue["number"])
+        return "awaiting-review"
+
+    def retry_execution_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict,
+    ) -> str:
+        self.execution_retried.append(issue["number"])
         return "awaiting-review"
 
     def auto_merge_delivery(
@@ -290,6 +299,81 @@ def test_daemon_routes_retry_to_delivery_without_process_issue(tmp_path: Path) -
     assert service.processed == []
     command = store.get_command("cmd-retry")
     assert command is not None and command["result"] == "awaiting-review"
+
+
+def test_daemon_routes_successful_uncommitted_run_to_execution_recovery(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+    run_id = store.start_run("owner/repo", 9)
+    store.finish_run(
+        run_id,
+        exit_code=0,
+        result={
+            "session_id": "session-1",
+            "termination_reason": None,
+            "last_message": '{"status":"completed"}',
+        },
+    )
+    store.record_command("cmd-execution-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+
+    assert service.execution_retried == [9]
+    assert service.delivery_retried == []
+    assert service.processed == []
+    command = store.get_command("cmd-execution-retry")
+    assert command is not None and command["result"] == "awaiting-review"
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "termination_reason"),
+    [(1, None), (0, "pause")],
+)
+def test_daemon_does_not_route_unsuccessful_run_to_execution_recovery(
+    tmp_path: Path,
+    exit_code: int,
+    termination_reason: str | None,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+        worktree="/tmp/worktree",
+    )
+    run_id = store.start_run("owner/repo", 9)
+    store.finish_run(
+        run_id,
+        exit_code=exit_code,
+        result={
+            "session_id": "session-1",
+            "termination_reason": termination_reason,
+            "last_message": "result",
+        },
+    )
+    store.record_command("cmd-unsuccessful-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+
+    assert service.execution_retried == []
+    assert service.delivery_retried == [9]
 
 
 def test_daemon_retries_pre_execution_failure_through_process_issue(

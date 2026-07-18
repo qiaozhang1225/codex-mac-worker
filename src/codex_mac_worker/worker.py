@@ -436,6 +436,46 @@ class WorkerService:
                 raise PolicyError(f"Codex result field {key} must be a string list")
         return payload
 
+    def _successful_execution_result(
+        self,
+        repo: str,
+        issue_number: int,
+        task: dict[str, Any],
+    ) -> RunnerResult:
+        expected_session_id = task.get("session_id")
+        candidates: list[dict[str, Any]] = []
+        for run in self.store.list_runs(repo, issue_number):
+            result = run.get("result")
+            if (
+                not run.get("finished_at")
+                or run.get("exit_code") != 0
+                or not isinstance(result, dict)
+                or result.get("termination_reason") is not None
+            ):
+                continue
+            session_id = result.get("session_id")
+            last_message = result.get("last_message")
+            if not isinstance(session_id, str) or not session_id:
+                continue
+            if not isinstance(last_message, str) or not last_message:
+                continue
+            if expected_session_id and session_id != expected_session_id:
+                continue
+            candidates.append(result)
+
+        if len(candidates) != 1:
+            raise PolicyError("post-execution recovery requires one successful Codex run")
+        result = candidates[0]
+        return RunnerResult(
+            exit_code=0,
+            session_id=result["session_id"],
+            events=(),
+            last_message=result["last_message"],
+            stderr="",
+            model=result.get("model"),
+            cli_version=result.get("cli_version"),
+        )
+
     def _delivery_pr_body(
         self,
         *,
@@ -511,7 +551,11 @@ This PR was created as a draft. {merge_note}
         if not diff.changed_paths:
             raise PolicyError("Codex produced no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
-        scan_for_secrets(worktree, diff.changed_paths)
+        scan_for_secrets(
+            worktree,
+            diff.changed_paths,
+            baseline_ref=baseline_head,
+        )
 
     def _validate_committed_delivery(
         self,
@@ -526,7 +570,11 @@ This PR was created as a draft. {merge_note}
         if not diff.changed_paths:
             raise PolicyError("delivery commit has no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
-        scan_for_secrets(worktree, diff.changed_paths)
+        scan_for_secrets(
+            worktree,
+            diff.changed_paths,
+            baseline_ref=baseline_head,
+        )
 
     def _verification_detail(self, result: Any) -> str:
         return "\n\n".join(
@@ -1101,6 +1149,20 @@ This PR was created as a draft. {merge_note}
                         "cli_version": runner_result.cli_version,
                     },
                 )
+                if (
+                    runner_result.exit_code == 0
+                    and runner_result.termination_reason is None
+                    and runner_result.session_id
+                ):
+                    self.store.upsert_task(
+                        repo=repo,
+                        issue_number=number,
+                        task_hash=task_hash,
+                        state="running",
+                        branch=branch,
+                        worktree=str(prepared.path),
+                        session_id=runner_result.session_id,
+                    )
                 if runner_result.termination_reason == "cancel":
                     self.store.upsert_task(
                         repo=repo,
@@ -1219,105 +1281,328 @@ This PR was created as a draft. {merge_note}
                 and verification_result is not None
                 and structured_result is not None
             )
-            latest_issue = self.github.get_issue(repo, number)
-            if parse_task_body(str(latest_issue.get("body", ""))).task_hash != task_hash:
-                raise PolicyError("task body changed after claim")
-
-            self._validate_delivery_diff(
-                prepared.path, prepared.baseline_head, spec, project_config
-            )
-            self.validate_repository_authority(repository)
-
-            task_commit_sha = self.git.commit(
-                prepared.path,
-                f"feat: complete codex task #{number}",
-                author_name="Codex Mac Worker",
-                author_email="codex-worker@users.noreply.github.com",
-            )
-            task_diff = self.git.diff_summary(prepared.path, spec.context_commit)
-            self.git.refresh_branch(
-                mirror,
-                clone_url=repository.clone_url,
-                branch=spec.base_branch,
-                token=self.token_provider(),
-            )
-            integration = self.git.integrate_default(
-                prepared.path,
-                mirror,
-                spec.base_branch,
-                spec.context_commit,
-                task_diff.changed_paths,
-                refresh_count=0,
-                author_name="Codex Mac Worker",
-                author_email="codex-worker@users.noreply.github.com",
-            )
-            project_config = load_project_config(
-                prepared.path / ".codex-worker" / "project.toml"
-            )
-            self._validate_project_worker_app(project_config)
-            validate_task_policy(spec, project_config)
-            self._validate_committed_delivery(
-                prepared.path,
-                integration.integrated_base,
-                spec,
-                project_config,
-            )
-            if integration.refresh_count:
-                remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
-                if remaining <= 0:
-                    raise RunnerTimeout(
-                        "task hard timeout exceeded before integration verification"
-                    )
-                verification_result = run_verification(
-                    prepared.path,
-                    project_config,
-                    spec.verification_profile,
-                    timeout_seconds=max(1, min(remaining, 1800)),
-                    codex_path=(
-                        self.config.codex_path if self.config.codex_home else None
-                    ),
-                    codex_home=self.config.codex_home,
-                    control_callback=monitor,
-                )
-                if not verification_result.passed:
-                    raise PolicyError(
-                        "integration verification failed:\n"
-                        + self._verification_detail(verification_result)
-                    )
-            self.store.save_delivery_checkpoint(
-                repo=repo,
-                issue_number=number,
+            self._finalize_verified_execution(
+                repository=repository,
+                issue=issue,
+                spec=spec,
                 task_hash=task_hash,
                 branch=branch,
-                worktree=str(prepared.path),
-                context_commit=spec.context_commit,
-                commit_sha=integration.delivery_head,
-                task_commit_sha=task_commit_sha,
-                integrated_base_sha=integration.integrated_base,
-                integration_refreshes=integration.refresh_count,
-                project_config_hash=self._project_config_hash(prepared.path),
-                verification_profile=spec.verification_profile,
-                verification_commands=project_config.verification[
-                    spec.verification_profile
-                ],
-                verification_result=self._serialize_verification(verification_result),
+                worktree=prepared.path,
+                mirror=mirror,
+                baseline_head=prepared.baseline_head,
+                project_config=project_config,
+                runner_result=runner_result,
                 structured_result=structured_result,
-                model=runner_result.model,
-                cli_version=runner_result.cli_version,
-                session_id=runner_result.session_id,
-            )
-            checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
-            assert checkpoint is not None
-            self._deliver_checkpoint(
-                repository,
-                issue,
-                spec,
-                checkpoint,
-                verification_result,
+                verification_result=verification_result,
+                hard_deadline=hard_deadline,
+                monitor=monitor,
                 status_comment_id=status_comment_id,
             )
         except Exception as exc:
             self._mark_attention(repo, issue, task_hash, branch, f"{type(exc).__name__}: {exc}")
+
+    def _finalize_verified_execution(
+        self,
+        *,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        spec: Any,
+        task_hash: str,
+        branch: str,
+        worktree: Path,
+        mirror: Path,
+        baseline_head: str,
+        project_config: ProjectConfig,
+        runner_result: RunnerResult,
+        structured_result: dict[str, Any],
+        verification_result: VerificationResult,
+        hard_deadline: datetime,
+        monitor: Callable[[], str | None],
+        status_comment_id: int,
+    ) -> None:
+        repo = repository.name
+        number = int(issue["number"])
+        latest_issue = self.github.get_issue(repo, number)
+        if parse_task_body(str(latest_issue.get("body", ""))).task_hash != task_hash:
+            raise PolicyError("task body changed after claim")
+
+        self._validate_delivery_diff(
+            worktree,
+            baseline_head,
+            spec,
+            project_config,
+        )
+        self.validate_repository_authority(repository)
+
+        task_commit_sha = self.git.commit(
+            worktree,
+            f"feat: complete codex task #{number}",
+            author_name="Codex Mac Worker",
+            author_email="codex-worker@users.noreply.github.com",
+        )
+        task_diff = self.git.diff_summary(worktree, spec.context_commit)
+        self.git.refresh_branch(
+            mirror,
+            clone_url=repository.clone_url,
+            branch=spec.base_branch,
+            token=self.token_provider(),
+        )
+        integration = self.git.integrate_default(
+            worktree,
+            mirror,
+            spec.base_branch,
+            spec.context_commit,
+            task_diff.changed_paths,
+            refresh_count=0,
+            author_name="Codex Mac Worker",
+            author_email="codex-worker@users.noreply.github.com",
+        )
+        project_config = load_project_config(
+            worktree / ".codex-worker" / "project.toml"
+        )
+        self._validate_project_worker_app(project_config)
+        validate_task_policy(spec, project_config)
+        self._validate_committed_delivery(
+            worktree,
+            integration.integrated_base,
+            spec,
+            project_config,
+        )
+        if integration.refresh_count:
+            remaining = (hard_deadline - datetime.now(UTC)).total_seconds()
+            if remaining <= 0:
+                raise RunnerTimeout(
+                    "task hard timeout exceeded before integration verification"
+                )
+            verification_result = run_verification(
+                worktree,
+                project_config,
+                spec.verification_profile,
+                timeout_seconds=max(1, min(remaining, 1800)),
+                codex_path=self.config.codex_path if self.config.codex_home else None,
+                codex_home=self.config.codex_home,
+                control_callback=monitor,
+            )
+            if not verification_result.passed:
+                raise PolicyError(
+                    "integration verification failed:\n"
+                    + self._verification_detail(verification_result)
+                )
+        self.store.save_delivery_checkpoint(
+            repo=repo,
+            issue_number=number,
+            task_hash=task_hash,
+            branch=branch,
+            worktree=str(worktree),
+            context_commit=spec.context_commit,
+            commit_sha=integration.delivery_head,
+            task_commit_sha=task_commit_sha,
+            integrated_base_sha=integration.integrated_base,
+            integration_refreshes=integration.refresh_count,
+            project_config_hash=self._project_config_hash(worktree),
+            verification_profile=spec.verification_profile,
+            verification_commands=project_config.verification[
+                spec.verification_profile
+            ],
+            verification_result=self._serialize_verification(verification_result),
+            structured_result=structured_result,
+            model=runner_result.model,
+            cli_version=runner_result.cli_version,
+            session_id=runner_result.session_id,
+        )
+        checkpoint = self.store.get_delivery_checkpoint(repo, number, task_hash)
+        assert checkpoint is not None
+        self._deliver_checkpoint(
+            repository,
+            issue,
+            spec,
+            checkpoint,
+            verification_result,
+            status_comment_id=status_comment_id,
+        )
+
+    def retry_execution_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> str:
+        """Verify and deliver one retained successful execution without Codex."""
+        deadline = time.monotonic() + DELIVERY_RETRY_TIMEOUT_SECONDS
+        hard_deadline = datetime.now(UTC) + timedelta(
+            seconds=DELIVERY_RETRY_TIMEOUT_SECONDS
+        )
+        scope_factory = getattr(self.github, "request_deadline", None)
+        scope = scope_factory(deadline) if scope_factory is not None else nullcontext()
+        with scope:
+            return self._retry_execution_delivery_bounded(
+                repository,
+                issue,
+                deadline=deadline,
+                hard_deadline=hard_deadline,
+            )
+
+    def _retry_execution_delivery_bounded(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+        *,
+        deadline: float,
+        hard_deadline: datetime,
+    ) -> str:
+        repo = repository.name
+        number = int(issue["number"])
+        task = self.store.get_task(repo, number)
+        task_hash = str(task.get("task_hash", "invalid")) if task else "invalid"
+        branch = str(task.get("branch") or "") if task else ""
+        try:
+            if task is None:
+                raise PolicyError("post-execution recovery task record is missing")
+            if task.get("state") != "needs-attention":
+                raise PolicyError("post-execution recovery requires needs-attention state")
+            if task.get("pr_number") is not None:
+                raise PolicyError("post-execution recovery task already has a pull request")
+            if self.store.get_delivery_checkpoint(repo, number, task_hash) is not None:
+                raise PolicyError("post-execution recovery already has a delivery checkpoint")
+
+            self._validate_issue_author(repo, issue)
+            self._require_delivery_deadline(deadline, "task authorization")
+            spec = parse_task_body(str(issue.get("body", "")))
+            if spec.task_hash != task_hash:
+                raise PolicyError("task body changed before post-execution recovery")
+            self.validate_repository_authority(repository)
+            self._require_delivery_deadline(deadline, "repository authorization")
+
+            worktree_value = str(task.get("worktree") or "")
+            if not branch or not worktree_value:
+                raise PolicyError("post-execution recovery worktree evidence is incomplete")
+            worktree = Path(worktree_value)
+            if not worktree.is_dir():
+                raise PolicyError("post-execution recovery worktree is missing")
+            if self.git.current_branch(worktree) != branch:
+                raise PolicyError("post-execution recovery branch changed")
+            if self.git.current_head(worktree) != spec.context_commit:
+                raise PolicyError("post-execution recovery HEAD changed")
+            if self.git.is_clean(worktree):
+                raise PolicyError("post-execution recovery worktree has no changes")
+
+            project_config = load_project_config(
+                worktree / ".codex-worker" / "project.toml"
+            )
+            self._validate_project_worker_app(project_config)
+            self._validate_runtime_policy(worktree)
+            validate_task_policy(spec, project_config)
+            self._validate_context_files(worktree, spec.context_files)
+            runner_result = self._successful_execution_result(repo, number, task)
+            structured_result = self._require_completed_result(runner_result, spec)
+            self._validate_delivery_diff(
+                worktree,
+                spec.context_commit,
+                spec,
+                project_config,
+            )
+
+            mirror = self.git.mirror_path(repo)
+            if not mirror.is_dir():
+                raise PolicyError("post-execution recovery repository mirror is missing")
+            self.store.upsert_task(
+                repo=repo,
+                issue_number=number,
+                task_hash=task_hash,
+                state="retrying",
+                branch=branch,
+                worktree=str(worktree),
+                session_id=runner_result.session_id,
+            )
+            self._set_state(repo, issue, "retrying")
+            status = self.github.add_comment(
+                repo,
+                number,
+                self._status_body(
+                    task_hash=task_hash,
+                    state="retrying",
+                    branch=branch,
+                    progress_at=iso_now(),
+                    hard_deadline_at=hard_deadline.isoformat(),
+                    detail="post-execution validation recovery",
+                ),
+            )
+            status_comment_id = int(status["id"])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerTimeout(
+                    "post-execution recovery hard timeout exceeded before verification"
+                )
+            monitor = self._command_monitor(repo, number)
+            verification_result = run_verification(
+                worktree,
+                project_config,
+                spec.verification_profile,
+                timeout_seconds=min(remaining, 1800),
+                codex_path=self.config.codex_path if self.config.codex_home else None,
+                codex_home=self.config.codex_home,
+                control_callback=monitor,
+            )
+            if verification_result.termination_reason:
+                state = (
+                    "cancelled"
+                    if verification_result.termination_reason == "cancel"
+                    else "paused"
+                )
+                self.store.upsert_task(
+                    repo=repo,
+                    issue_number=number,
+                    task_hash=task_hash,
+                    state=state,
+                    branch=branch,
+                    worktree=str(worktree),
+                    session_id=runner_result.session_id,
+                )
+                self._set_state(
+                    repo,
+                    issue,
+                    "cancelled" if state == "cancelled" else "claimed",
+                )
+                return state
+            if not verification_result.passed:
+                raise PolicyError(
+                    "post-execution recovery verification failed:\n"
+                    + self._verification_detail(verification_result)
+                )
+
+            self._finalize_verified_execution(
+                repository=repository,
+                issue=issue,
+                spec=spec,
+                task_hash=task_hash,
+                branch=branch,
+                worktree=worktree,
+                mirror=mirror,
+                baseline_head=spec.context_commit,
+                project_config=project_config,
+                runner_result=runner_result,
+                structured_result=structured_result,
+                verification_result=verification_result,
+                hard_deadline=hard_deadline,
+                monitor=monitor,
+                status_comment_id=status_comment_id,
+            )
+            completed = self.store.get_task(repo, number)
+            if completed is None or completed.get("state") not in {
+                "awaiting-review",
+                "merging",
+            }:
+                raise PolicyError("post-execution recovery did not reach delivery state")
+            return str(completed["state"])
+        except Exception as exc:
+            self._mark_attention(
+                repo,
+                issue,
+                task_hash,
+                branch,
+                f"{type(exc).__name__}: {exc}",
+                allow_remote=time.monotonic() < deadline,
+            )
+            return "needs-attention"
 
     def _legacy_delivery_checkpoint_candidate(
         self,
@@ -1525,7 +1810,11 @@ This PR was created as a draft. {merge_note}
                 diff.changed_paths,
                 diff.diff_lines,
             )
-            scan_for_secrets(worktree, diff.changed_paths)
+            scan_for_secrets(
+                worktree,
+                diff.changed_paths,
+                baseline_ref=integrated_base_sha,
+            )
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
