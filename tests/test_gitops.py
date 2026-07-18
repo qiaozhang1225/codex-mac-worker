@@ -56,8 +56,17 @@ def test_existing_mirror_retries_transient_network_failure_twice(
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal attempts
-        attempts += 1
         assert cwd == mirror
+        if args[0] == "config":
+            assert args == (
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            )
+            assert check is True
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        attempts += 1
         assert args == ("remote", "update", "--prune")
         assert check is False
         if attempts < 3:
@@ -94,6 +103,8 @@ def test_network_git_does_not_retry_authentication_failure(
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal attempts
+        if args[0] == "config":
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
         attempts += 1
         return subprocess.CompletedProcess(
             ["git", *args], 128, "", "fatal: Authentication failed"
@@ -187,6 +198,8 @@ def test_transient_network_retries_are_bounded(
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         nonlocal attempts
+        if args[0] == "config":
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
         attempts += 1
         return subprocess.CompletedProcess(
             ["git", *args], 128, "", "fatal: unable to access: HTTP 503\n"
@@ -608,6 +621,37 @@ def test_prepare_worktree_uses_exact_context_commit(tmp_path: Path) -> None:
     assert prepared.branch == "codex/12-bounded-task"
     assert git(prepared.path, "rev-parse", "HEAD") == sha
     assert prepared.baseline_head == sha
+
+
+def test_existing_mirror_refresh_does_not_fetch_into_checked_out_task_branch(
+    tmp_path: Path,
+) -> None:
+    remote, sha = make_remote(tmp_path)
+    operations = GitOperations(
+        cache_root=tmp_path / "cache",
+        worktree_root=tmp_path / "worktrees",
+    )
+    mirror = operations.ensure_mirror("owner/repo", str(remote))
+    prepared = operations.prepare_worktree(
+        repo="owner/repo",
+        mirror=mirror,
+        context_commit=sha,
+        base_branch="main",
+        issue_number=12,
+        slug="bounded-task",
+    )
+    git(prepared.path, "remote", "add", "delivery", str(remote))
+    git(
+        prepared.path,
+        "push",
+        "delivery",
+        f"HEAD:refs/heads/{prepared.branch}",
+    )
+
+    assert operations.ensure_mirror("owner/repo", str(remote)) == mirror
+
+    assert git(prepared.path, "rev-parse", "HEAD") == sha
+    assert git(mirror, "rev-parse", f"refs/remotes/origin/{prepared.branch}") == sha
 
 
 def test_prepare_worktree_rejects_commit_outside_base_branch(tmp_path: Path) -> None:

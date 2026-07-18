@@ -292,6 +292,32 @@ def test_daemon_routes_retry_to_delivery_without_process_issue(tmp_path: Path) -
     assert command is not None and command["result"] == "awaiting-review"
 
 
+def test_daemon_retries_pre_execution_failure_through_process_issue(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    store = EventStore(settings.database_path)
+    store.upsert_task(
+        repo="owner/repo",
+        issue_number=9,
+        task_hash="hash",
+        state="needs-attention",
+        branch="codex/9-active",
+    )
+    store.record_command("cmd-pre-execution-retry", "owner/repo", 9, "retry", "owner")
+    service = FakeService()
+    daemon = WorkerDaemon(settings, FakeGitHub([]), store, service)
+
+    assert daemon.process_control_commands() is True
+
+    assert service.processed == [9]
+    assert service.resumed == [None]
+    assert service.delivery_retried == []
+    command = store.get_command("cmd-pre-execution-retry")
+    assert command is not None
+    assert command["result"] == "pre-execution-retry"
+
+
 @pytest.mark.parametrize(
     ("checkpoint_phase", "checkpoint_error", "prior_command_result"),
     [
