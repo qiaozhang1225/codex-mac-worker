@@ -75,6 +75,12 @@ class IssueProcessor(Protocol):
         issue: dict[str, Any],
     ) -> str: ...
 
+    def retry_execution_delivery(
+        self,
+        repository: RepositoryConfig,
+        issue: dict[str, Any],
+    ) -> str: ...
+
     def auto_merge_delivery(
         self,
         repository: RepositoryConfig,
@@ -349,6 +355,27 @@ class WorkerDaemon:
                     )
                     self._set_remote_state(repo, issue, "merging")
                     self.store.mark_command_executed(command_id, "merging")
+                    return True
+                successful_execution = any(
+                    run.get("finished_at")
+                    and run.get("exit_code") == 0
+                    and isinstance(run.get("result"), dict)
+                    and run["result"].get("termination_reason") is None
+                    and isinstance(run["result"].get("session_id"), str)
+                    and bool(run["result"]["session_id"])
+                    for run in self.store.list_runs(repo, issue_number)
+                )
+                post_execution_failure = (
+                    checkpoint is None
+                    and task.get("pr_number") is None
+                    and bool(task.get("worktree"))
+                    and successful_execution
+                )
+                if post_execution_failure:
+                    result = self.service.retry_execution_delivery(
+                        self._repository(repo), issue
+                    )
+                    self.store.mark_command_executed(command_id, result)
                     return True
                 pre_execution_failure = (
                     checkpoint is None
