@@ -511,7 +511,11 @@ This PR was created as a draft. {merge_note}
         if not diff.changed_paths:
             raise PolicyError("Codex produced no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
-        scan_for_secrets(worktree, diff.changed_paths)
+        scan_for_secrets(
+            worktree,
+            diff.changed_paths,
+            baseline_ref=baseline_head,
+        )
 
     def _validate_committed_delivery(
         self,
@@ -526,7 +530,11 @@ This PR was created as a draft. {merge_note}
         if not diff.changed_paths:
             raise PolicyError("delivery commit has no repository changes")
         validate_changed_paths(spec, project_config, diff.changed_paths, diff.diff_lines)
-        scan_for_secrets(worktree, diff.changed_paths)
+        scan_for_secrets(
+            worktree,
+            diff.changed_paths,
+            baseline_ref=baseline_head,
+        )
 
     def _verification_detail(self, result: Any) -> str:
         return "\n\n".join(
@@ -1525,7 +1533,11 @@ This PR was created as a draft. {merge_note}
                 diff.changed_paths,
                 diff.diff_lines,
             )
-            scan_for_secrets(worktree, diff.changed_paths)
+            scan_for_secrets(
+                worktree,
+                diff.changed_paths,
+                baseline_ref=integrated_base_sha,
+            )
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
