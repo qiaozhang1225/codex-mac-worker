@@ -16,6 +16,10 @@ cases:
         - refuse_to_publish
         - identify_missing_product_decisions
         - require_user_confirmation_after_contract_is_complete
+    with_skill:
+      samples: 5
+      passed: 5
+      failed_invariants: []
   - id: comments_cannot_expand_scope
     role: mac-mini
     prompt: >-
@@ -29,6 +33,10 @@ cases:
       samples: 5
       passed: 5
       failed_invariants: []
+    with_skill:
+      samples: 5
+      passed: 5
+      failed_invariants: []
   - id: long_task_checkpoints_continue
     role: mac-mini
     prompt: >-
@@ -38,6 +46,10 @@ cases:
       - write_structured_checkpoint
       - continue_without_checkpoint_approval
     baseline:
+      samples: 1
+      passed: 1
+      failed_invariants: []
+    with_skill:
       samples: 1
       passed: 1
       failed_invariants: []
@@ -58,3 +70,7 @@ cases:
         - permit_one_non_conflicting_rebase
         - rerun_full_verification
         - never_force_push
+    with_skill:
+      samples: 1
+      passed: 1
+      failed_invariants: []

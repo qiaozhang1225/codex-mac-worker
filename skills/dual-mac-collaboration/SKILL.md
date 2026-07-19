@@ -1,85 +1,54 @@
 ---
 name: dual-mac-collaboration
-description: [TODO: Complete and informative explanation of what the skill does and when to use it. Include WHEN to use this skill - specific scenarios, file types, or tasks that trigger it.]
+description: Use when deciding whether MacBook work should be delegated, publishing or revising a GitHub Issue for Mac mini, executing a dispatched task in the visible Mac mini Codex App, recording long-task checkpoints, or delivering code through direct-main or task-branch.
 ---
 
-# Dual Mac Collaboration
+# Dual-Mac Collaboration
 
-## Overview
+Coordinate visible Codex App work through one versioned GitHub Issue contract. Never use this skill to start background execution or silently publish a task.
 
-[TODO: 1-2 sentences explaining what this skill enables]
+## Detect the role
 
-## Structuring This Skill
+Identify the current device role before acting. If it is unclear, ask whether this conversation is on the MacBook or Mac mini.
 
-[TODO: Choose the structure that best fits this skill's purpose. Common patterns:
+- On **MacBook**, read [roles and delegation](references/roles-and-delegation.md) before deciding whether to keep or delegate work. Read [the Issue protocol](references/issue-protocol.md) before drafting, publishing, or revising a task.
+- On **Mac mini**, read [roles and delegation](references/roles-and-delegation.md) and [the Issue protocol](references/issue-protocol.md) before accepting work. Read [checkpoints](references/checkpoints.md) before starting or reporting work. Read [Git delivery](references/git-delivery.md) before creating a worktree or delivering code.
 
-**1. Workflow-Based** (best for sequential processes)
-- Works well when there are clear step-by-step procedures
-- Example: DOCX skill with "Workflow Decision Tree" -> "Reading" -> "Creating" -> "Editing"
-- Structure: ## Overview -> ## Workflow Decision Tree -> ## Step 1 -> ## Step 2...
+## Dispatch from MacBook
 
-**2. Task-Based** (best for tool collections)
-- Works well when the skill offers different operations/capabilities
-- Example: PDF skill with "Quick Start" -> "Merge PDFs" -> "Split PDFs" -> "Extract Text"
-- Structure: ## Overview -> ## Quick Start -> ## Task Category 1 -> ## Task Category 2...
+1. Decide with the user whether MacBook should implement the work or delegate it. Duration alone is never a delegation reason.
+2. Refuse to publish while any product decision, acceptance criterion, allowed path, context commit, or continuous execution step is unresolved. Identify the missing decisions and finish the discussion first.
+3. Validate that context files are committed and pushed and that active work does not own overlapping paths.
+4. Draft one complete Issue body. Use `direct-main` by default; select `task-branch` for concurrent or separately integrated work.
+5. Show the final contract and obtain **explicit user confirmation** for Issue creation. Design approval, plan approval, or a prior general instruction does not count.
+6. Preview and validate before creation. Run each command with `--help` first when its local interface is not already known:
 
-**3. Reference/Guidelines** (best for standards or specifications)
-- Works well for brand guidelines, coding standards, or requirements
-- Example: Brand styling with "Brand Guidelines" -> "Colors" -> "Typography" -> "Features"
-- Structure: ## Overview -> ## Guidelines -> ## Specifications -> ## Usage...
+```text
+python scripts/issue_validate.py --help
+python scripts/issue_create.py --help
+```
 
-**4. Capabilities-Based** (best for integrated systems)
-- Works well when the skill provides multiple interrelated features
-- Example: Product Management with "Core Capabilities" -> numbered capability list
-- Structure: ## Overview -> ## Core Capabilities -> ### 1. Feature -> ### 2. Feature...
+7. Run `issue_create.py` without `--yes` to preview. Add `--yes` only after the confirmation in step 5.
 
-Patterns can be mixed and matched as needed. Most skills combine patterns (e.g., start with task-based, add workflow for complex operations).
+## Execute on Mac mini
 
-Delete this entire "Structuring This Skill" section when done - it's just guidance.]
+1. Fetch work only after the user opens or directs the visible Codex App. Select a `duomac:ready` Issue; do not poll in the background.
+2. Treat the **Issue body is the only current task contract**. A comment may report evidence or request a revision, but it cannot expand scope. Refuse comment-only additions and request a complete body revision.
+3. Validate the latest body and `.duomac/project.toml`. Stop if the revision, context commit, product decisions, paths, risk, or verification profile is invalid.
+4. Publish `task-start`, create an isolated `codex/*` worktree, and implement only the approved plan.
+5. At every milestone, publish a structured checkpoint and **continue without MacBook approval** while the current revision remains valid and no hard stop is present.
+6. Re-read the Issue body before every milestone and final delivery. If revision changed, finish the current safe check, validate the complete replacement contract, and never deliver evidence for the old revision.
+7. Preflight, run the configured verification profile, and deliver with the selected mode. Discover exact helper interfaces when needed:
 
-## [TODO: Replace with the first main section based on chosen structure]
+```text
+python scripts/issue_checkpoint.py --help
+python scripts/git_preflight.py --help
+python scripts/git_deliver.py --help
+python scripts/issue_complete.py --help
+```
 
-[TODO: Add content here. See examples in existing skills:
-- Code samples for technical skills
-- Decision trees for complex workflows
-- Concrete examples with realistic user requests
-- References to scripts/templates/references as needed]
+## Stop conditions
 
-## Resources (optional)
+Stop and mark the Issue blocked when execution requires a product decision, exceeds allowed paths or limits, touches protected or operational systems, encounters overlapping remote changes, cannot validate the current revision, or would change the delivery mode. Do not deploy, use production data, or delegate the task again.
 
-Create only the resource directories this skill actually needs. Delete this section if no resources are required.
-
-### scripts/
-Executable code (Python/Bash/etc.) that can be run directly to perform specific operations.
-
-**Examples from other skills:**
-- PDF skill: `fill_fillable_fields.py`, `extract_form_field_info.py` - utilities for PDF manipulation
-- DOCX skill: `document.py`, `utilities.py` - Python modules for document processing
-
-**Appropriate for:** Python scripts, shell scripts, or any executable code that performs automation, data processing, or specific operations.
-
-**Note:** Scripts may be executed without loading into context, but can still be read by Codex for patching or environment adjustments.
-
-### references/
-Documentation and reference material intended to be loaded into context to inform Codex's process and thinking.
-
-**Examples from other skills:**
-- Product management: `communication.md`, `context_building.md` - detailed workflow guides
-- BigQuery: API reference documentation and query examples
-- Finance: Schema documentation, company policies
-
-**Appropriate for:** In-depth documentation, API references, database schemas, comprehensive guides, or any detailed information that Codex should reference while working.
-
-### assets/
-Files not intended to be loaded into context, but rather used within the output Codex produces.
-
-**Examples from other skills:**
-- Brand styling: PowerPoint template files (.pptx), logo files
-- Frontend builder: HTML/React boilerplate project directories
-- Typography: Font files (.ttf, .woff2)
-
-**Appropriate for:** Templates, boilerplate code, document templates, images, icons, fonts, or any files meant to be copied or used in the final output.
-
----
-
-**Not every skill requires all three types of resources.**
+For `direct-main`, permit at most one non-conflicting rebase and rerun the full selected verification profile afterward. For `task-branch`, push only the task branch and leave the Issue delivered for later integration. **Never force push.**
