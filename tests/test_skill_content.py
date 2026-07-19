@@ -266,6 +266,85 @@ def test_retirement_refuses_nonterminal_task_before_mutation(tmp_path: Path) -> 
     assert not (app_root / "backups").exists()
 
 
+def test_retirement_waits_for_launchd_bootout_to_finish(tmp_path: Path) -> None:
+    app_root = tmp_path / "legacy-app"
+    state = app_root / "state"
+    config = app_root / "config"
+    secrets = app_root / "secrets"
+    state.mkdir(parents=True)
+    config.mkdir()
+    secrets.mkdir()
+    database = state / "worker.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("create table tasks (state text not null)")
+        connection.execute("insert into tasks values ('completed')")
+    (config / "worker.toml").write_text("enabled = true\n", encoding="utf-8")
+    (secrets / "private-material.pem").write_text("not-a-real-key\n", encoding="utf-8")
+
+    launchd_root = tmp_path / "launchd"
+    launchd_root.mkdir()
+    (launchd_root / "com.easewise.codex-worker.plist").write_text("primary\n")
+    (launchd_root / "com.easewise.codex-worker-backup.plist").write_text("backup\n")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    sudo = fake_bin / "sudo"
+    sudo.write_text("#!/bin/sh\nexec \"$@\"\n", encoding="utf-8")
+    sudo.chmod(0o755)
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        """#!/bin/sh
+if [ "$1" = "bootout" ]; then
+  exit 0
+fi
+if [ "$1" = "print" ]; then
+  name=$(printf '%s' "$2" | tr '/.' '__')
+  counter="$DUOMAC_LAUNCHCTL_STATE.$name"
+  value=0
+  [ -f "$counter" ] && value=$(cat "$counter")
+  value=$((value + 1))
+  printf '%s\n' "$value" > "$counter"
+  if [ "$value" -le 2 ]; then
+    echo loaded
+    exit 0
+  fi
+  echo absent >&2
+  exit 1
+fi
+exit 2
+""",
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    pgrep = fake_bin / "pgrep"
+    pgrep.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    pgrep.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "DUOMAC_APP_ROOT": str(app_root),
+        "DUOMAC_LAUNCHD_ROOT": str(launchd_root),
+        "DUOMAC_LAUNCHCTL_STATE": str(tmp_path / "launchctl-state"),
+        "DUOMAC_WAIT_ATTEMPTS": "5",
+        "DUOMAC_WAIT_INTERVAL_SECONDS": "0",
+    }
+
+    result = subprocess.run(
+        ["/bin/zsh", str(ROOT / "scripts/retire_legacy_worker.sh"), "--apply"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not secrets.exists()
+    isolated = list(app_root.glob("legacy-secrets-*"))
+    assert len(isolated) == 1
+    assert isolated[0].stat().st_mode & 0o777 == 0o700
+    assert "private-material.pem" not in result.stdout
+
+
 def test_main_tree_has_no_legacy_entry_points() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 

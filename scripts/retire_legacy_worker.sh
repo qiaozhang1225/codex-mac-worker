@@ -77,18 +77,21 @@ sudo launchctl bootout "system/$LEGACY_SERVICE" 2>/dev/null || true
 sudo launchctl bootout "system/$LEGACY_SERVICE-backup" 2>/dev/null || true
 sudo rm -f "$PRIMARY_PLIST" "$BACKUP_PLIST"
 
-if launchctl print "system/$LEGACY_SERVICE" >/dev/null 2>&1; then
-  print -u2 "legacy Worker service is still loaded"
-  exit 1
-fi
-if launchctl print "system/$LEGACY_SERVICE-backup" >/dev/null 2>&1; then
-  print -u2 "legacy backup service is still loaded"
-  exit 1
-fi
-if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
-  print -u2 "legacy Worker process is still running"
-  exit 1
-fi
+WAIT_ATTEMPTS="${DUOMAC_WAIT_ATTEMPTS:-20}"
+WAIT_INTERVAL_SECONDS="${DUOMAC_WAIT_INTERVAL_SECONDS:-0.25}"
+retirement_complete() {
+  ! launchctl print "system/$LEGACY_SERVICE" >/dev/null 2>&1 &&
+    ! launchctl print "system/$LEGACY_SERVICE-backup" >/dev/null 2>&1 &&
+    ! pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1
+}
+for (( attempt = 1; attempt <= WAIT_ATTEMPTS; attempt += 1 )); do
+  retirement_complete && break
+  if (( attempt == WAIT_ATTEMPTS )); then
+    print -u2 "legacy Worker did not finish unloading before the verification deadline"
+    exit 1
+  fi
+  sleep "$WAIT_INTERVAL_SECONDS"
+done
 if [[ -e "$PRIMARY_PLIST" || -e "$BACKUP_PLIST" ]]; then
   print -u2 "legacy service files are still installed"
   exit 1
