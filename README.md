@@ -1,25 +1,62 @@
-# Codex Mac Worker
+# Dual-Mac Codex Collaboration
 
-A dual-Mac development system: the MacBook Codex agent is the principal development agent and may develop directly or delegate a bounded subtask to one always-on macOS Worker. The Worker consumes GitHub Issue tasks, runs `codex exec` in isolated Git worktrees, validates the diff and repository-approved tests, opens a Draft PR, and can squash-merge its own exact verified head under an explicit single-owner policy.
+This repository provides one versioned Codex skill for coordinating development between two visible Codex App sessions through GitHub Issues. It is designed for a single owner who wants the MacBook to remain the principal development device while using an always-available Mac mini for complete, bounded tasks.
 
-It deliberately excludes Codex Goal/“目标” mode, cloud execution, desktop scheduled tasks, production deployment, automatic rollback, high-risk work, and multiple competing Workers. Automatic merge is repository-specific and requires two trusted signals: local `merge_mode = "automatic"` plus the recognized automatic Ruleset profile.
+## Roles
 
-## Components
+- **MacBook** develops directly, explores product and technical decisions, prepares PRD/Project Card/Spec context, decides with the user whether to delegate, and is the only device that formally publishes task Issues.
+- **Mac mini** visibly fetches a confirmed Issue in Codex App, executes its complete plan, records structured checkpoints, and delivers within the approved Git and path boundaries.
 
-- `codex-worker`: LaunchDaemon process for polling, execution, recovery, verification, and Draft PR delivery.
-- `codexctl`: MacBook CLI for repository onboarding, task creation/control, read-only review, and manual exact-head merge approval where manual mode is selected.
-- `skills/dispatch-codex-task`: MacBook principal-agent skill for choosing local work or delegating a strict subset of an authorized objective.
-- `scripts/`: macOS installation, diagnosis, maintenance, repository-label bootstrap, and uninstall tools.
-- `templates/`: Worker configuration and LaunchDaemon templates.
+Task duration does not determine delegation. Delegate when product decisions are closed, context is committed and pushed, acceptance and paths are explicit, and the execution plan can continue without repeated product judgment. Every formal Issue creation still requires explicit user confirmation after the final contract is shown.
 
-The Worker uses a dedicated `CODEX_HOME` permission profile. It can write only in the active worktree, cannot read the rest of the user home directory, and has no network access. System toolchain files remain readable so Python and Node runtimes can execute. Repository-level `.codex/config.toml` files are rejected in v1 so they cannot override that boundary.
+## Install an exact revision
+
+Install the same repository commit on both Macs:
+
+```bash
+git clone https://github.com/qiaozhang1225/codex-mac-worker.git
+cd codex-mac-worker
+git checkout <approved-full-commit-sha>
+./scripts/install_skill.sh --remove-legacy-client
+```
+
+The installer creates a small Python 3.12 environment, installs PyYAML, atomically installs `dual-mac-collaboration` into Codex skills, writes `.source-commit`, and adds `duomac-*` command wrappers under `~/.local/bin`. It requires authenticated `gh` and does not start a background service.
+
+## Visible use
+
+On MacBook, ask Codex App:
+
+> 使用 dual-mac-collaboration 判断这个计划是否适合交给 Mac mini；先展示最终任务契约，不要在我确认前创建 Issue。
+
+On Mac mini, ask Codex App:
+
+> 使用 dual-mac-collaboration，从指定仓库读取一个 duomac:ready 任务，校验后在可见对话中开始执行。
+
+The helpers are preview-first:
+
+```bash
+duomac-issue-create --repo OWNER/REPO --spec task.md
+duomac-issue-create --repo OWNER/REPO --spec task.md --yes
+duomac-git-preflight --help
+duomac-git-deliver --help
+```
+
+## Delivery modes
+
+`direct-main` is the default for one-owner, non-overlapping work. It permits one non-conflicting rebase, reruns full configured verification, and then performs a normal push to the default branch. `task-branch` pushes only the `codex/*` task branch for later integration. Neither mode permits force push.
+
+## Deliberate exclusions
+
+The active design has no Goal mode, unattended daemon, GitHub App identity gate, mandatory pull request, mandatory approval, or Ruleset gate. It does not poll Issues, run silently, deploy production, or let Mac mini expand scope. GitHub Issues preserve the current contract and evidence; the Codex App conversations remain visible to the user.
+
+The final unattended implementation is preserved at Git tag `legacy-worker-v0.1.0`. Historical source and operating documents can be inspected from that tag without keeping two runnable protocols on the default branch.
 
 ## Development
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/pytest
+.venv/bin/pytest -q
 ```
 
-Set up the dispatch device with [docs/MACBOOK_SETUP.md](docs/MACBOOK_SETUP.md), then follow [docs/MAC_MINI_SETUP.md](docs/MAC_MINI_SETUP.md) on the always-on Worker. Day-to-day commands and failure handling are in [docs/OPERATIONS.md](docs/OPERATIONS.md); the trust boundaries are in [docs/SECURITY.md](docs/SECURITY.md).
+The approved design and implementation plan are under `docs/superpowers/`.

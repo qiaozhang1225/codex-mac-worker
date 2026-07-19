@@ -1,4 +1,0 @@
-interface:
-  display_name: "派发 Codex Worker 任务"
-  short_description: "MacBook principal agent 的受控委派与 Worker 交付治理"
-  default_prompt: "Use $dispatch-codex-task to decide local versus delegated development and govern one bounded Mac mini Worker task."

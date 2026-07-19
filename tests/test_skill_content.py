@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import re
+import sqlite3
+import subprocess
 
 import yaml
 
@@ -23,9 +26,9 @@ REQUIRED_SCRIPTS = (
     "git_deliver.py",
 )
 FORBIDDEN_ACTIVE = (
-    "worker_github_app_id",
+    "worker_github_app" + "_id",
     "readiness attestation",
-    "merge_mode",
+    "merge_" + "mode",
     "approval fingerprint",
     "codex exec",
     "LaunchDaemon",
@@ -111,3 +114,163 @@ def test_openai_metadata_names_the_skill() -> None:
     assert metadata["interface"]["display_name"] == "双 Mac Codex 协作"
     assert "GitHub Issue" in metadata["interface"]["short_description"]
     assert "$dual-mac-collaboration" in metadata["interface"]["default_prompt"]
+
+
+def _fake_install_tools(tmp_path: Path, head: str) -> tuple[Path, Path]:
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "install-tools.log"
+    python = bin_dir / "python3.12"
+    python.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$DUOMAC_TEST_LOG"
+if [ "$1" = "--version" ]; then
+  echo 'Python 3.12.9'
+elif [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
+  mkdir -p "$3/bin"
+  cp "$0" "$3/bin/python"
+fi
+""",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+    git = bin_dir / "git"
+    git.write_text(
+        f"#!/bin/sh\nif [ \"$1 $2\" = \"rev-parse HEAD\" ]; then echo '{head}'; else echo 'git version 2.50.0'; fi\n",
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o755)
+    return bin_dir, log
+
+
+def test_installer_copies_skill_and_records_source_commit(tmp_path: Path) -> None:
+    head = "d" * 40
+    bin_dir, log = _fake_install_tools(tmp_path, head)
+    home = tmp_path / "home"
+    app_root = tmp_path / "app"
+    skills_root = tmp_path / "skills"
+    wrapper_root = tmp_path / "bin"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "HOME": str(home),
+        "CODEX_HOME": str(tmp_path / "codex-home"),
+        "DUOMAC_APP_ROOT": str(app_root),
+        "DUOMAC_SKILLS_ROOT": str(skills_root),
+        "DUOMAC_BIN_ROOT": str(wrapper_root),
+        "DUOMAC_TEST_LOG": str(log),
+    }
+
+    result = subprocess.run(
+        ["/bin/zsh", str(ROOT / "scripts/install_skill.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    installed = skills_root / "dual-mac-collaboration"
+    assert (installed / "SKILL.md").is_file()
+    assert (installed / ".source-commit").read_text(encoding="utf-8").strip() == head
+    assert "-m pip install PyYAML>=6,<7" in log.read_text(encoding="utf-8")
+    wrapper_names = (
+        "duomac-issue-validate",
+        "duomac-issue-create",
+        "duomac-issue-checkpoint",
+        "duomac-issue-complete",
+        "duomac-git-preflight",
+        "duomac-git-deliver",
+    )
+    for name in wrapper_names:
+        wrapper = wrapper_root / name
+        assert wrapper.is_file()
+        assert os.access(wrapper, os.X_OK)
+
+
+def test_installer_removes_old_client_only_with_explicit_flag(tmp_path: Path) -> None:
+    bin_dir, log = _fake_install_tools(tmp_path, "e" * 40)
+    skills_root = tmp_path / "skills"
+    old_skill = skills_root / "dispatch-codex-task"
+    old_skill.mkdir(parents=True)
+    wrapper_root = tmp_path / "bin"
+    wrapper_root.mkdir()
+    old_cli = wrapper_root / ("codex" + "ctl")
+    old_cli.symlink_to("/tmp/old-" + "codex" + "ctl")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "HOME": str(tmp_path / "home"),
+        "DUOMAC_APP_ROOT": str(tmp_path / "app"),
+        "DUOMAC_SKILLS_ROOT": str(skills_root),
+        "DUOMAC_BIN_ROOT": str(wrapper_root),
+        "DUOMAC_TEST_LOG": str(log),
+    }
+
+    first = subprocess.run(
+        ["/bin/zsh", str(ROOT / "scripts/install_skill.sh")],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    assert old_skill.exists()
+    assert old_cli.is_symlink()
+
+    second = subprocess.run(
+        [
+            "/bin/zsh",
+            str(ROOT / "scripts/install_skill.sh"),
+            "--remove-legacy-client",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    assert not old_skill.exists()
+    assert not old_cli.exists()
+
+
+def test_retirement_refuses_nonterminal_task_before_mutation(tmp_path: Path) -> None:
+    app_root = tmp_path / "legacy-app"
+    state = app_root / "state"
+    config = app_root / "config"
+    state.mkdir(parents=True)
+    config.mkdir()
+    database = state / "worker.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("create table tasks (state text not null)")
+        connection.execute("insert into tasks values ('running')")
+    (config / "worker.toml").write_text("enabled = true\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/zsh", str(ROOT / "scripts/retire_legacy_worker.sh"), "--apply"],
+        cwd=ROOT,
+        env={**os.environ, "DUOMAC_APP_ROOT": str(app_root)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "nonterminal" in result.stderr
+    assert not (app_root / "backups").exists()
+
+
+def test_main_tree_has_no_legacy_entry_points() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "codex" + "-worker" not in pyproject
+    assert "codex" + "ctl" not in pyproject
+    assert not (ROOT / "src/codex_mac_worker").exists()
+    assert not (ROOT / "skills/dispatch-codex-task").exists()
+    assert not (ROOT / "templates").exists()
