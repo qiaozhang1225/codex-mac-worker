@@ -199,5 +199,17 @@ class GhClient:
         args.extend(["--add-label", label])
         self._run(args)
 
+    def has_label(self, ref: IssueRef, label: str) -> bool:
+        if label not in STATUS_LABELS:
+            raise GhError(f"unknown dual-Mac state label: {label}")
+        return label in self._labels(ref)
+
+    def issue_state(self, ref: IssueRef) -> str:
+        value = self._json(["issue", "view", ref.url, "--json", "state"])
+        state = value.get("state")
+        if state not in {"OPEN", "CLOSED"}:
+            raise GhError("GitHub Issue state is missing or invalid")
+        return state
+
     def close(self, ref: IssueRef) -> None:
         self._run(["issue", "close", ref.url])

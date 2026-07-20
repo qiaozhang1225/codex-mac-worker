@@ -119,6 +119,9 @@ with Path(os.environ["GH_FAKE_LOG"]).open("a", encoding="utf-8") as stream:
 if os.environ.get("GH_FAKE_UNAUTHENTICATED") == "1":
     print("authentication required", file=sys.stderr)
     raise SystemExit(4)
+if os.environ.get("GH_FAKE_FAIL_COMMAND") == " ".join(args[:2]):
+    print("injected gh failure", file=sys.stderr)
+    raise SystemExit(5)
 fixture = json.loads(Path(os.environ["GH_FAKE_FIXTURE"]).read_text())
 if args[:2] == ["issue", "create"]:
     print(fixture["issue_url"])
@@ -130,6 +133,8 @@ elif args[:2] == ["issue", "view"] and "--json" in args:
         print(json.dumps({"labels": [{"name": item} for item in fixture["labels"]]}))
     elif field == "comments":
         print(json.dumps({"comments": fixture.get("comments", [])}))
+    elif field == "state":
+        print(json.dumps({"state": fixture.get("state", "OPEN")}))
     else:
         print("unsupported fixture field", file=sys.stderr)
         raise SystemExit(2)
@@ -206,6 +211,32 @@ def checkpoint_event(milestone: int) -> dict[str, object]:
     payload = valid_checkpoint()
     payload["milestone"] = milestone
     return event_comment(payload, f"IC_{milestone}")
+
+
+def completion_comments(*events: dict[str, object]) -> list[dict[str, object]]:
+    return [
+        event_comment(valid_task_start()),
+        checkpoint_event(1),
+        checkpoint_event(2),
+        *events,
+    ]
+
+
+def set_issue_fixture(
+    cli_env: dict[str, str],
+    *,
+    comments: list[dict[str, object]],
+    labels: list[str] | None = None,
+    state: str | None = None,
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text(encoding="utf-8"))
+    value["comments"] = comments
+    if labels is not None:
+        value["labels"] = labels
+    if state is not None:
+        value["state"] = state
+    fixture.write_text(json.dumps(value), encoding="utf-8")
 
 
 def valid_delivery(mode: str = "direct-main") -> dict[str, object]:
@@ -1125,6 +1156,219 @@ def test_completion_rejects_not_met_acceptance(
 
     assert result.returncode != 0
     assert "all acceptance results must be met" in result.stderr
+
+
+def test_completion_preview_rejects_absent_task_start(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    set_issue_fixture(cli_env, comments=[checkpoint_event(1), checkpoint_event(2)])
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "exactly one current-revision task-start" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
+@pytest.mark.parametrize(
+    ("comments", "message"),
+    [
+        (
+            [event_comment(valid_task_start()), checkpoint_event(1), checkpoint_event(1)],
+            "existing checkpoint milestones must be continuous from 1",
+        ),
+        (
+            [event_comment(valid_task_start()), checkpoint_event(2)],
+            "existing checkpoint milestones must be continuous from 1",
+        ),
+        (
+            completion_comments(checkpoint_event(3)),
+            "historical checkpoint milestone 3 is not declared",
+        ),
+        (
+            [
+                event_comment(valid_task_start()),
+                event_comment(
+                    {**valid_checkpoint(), "blockers": ["waiting on dependency"]}
+                ),
+                checkpoint_event(2),
+            ],
+            "checkpoint blockers must be empty",
+        ),
+    ],
+)
+def test_completion_preview_rejects_invalid_checkpoint_history(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    comments: list[dict[str, object]],
+    message: str,
+) -> None:
+    set_issue_fixture(cli_env, comments=comments)
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_completion_preview_rejects_current_blocked_event(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    blocked = event_comment(
+        {
+            "type": "blocked",
+            "revision": 2,
+            "reason": "Need approval",
+            "completed": [],
+            "next": ["Wait for approval"],
+        }
+    )
+    set_issue_fixture(cli_env, comments=completion_comments(blocked))
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "current revision contains an unresolved blocked event" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        {**valid_delivery(), "commit": "e" * 40},
+        {"type": "delivery", "revision": 2},
+    ],
+)
+def test_completion_preview_rejects_conflicting_or_malformed_delivery_history(
+    cli_env: dict[str, str], tmp_path: Path, delivery: dict[str, object]
+) -> None:
+    set_issue_fixture(cli_env, comments=completion_comments(event_comment(delivery)))
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_completion_first_run_comments_before_label_and_close(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    set_issue_fixture(cli_env, comments=completion_comments())
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    mutations = [
+        call["argv"][:2]
+        for call in gh_calls(cli_env)
+        if call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+    ]
+    assert mutations == [["issue", "comment"], ["issue", "edit"], ["issue", "close"]]
+
+
+def test_completion_rerun_repairs_without_duplicate_delivery_comment(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_delivery()
+    set_issue_fixture(
+        cli_env,
+        comments=completion_comments(event_comment(payload, "IC_delivery")),
+        labels=["bug", "duomac:ready"],
+        state="OPEN",
+    )
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    mutations = [
+        call["argv"][:2]
+        for call in gh_calls(cli_env)
+        if call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+    ]
+    assert mutations == [["issue", "edit"], ["issue", "close"]]
+
+
+def test_completion_comment_failure_prevents_label_and_close_mutations(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    set_issue_fixture(cli_env, comments=completion_comments())
+    cli_env["GH_FAKE_FAIL_COMMAND"] = "issue comment"
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert not any(
+        call["argv"][:2] in (["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
 
 
 def test_completed_direct_main_closes_issue(cli_env: dict[str, str], tmp_path: Path) -> None:

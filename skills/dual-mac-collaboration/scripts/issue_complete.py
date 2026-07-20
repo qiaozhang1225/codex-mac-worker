@@ -118,6 +118,22 @@ def validate_checkpoint_completion(
         )
 
 
+def validate_delivery_history(
+    payload: dict[str, Any], spec: TaskSpec, state: str, events: tuple[IssueEvent, ...]
+) -> bool:
+    current = current_revision_events(events, spec.revision)
+    deliveries = [
+        event.payload for event in current if event.payload.get("type") == "delivery"
+    ]
+    for delivery in deliveries:
+        validate_delivery(delivery, spec, state)
+    if not deliveries:
+        return False
+    if any(delivery != payload for delivery in deliveries):
+        raise ContractError("current revision contains a conflicting delivery event")
+    return True
+
+
 def render_event(payload: dict[str, Any]) -> str:
     rendered = yaml.safe_dump(payload, allow_unicode=True, sort_keys=False).rstrip()
     return f"{EVENT_MARKER}\n```yaml\n{rendered}\n```\n"
@@ -139,6 +155,7 @@ def main() -> int:
         validate_delivery(payload, spec, args.state)
         events = parse_issue_events(client.issue_comments(ref))
         validate_checkpoint_completion(spec, events)
+        delivery_exists = validate_delivery_history(payload, spec, args.state, events)
         if not args.yes:
             print(
                 json.dumps(
@@ -152,9 +169,15 @@ def main() -> int:
                 )
             )
             return 0
-        client.set_state_label(ref, f"duomac:{args.state}")
-        client.comment(ref, render_event(payload))
-        if args.state == "completed":
+        issue_is_open = (
+            args.state == "completed" and client.issue_state(ref) == "OPEN"
+        )
+        if not delivery_exists:
+            client.comment(ref, render_event(payload))
+        target_label = f"duomac:{args.state}"
+        if not delivery_exists or not client.has_label(ref, target_label):
+            client.set_state_label(ref, target_label)
+        if issue_is_open:
             client.close(ref)
     except (ContractError, GhError, OSError) as exc:
         print(str(exc), file=sys.stderr)
