@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -180,10 +181,21 @@ def event_comment(
     }
 
 
-def valid_task_start(*, claim_id: str = "c" * 40) -> dict[str, object]:
+def valid_task_start(
+    *,
+    claim_id: str = "c" * 40,
+    task_hash: str | None = None,
+    repository: str = "owner/repo",
+    base_branch: str = "main",
+    context_commit: str = "a" * 40,
+) -> dict[str, object]:
     return {
         "type": "task-start",
         "revision": 2,
+        "task_hash": task_hash or hashlib.sha256(VALID_BODY.encode("utf-8")).hexdigest(),
+        "repository": repository,
+        "base_branch": base_branch,
+        "context_commit": context_commit,
         "skill_commit": "d" * 40,
         "base_commit": "a" * 40,
         "plan_summary": ["Execute two milestones"],
@@ -608,6 +620,30 @@ def test_task_start_rejects_different_claim_without_mutation(
     )
 
 
+def test_task_start_rejects_same_claim_with_different_task_binding(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(valid_task_start())]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    changed = valid_task_start(task_hash="e" * 64)
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, changed),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "binding" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -615,6 +651,11 @@ def test_task_start_rejects_different_claim_without_mutation(
         ({"slot": 0}, "slot"),
         ({"slot": True}, "slot"),
         ({"claim_id": "C" * 40}, "claim_id"),
+        ({"task_hash": "A" * 64}, "task_hash"),
+        ({"repository": "not-a-repository"}, "repository"),
+        ({"base_branch": ""}, "base_branch"),
+        ({"base_branch": "main..raced"}, "base_branch"),
+        ({"context_commit": "not-a-commit"}, "context_commit"),
     ],
 )
 def test_task_start_rejects_invalid_scheduled_identity(
@@ -640,6 +681,54 @@ def test_task_start_rejects_invalid_scheduled_identity(
         call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
         for call in gh_calls(cli_env)
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["task_hash", "repository", "base_branch", "context_commit"],
+)
+def test_task_start_rejects_missing_scheduled_binding_field(
+    cli_env: dict[str, str], tmp_path: Path, field: str
+) -> None:
+    payload = valid_task_start()
+    payload.pop(field)
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert field in result.stderr
+
+
+def test_interactive_task_start_remains_compatible_without_scheduled_binding(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_task_start()
+    payload["execution_mode"] = "interactive"
+    for field in (
+        "slot",
+        "claim_id",
+        "task_hash",
+        "repository",
+        "base_branch",
+        "context_commit",
+    ):
+        payload.pop(field)
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

@@ -84,6 +84,7 @@ class Candidate:
     labels: tuple[str, ...] = ()
     events: tuple[IssueEvent, ...] = ()
     state: str = "open"
+    task_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)

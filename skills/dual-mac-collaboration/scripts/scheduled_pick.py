@@ -17,6 +17,7 @@ from duomac_contracts import (
     TaskSpec,
     parse_issue_body,
     require_current_schema,
+    task_body_hash,
 )
 from duomac_github import (
     GhClient,
@@ -42,6 +43,18 @@ from issue_checkpoint import apply_event, validate_payload
 
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SCHEDULED_BINDING_FIELDS = (
+    "task_hash",
+    "repository",
+    "base_branch",
+    "context_commit",
+    "skill_commit",
+    "base_commit",
+    "revision",
+    "execution_mode",
+    "slot",
+    "claim_id",
+)
 _INVALID_CONTRACT_DIAGNOSTIC = """<!-- duomac-scheduled-diagnostic:v1 -->
 ```yaml
 type: blocked
@@ -118,6 +131,7 @@ def _active_issue(
             labels=summary.labels,
             events=all_events,
             state="open",
+            task_hash=task_body_hash(summary.body),
         ),
     )
 
@@ -141,6 +155,7 @@ def _ready_candidate(
         labels=summary.labels,
         events=_events(client, summary),
         state="open",
+        task_hash=task_body_hash(summary.body),
     )
 
 
@@ -243,18 +258,20 @@ def _claim_value(
     *,
     candidate: Candidate,
     target: RepositoryTarget,
-    slot: int,
-    claim_id: str,
-    base_commit: str,
+    payload: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    validate_payload(payload)
+    claim = {
         "issue_url": candidate.issue_url,
         "repo": candidate.repo,
         "local_path": str(target.local_path),
-        "slot": slot,
-        "claim_id": claim_id,
-        "base_commit": base_commit,
     }
+    claim.update({field: payload[field] for field in _SCHEDULED_BINDING_FIELDS})
+    return claim
+
+
+def _same_task_binding(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return all(left.get(field) == right.get(field) for field in _SCHEDULED_BINDING_FIELDS)
 
 
 def _write_claim(app_root: Path, claim: dict[str, Any]) -> None:
@@ -286,6 +303,13 @@ def _current_task_start(candidate: Candidate) -> IssueEvent | None:
         validate_payload(starts[0].payload)
     except ContractError:
         return None
+    payload = starts[0].payload
+    if payload.get("execution_mode") == "scheduled" and (
+        payload.get("task_hash") != candidate.task_hash
+        or payload.get("repository", "").casefold() != candidate.repo.casefold()
+        or payload.get("context_commit") != candidate.spec.context_commit
+    ):
+        return None
     return starts[0]
 
 
@@ -309,9 +333,7 @@ def _repair_ready_claims(
                 _claim_value(
                     candidate=candidate,
                     target=target,
-                    slot=payload["slot"],
-                    claim_id=payload["claim_id"],
-                    base_commit=payload["base_commit"],
+                    payload=payload,
                 ),
             )
         repaired = True
@@ -335,9 +357,7 @@ def _repair_active_claims(
             _claim_value(
                 candidate=candidate,
                 target=_target_for(config, candidate.repo),
-                slot=payload["slot"],
-                claim_id=payload["claim_id"],
-                base_commit=payload["base_commit"],
+                payload=payload,
             ),
         )
 
@@ -345,7 +365,7 @@ def _repair_active_claims(
 def _claim_is_authoritative(
     client: GhClient,
     candidate: Candidate,
-    claim_id: str,
+    payload: dict[str, Any],
 ) -> bool:
     events = current_revision_events(
         parse_issue_events(
@@ -360,7 +380,41 @@ def _claim_is_authoritative(
         validate_payload(starts[0].payload)
     except ContractError:
         return False
-    return starts[0].payload.get("claim_id") == claim_id
+    return _same_task_binding(starts[0].payload, payload)
+
+
+def _revalidate_selected(
+    client: GhClient,
+    candidate: Candidate,
+    active: tuple[ActiveTask, ...],
+    maximum: int,
+) -> Candidate | None:
+    snapshot = client.issue_snapshot(IssueRef.parse(candidate.issue_url))
+    try:
+        spec = parse_issue_body(snapshot.body)
+        require_current_schema(spec)
+        events = parse_issue_events(snapshot.comments)
+    except (ContractError, GhError):
+        return None
+    fresh = Candidate(
+        repo=candidate.repo,
+        issue_url=candidate.issue_url,
+        created_at=candidate.created_at,
+        spec=spec,
+        labels=snapshot.labels,
+        events=events,
+        state=snapshot.state,
+        task_hash=task_body_hash(snapshot.body),
+    )
+    if (
+        fresh.task_hash != candidate.task_hash
+        or fresh.spec != candidate.spec
+        or fresh.spec.revision != candidate.spec.revision
+        or fresh.spec.context_commit != candidate.spec.context_commit
+    ):
+        return None
+    result = select_candidate_result((fresh,), active, maximum)
+    return fresh if result.candidate == fresh else None
 
 
 def _preview_result(candidate: Candidate, target: RepositoryTarget, slot: int) -> PickResult:
@@ -378,29 +432,28 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
     if not isinstance(slot, int) or isinstance(slot, bool) or slot not in {1, 2, 3}:
         raise PickError("slot must be 1, 2, or 3")
     config = load_scheduled_config(config_path)
+    client = GhClient()
+    if not apply:
+        state = _read_github_state(client, config)
+        selection = select_candidate_result(
+            state.ready, state.active, config.max_parallel_tasks
+        )
+        if selection.candidate is None:
+            return PickResult(False, selection.reason)
+        return _preview_result(
+            selection.candidate,
+            _target_for(config, selection.candidate.repo),
+            slot,
+        )
+
     root = app_root.expanduser().resolve()
     if root.exists() and not root.is_dir():
         raise PickError("application root must be a directory")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    client = GhClient()
-
-    if apply:
-        _read_github_state(client, config)
+    _read_github_state(client, config)
 
     with dispatch_lock(root / "dispatch.lock"):
         state = _read_github_state(client, config)
-        if not apply:
-            selection = select_candidate_result(
-                state.ready, state.active, config.max_parallel_tasks
-            )
-            if selection.candidate is None:
-                return PickResult(False, selection.reason)
-            return _preview_result(
-                selection.candidate,
-                _target_for(config, selection.candidate.repo),
-                slot,
-            )
-
         _repair_active_claims(config, root, state.active_candidates)
         if _repair_ready_claims(client, config, root, state.ready):
             state = _read_github_state(client, config)
@@ -429,18 +482,22 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
             _block_candidate(client, candidate)
             return PickResult(False, "invalid-candidates-blocked")
 
-        claim_id = secrets.token_hex(20)
-        claim = _claim_value(
-            candidate=candidate,
-            target=target,
-            slot=slot,
-            claim_id=claim_id,
-            base_commit=evidence.base_commit,
+        skill_commit = _installed_skill_commit()
+        fresh = _revalidate_selected(
+            client, candidate, state.active, config.max_parallel_tasks
         )
+        if fresh is None:
+            return PickResult(False, "invalid-candidates-blocked")
+        candidate = fresh
+        claim_id = secrets.token_hex(20)
         payload = {
             "type": "task-start",
             "revision": candidate.spec.revision,
-            "skill_commit": _installed_skill_commit(),
+            "task_hash": candidate.task_hash,
+            "repository": candidate.repo,
+            "base_branch": evidence.project.default_base_branch,
+            "context_commit": candidate.spec.context_commit,
+            "skill_commit": skill_commit,
             "base_commit": evidence.base_commit,
             "plan_summary": [
                 milestone.objective for milestone in candidate.spec.execution_plan
@@ -449,6 +506,7 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
             "slot": slot,
             "claim_id": claim_id,
         }
+        claim = _claim_value(candidate=candidate, target=target, payload=payload)
         try:
             apply_event(
                 client,
@@ -456,14 +514,25 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
                 candidate.spec,
                 payload,
             )
+        except ContractError:
+            return PickResult(False, "invalid-candidates-blocked")
         except GhError as exc:
-            if not _claim_is_authoritative(client, candidate, claim_id):
+            if not _claim_is_authoritative(client, candidate, payload):
                 raise PickError("GitHub task-start publication failed") from exc
         try:
             _write_claim(root, claim)
         except OSError:
             pass
-        return PickResult(claimed=True, reason="selected", **claim)
+        return PickResult(
+            claimed=True,
+            reason="selected",
+            issue_url=candidate.issue_url,
+            repo=candidate.repo,
+            local_path=str(target.local_path),
+            slot=slot,
+            claim_id=claim_id,
+            base_commit=evidence.base_commit,
+        )
 
 
 def main() -> int:

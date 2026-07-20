@@ -71,6 +71,14 @@ class IssueSummary:
     labels: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class IssueSnapshot:
+    body: str
+    state: str
+    labels: tuple[str, ...]
+    comments: tuple[dict[str, Any], ...]
+
+
 def parse_issue_events(
     comments: tuple[dict[str, Any], ...],
 ) -> tuple[IssueEvent, ...]:
@@ -220,6 +228,34 @@ class GhClient:
         ):
             raise GhError("GitHub Issue comments have an unexpected shape")
         return tuple(comments)
+
+    def issue_snapshot(self, ref: IssueRef) -> IssueSnapshot:
+        value = self._json(
+            ["issue", "view", ref.url, "--json", "body,state,labels,comments"]
+        )
+        body = value.get("body")
+        state = value.get("state")
+        labels = value.get("labels")
+        comments = value.get("comments")
+        if not isinstance(body, str):
+            raise GhError("GitHub Issue body is missing")
+        if state not in {"OPEN", "CLOSED"}:
+            raise GhError("GitHub Issue state is missing or invalid")
+        if not isinstance(labels, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("name"), str)
+            for item in labels
+        ):
+            raise GhError("GitHub Issue labels have an unexpected shape")
+        if not isinstance(comments, list) or not all(
+            isinstance(item, dict) for item in comments
+        ):
+            raise GhError("GitHub Issue comments have an unexpected shape")
+        return IssueSnapshot(
+            body=body,
+            state=state.casefold(),
+            labels=tuple(item["name"] for item in labels),
+            comments=tuple(comments),
+        )
 
     def create_issue(self, repo: str, title: str, body: str) -> str:
         if _REPOSITORY.fullmatch(repo) is None:

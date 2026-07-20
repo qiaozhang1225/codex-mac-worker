@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path, PurePosixPath
 import re
 import tomllib
@@ -29,6 +30,13 @@ _FORBIDDEN_OPERATIONS = (
 
 class ContractError(ValueError):
     """Raised when a project config or Issue task contract is invalid."""
+
+
+def task_body_hash(text: str) -> str:
+    """Bind authority to the exact UTF-8 GitHub Issue body representation."""
+    if not isinstance(text, str):
+        raise ContractError("Issue body must be text before hashing")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import os
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -12,7 +14,7 @@ from typing import cast
 import pytest
 
 from duomac_contracts import ContractError, TaskSpec, parse_issue_body
-from duomac_github import IssueEvent
+from duomac_github import IssueEvent, parse_issue_events
 from duomac_scheduled import (
     ActiveTask,
     Candidate,
@@ -110,6 +112,10 @@ def task_start_event(revision: int) -> IssueEvent:
         payload={
             "type": "task-start",
             "revision": revision,
+            "task_hash": hashlib.sha256(VALID_BODY.encode("utf-8")).hexdigest(),
+            "repository": "owner/repo",
+            "base_branch": "main",
+            "context_commit": "a" * 40,
             "skill_commit": "a" * 40,
             "base_commit": "b" * 40,
             "plan_summary": ["Start the task"],
@@ -456,6 +462,17 @@ class ScheduledEnv:
         claims = self.app_root / "claims"
         return sorted(claims.glob("*.json")) if claims.is_dir() else []
 
+    def scheduled_start(self, *, claim_id: str = "c" * 40) -> dict[str, object]:
+        issue = self.state()["issues"][0]
+        spec = parse_issue_body(issue["body"])
+        return valid_task_start(
+            claim_id=claim_id,
+            task_hash=hashlib.sha256(issue["body"].encode("utf-8")).hexdigest(),
+            repository=issue["repo"],
+            base_branch="main",
+            context_commit=spec.context_commit,
+        )
+
     def run_two_pickers_concurrently(
         self, first_slot: int, second_slot: int
     ) -> tuple[subprocess.CompletedProcess[str], subprocess.CompletedProcess[str]]:
@@ -603,6 +620,8 @@ local_path = "{repositories[1][1]}"
         encoding="utf-8",
     )
 
+    real_git = shutil.which("git")
+    assert real_git is not None
     gh = bin_dir / "gh"
     gh.write_text(
         '''#!/usr/bin/env python3
@@ -686,6 +705,13 @@ elif args[:2] == ["issue", "view"]:
         print(json.dumps({"labels": [{"name": name} for name in issue["labels"]]}))
     elif field == "state":
         print(json.dumps({"state": issue["state"]}))
+    elif field == "body,state,labels,comments":
+        print(json.dumps({
+            "body": issue["body"],
+            "state": issue["state"],
+            "labels": [{"name": name} for name in issue["labels"]],
+            "comments": issue["comments"],
+        }))
     else:
         print("unsupported issue view field", file=sys.stderr)
         raise SystemExit(2)
@@ -728,6 +754,84 @@ else:
         encoding="utf-8",
     )
     gh.chmod(0o755)
+    git = bin_dir / "git"
+    git.write_text(
+        f'''#!/usr/bin/env python3
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+result = subprocess.run(
+    [{real_git!r}, *sys.argv[1:]],
+    input=sys.stdin.read(),
+    text=True,
+    capture_output=True,
+    check=False,
+)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+mutation = os.environ.get("GH_FAKE_GIT_MUTATION")
+if result.returncode == 0 and mutation and "fetch" in sys.argv[1:]:
+    fixture_path = Path(os.environ["GH_FAKE_FIXTURE"])
+    lock_path = fixture_path.with_suffix(".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        value = json.loads(fixture_path.read_text(encoding="utf-8"))
+        if not value.get("git_mutated"):
+            issue = value["issues"][0]
+            if mutation == "body":
+                issue["body"] += "\\n<!-- raced body edit -->\\n"
+            elif mutation == "labels":
+                issue["labels"] = []
+            elif mutation == "cancel":
+                issue["labels"] = ["duomac:cancelled"]
+            elif mutation == "blocked_label":
+                issue["labels"] = ["duomac:blocked"]
+            elif mutation == "state":
+                issue["state"] = "CLOSED"
+            elif mutation in {{"claim", "terminal"}}:
+                if mutation == "claim":
+                    context = re.search(r"commit:\\s+([0-9a-f]{{40}})", issue["body"]).group(1)
+                    body_hash = hashlib.sha256(issue["body"].encode("utf-8")).hexdigest()
+                    payload = f"""type: task-start
+revision: 2
+task_hash: {{body_hash}}
+repository: {{issue['repo']}}
+base_branch: main
+context_commit: {{context}}
+skill_commit: {{'d' * 40}}
+base_commit: {{context}}
+plan_summary:
+  - Raced claim
+execution_mode: scheduled
+slot: 3
+claim_id: {{'e' * 40}}"""
+                else:
+                    payload = """type: blocked
+revision: 2
+reason: Raced terminal event
+completed: []
+next:
+  - Publish a new revision"""
+                issue["comments"].append({{
+                    "id": "IC_race",
+                    "createdAt": "2026-07-20T00:00:00Z",
+                    "body": f"<!-- duomac-event:v1 -->\\n```yaml\\n{{payload}}\\n```\\n",
+                }})
+            value["git_mutated"] = True
+            temporary = fixture_path.with_suffix(f".tmp.{{os.getpid()}}")
+            temporary.write_text(json.dumps(value), encoding="utf-8")
+            temporary.replace(fixture_path)
+raise SystemExit(result.returncode)
+''',
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
     app_root = tmp_path / "app"
     app_root.mkdir()
     env = {
@@ -740,6 +844,14 @@ else:
 
 
 def test_picker_preview_has_no_github_writes(scheduled_env: ScheduledEnv) -> None:
+    sentinel = scheduled_env.app_root / "sentinel.txt"
+    sentinel.write_bytes(b"unchanged\x00bytes")
+    before = {
+        path.relative_to(scheduled_env.app_root): path.read_bytes()
+        for path in scheduled_env.app_root.rglob("*")
+        if path.is_file()
+    }
+
     result = scheduled_env.run_picker("--slot", "1")
 
     assert result.returncode == 0, result.stderr
@@ -747,6 +859,24 @@ def test_picker_preview_has_no_github_writes(scheduled_env: ScheduledEnv) -> Non
     assert output["claimed"] is False
     assert output["reason"] == "preview"
     assert not scheduled_env.github_writes()
+    after = {
+        path.relative_to(scheduled_env.app_root): path.read_bytes()
+        for path in scheduled_env.app_root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_picker_preview_does_not_create_missing_application_root(
+    scheduled_env: ScheduledEnv,
+) -> None:
+    missing = scheduled_env.app_root.parent / "missing-app-root"
+    env = replace(scheduled_env, app_root=missing)
+
+    result = env.run_picker("--slot", "1")
+
+    assert result.returncode == 0, result.stderr
+    assert not missing.exists()
 
 
 def test_picker_claims_oldest_eligible_issue_once(scheduled_env: ScheduledEnv) -> None:
@@ -761,6 +891,24 @@ def test_picker_claims_oldest_eligible_issue_once(scheduled_env: ScheduledEnv) -
     assert json.loads(second.stdout)["claimed"] is False
     assert len(scheduled_env.task_start_comments()) == 1
     assert len(scheduled_env.claim_files()) == 1
+    issue = scheduled_env.state()["issues"][0]
+    task_start = parse_issue_events(tuple(issue["comments"]))[0].payload
+    spec = parse_issue_body(issue["body"])
+    expected = {
+        "task_hash": hashlib.sha256(issue["body"].encode("utf-8")).hexdigest(),
+        "repository": issue["repo"],
+        "base_branch": "main",
+        "context_commit": spec.context_commit,
+        "skill_commit": _git(ROOT, "rev-parse", "HEAD"),
+        "base_commit": _git(scheduled_env.repository_path(), "rev-parse", "origin/main"),
+        "revision": spec.revision,
+        "execution_mode": "scheduled",
+        "slot": 1,
+        "claim_id": first_output["claim_id"],
+    }
+    assert {field: task_start[field] for field in expected} == expected
+    local_claim = json.loads(scheduled_env.claim_files()[0].read_text(encoding="utf-8"))
+    assert {field: local_claim[field] for field in expected} == expected
     assert [call["argv"][:2] for call in scheduled_env.github_writes()[:2]] == [
         ["issue", "comment"],
         ["issue", "edit"],
@@ -782,7 +930,8 @@ def test_picker_repairs_active_label_after_task_start_comment(
     scheduled_env: ScheduledEnv,
 ) -> None:
     claim_id = "c" * 40
-    scheduled_env.add_comment(event_comment(valid_task_start(claim_id=claim_id)))
+    payload = scheduled_env.scheduled_start(claim_id=claim_id)
+    scheduled_env.add_comment(event_comment(payload))
     scheduled_env.set_labels(["duomac:ready"])
 
     result = scheduled_env.run_picker("--slot", "1", "--yes")
@@ -791,6 +940,19 @@ def test_picker_repairs_active_label_after_task_start_comment(
     assert scheduled_env.current_label() == "duomac:active"
     assert len(scheduled_env.task_start_comments()) == 1
     assert len(scheduled_env.claim_files()) == 1
+    local_claim = json.loads(scheduled_env.claim_files()[0].read_text(encoding="utf-8"))
+    assert all(local_claim[field] == payload[field] for field in (
+        "task_hash",
+        "repository",
+        "base_branch",
+        "context_commit",
+        "skill_commit",
+        "base_commit",
+        "revision",
+        "execution_mode",
+        "slot",
+        "claim_id",
+    ))
 
 
 def test_picker_repairs_missing_local_claim_for_active_issue(
@@ -815,6 +977,8 @@ def test_picker_counts_interactive_active_issue_without_local_scheduled_claim(
     payload["execution_mode"] = "interactive"
     payload.pop("slot")
     payload.pop("claim_id")
+    for field in ("task_hash", "repository", "base_branch", "context_commit"):
+        payload.pop(field)
     scheduled_env.add_comment(event_comment(payload))
     scheduled_env.set_labels(["duomac:active"])
 
@@ -897,3 +1061,26 @@ def test_two_slots_cannot_claim_the_same_issue(scheduled_env: ScheduledEnv) -> N
     assert all(result.returncode == 0 for result in results)
     assert sum(json.loads(result.stdout)["claimed"] for result in results) == 1
     assert len(scheduled_env.task_start_comments()) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["body", "labels", "state", "cancel", "blocked_label", "claim", "terminal"],
+)
+def test_picker_revalidates_selected_issue_after_repository_validation(
+    scheduled_env: ScheduledEnv, mutation: str
+) -> None:
+    scheduled_env.env["GH_FAKE_GIT_MUTATION"] = mutation
+
+    result = scheduled_env.run_picker("--slot", "1", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["claimed"] is False
+    picker_comments = [
+        call for call in scheduled_env.github_writes()
+        if call["argv"][:2] == ["issue", "comment"]
+    ]
+    assert not picker_comments
+    assert not scheduled_env.claim_files()
+    expected_external_starts = 1 if mutation == "claim" else 0
+    assert len(scheduled_env.task_start_comments()) == expected_external_starts

@@ -24,10 +24,31 @@ from duomac_github import (
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _CLAIM_ID = re.compile(r"^[0-9a-f]{40}$")
+_TASK_HASH = re.compile(r"^[0-9a-f]{64}$")
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _PASSING_RESULT = re.compile(r"(?:(?P<count>[0-9]+)\s+)?passed", re.IGNORECASE)
 _FAILURE_MARKER = re.compile(
     r"\b(?:fail(?:s|ed|ing|ure|ures)?|error(?:s|ed|ing)?)\b", re.IGNORECASE
 )
+
+
+def _valid_base_branch(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if value in {".", "@"} or value.startswith(("/", ".")):
+        return False
+    if value.endswith(("/", ".", ".lock")):
+        return False
+    if ".." in value or "//" in value or "@{" in value:
+        return False
+    if any(ord(character) <= 32 or ord(character) == 127 for character in value):
+        return False
+    if any(character in "~^:?*[\\" for character in value):
+        return False
+    return all(
+        component and not component.startswith(".") and not component.endswith(".lock")
+        for component in value.split("/")
+    )
 
 
 def _mapping(path: Path) -> dict[str, Any]:
@@ -106,6 +127,10 @@ def validate_payload(payload: dict[str, Any]) -> str:
         if payload["execution_mode"] == "scheduled":
             slot = payload.get("slot")
             claim_id = payload.get("claim_id")
+            task_hash = payload.get("task_hash")
+            repository = payload.get("repository")
+            base_branch = payload.get("base_branch")
+            context_commit = payload.get("context_commit")
             if (
                 not isinstance(slot, int)
                 or isinstance(slot, bool)
@@ -118,6 +143,28 @@ def validate_payload(payload: dict[str, Any]) -> str:
             ):
                 raise ContractError(
                     "scheduled task-start claim_id must be 40 lowercase hex characters"
+                )
+            if not isinstance(task_hash, str) or _TASK_HASH.fullmatch(task_hash) is None:
+                raise ContractError(
+                    "scheduled task-start task_hash must be 64 lowercase hex characters"
+                )
+            if (
+                not isinstance(repository, str)
+                or _REPOSITORY.fullmatch(repository) is None
+            ):
+                raise ContractError(
+                    "scheduled task-start repository must use OWNER/REPO format"
+                )
+            if not _valid_base_branch(base_branch):
+                raise ContractError(
+                    "scheduled task-start base_branch must be a non-empty branch name"
+                )
+            if (
+                not isinstance(context_commit, str)
+                or _FULL_SHA.fullmatch(context_commit) is None
+            ):
+                raise ContractError(
+                    "scheduled task-start context_commit must be a full commit SHA"
                 )
         return "duomac:active"
     if kind == "checkpoint":
@@ -188,6 +235,27 @@ def _validate_task_start(
         raise ContractError(
             "current Issue revision already has a task-start from a different claim"
         )
+    if payload.get("execution_mode") == "scheduled":
+        binding_fields = (
+            "revision",
+            "task_hash",
+            "repository",
+            "base_branch",
+            "context_commit",
+            "skill_commit",
+            "base_commit",
+            "execution_mode",
+            "slot",
+            "claim_id",
+        )
+        expected = tuple(payload.get(field) for field in binding_fields)
+        if any(
+            tuple(event.payload.get(field) for field in binding_fields) != expected
+            for event in starts
+        ):
+            raise ContractError(
+                "current Issue revision task-start has a different task binding"
+            )
     return True
 
 
