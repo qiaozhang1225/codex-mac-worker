@@ -202,6 +202,12 @@ def valid_checkpoint() -> dict[str, object]:
     }
 
 
+def checkpoint_event(milestone: int) -> dict[str, object]:
+    payload = valid_checkpoint()
+    payload["milestone"] = milestone
+    return event_comment(payload, f"IC_{milestone}")
+
+
 def valid_delivery(mode: str = "direct-main") -> dict[str, object]:
     return {
         "type": "delivery",
@@ -1023,6 +1029,11 @@ def test_delivered_task_branch_stays_open(cli_env: dict[str, str], tmp_path: Pat
     fixture = Path(cli_env["GH_FAKE_FIXTURE"])
     content = json.loads(fixture.read_text(encoding="utf-8"))
     content["issue_body"] = VALID_BODY.replace("direct-main", "task-branch")
+    content["comments"] = [
+        event_comment(valid_task_start()),
+        checkpoint_event(1),
+        checkpoint_event(2),
+    ]
     fixture.write_text(json.dumps(content), encoding="utf-8")
     payload = write_payload(tmp_path, valid_delivery("task-branch"))
 
@@ -1043,7 +1054,88 @@ def test_delivered_task_branch_stays_open(cli_env: dict[str, str], tmp_path: Pat
     assert not any(call["argv"][:2] == ["issue", "close"] for call in calls)
 
 
+def test_completion_rejects_missing_final_checkpoint(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(valid_task_start()), checkpoint_event(1)]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "missing checkpoint milestones: 2" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_completion_accepts_all_current_revision_checkpoints(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        event_comment(valid_task_start()),
+        checkpoint_event(1),
+        checkpoint_event(2),
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_delivery()),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_completion_rejects_not_met_acceptance(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_delivery()
+    payload["acceptance_results"][0]["status"] = "not-met"
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        "--state",
+        "completed",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "all acceptance results must be met" in result.stderr
+
+
 def test_completed_direct_main_closes_issue(cli_env: dict[str, str], tmp_path: Path) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    content = json.loads(fixture.read_text(encoding="utf-8"))
+    content["comments"] = [
+        event_comment(valid_task_start()),
+        checkpoint_event(1),
+        checkpoint_event(2),
+    ]
+    fixture.write_text(json.dumps(content), encoding="utf-8")
     payload = write_payload(tmp_path, valid_delivery())
 
     result = run_script(
@@ -1089,6 +1181,14 @@ def test_completed_rejects_task_branch(cli_env: dict[str, str], tmp_path: Path) 
 def test_issue_complete_is_dry_run_without_yes(
     cli_env: dict[str, str], tmp_path: Path
 ) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    content = json.loads(fixture.read_text(encoding="utf-8"))
+    content["comments"] = [
+        event_comment(valid_task_start()),
+        checkpoint_event(1),
+        checkpoint_event(2),
+    ]
+    fixture.write_text(json.dumps(content), encoding="utf-8")
     payload = write_payload(tmp_path, valid_delivery())
 
     result = run_script(

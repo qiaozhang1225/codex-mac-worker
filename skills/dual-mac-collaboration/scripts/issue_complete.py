@@ -10,8 +10,22 @@ from typing import Any
 
 import yaml
 
-from duomac_contracts import ContractError, TaskSpec, parse_issue_body
-from duomac_github import EVENT_MARKER, GhClient, GhError, IssueRef
+from duomac_contracts import (
+    ContractError,
+    TaskSpec,
+    parse_issue_body,
+    require_current_schema,
+)
+from duomac_github import (
+    EVENT_MARKER,
+    GhClient,
+    GhError,
+    IssueEvent,
+    IssueRef,
+    current_revision_events,
+    parse_issue_events,
+)
+from issue_checkpoint import _checkpoint_milestones, _require_authoritative_task_start
 
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -75,10 +89,33 @@ def validate_delivery(payload: dict[str, Any], spec: TaskSpec, state: str) -> No
         for field in ("criterion", "evidence"):
             if not isinstance(result.get(field), str) or not result[field].strip():
                 raise ContractError(f"acceptance result {field} must be non-empty")
-        if result.get("status") not in {"met", "not-met"}:
-            raise ContractError("acceptance result status must be met or not-met")
+        if result.get("status") != "met":
+            raise ContractError("all acceptance results must be met before delivery")
     _strings(payload, "verification")
     _strings(payload, "remaining_risks", allow_empty=True)
+
+
+def validate_checkpoint_completion(
+    spec: TaskSpec, events: tuple[IssueEvent, ...]
+) -> None:
+    require_current_schema(spec)
+    current = current_revision_events(events, spec.revision)
+    _require_authoritative_task_start(current)
+    if any(event.payload.get("type") == "blocked" for event in current):
+        raise ContractError("current revision contains an unresolved blocked event")
+    milestones = _checkpoint_milestones(current, spec)
+    actual = set(milestones)
+    expected = set(range(1, len(spec.execution_plan) + 1))
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        raise ContractError(
+            "missing checkpoint milestones: " + ", ".join(map(str, missing))
+        )
+    if extra:
+        raise ContractError(
+            "unexpected checkpoint milestones: " + ", ".join(map(str, extra))
+        )
 
 
 def render_event(payload: dict[str, Any]) -> str:
@@ -100,6 +137,8 @@ def main() -> int:
         client = GhClient()
         spec = parse_issue_body(client.issue_body(ref))
         validate_delivery(payload, spec, args.state)
+        events = parse_issue_events(client.issue_comments(ref))
+        validate_checkpoint_completion(spec, events)
         if not args.yes:
             print(
                 json.dumps(
@@ -136,4 +175,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
