@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 
@@ -101,9 +102,10 @@ def test_scheduled_docs_distinguish_clean_noop_from_maintenance() -> None:
         normalized = text.casefold()
         assert "clean no-candidate no-op" in normalized
         assert "maintenance-only" in normalized
-        assert "claimed: false" in normalized
         assert "stop without code execution" in normalized
         assert "report" in normalized and "maintenance" in normalized
+        assert "maintenance_actions" in text
+        assert "outcome" in text
 
 
 def test_references_do_not_chain_to_other_references() -> None:
@@ -333,6 +335,84 @@ def test_installer_rejects_invalid_staged_skill_before_activation(
         / "openai.yaml"
     )
     invalid_metadata.write_text("interface: {}\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/zsh", str(source_root / "scripts" / "install_skill.sh")],
+        cwd=source_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "existing install\n"
+    assert {path.name for path in installed.iterdir()} == {"sentinel.txt"}
+
+
+@pytest.mark.parametrize(
+    ("relative", "replacement"),
+    [
+        ("references/scheduled-execution.md", ""),
+        ("assets/scheduled-slot-prompt.md", ""),
+        (
+            "references/scheduled-execution.md",
+            (
+                SKILL_ROOT / "references" / "scheduled-execution.md"
+            ).read_text(encoding="utf-8").replace(
+                "same visible Codex App Scheduled task",
+                "a later Scheduled task",
+            ),
+        ),
+        (
+            "assets/scheduled-slot-prompt.md",
+            (
+                SKILL_ROOT / "assets" / "scheduled-slot-prompt.md"
+            ).read_text(encoding="utf-8")
+            + "\nUse Goal and codex exec to create Issues automatically.\n",
+        ),
+        (
+            "assets/repositories.toml.example",
+            (
+                SKILL_ROOT / "assets" / "repositories.toml.example"
+            ).read_text(encoding="utf-8")
+            .replace("max_parallel_tasks = 3", "max_parallel_tasks = 4")
+            .replace("poll_interval_minutes = 10", "poll_interval_minutes = 15"),
+        ),
+        (
+            "assets/repositories.toml.example",
+            '''schema_version = 1
+max_parallel_tasks = 3
+poll_interval_minutes = 10
+
+[[repositories]]
+github = "other/EaseWise"
+local_path = "/tmp/EaseWise"
+
+[[repositories]]
+github = "qiaozhang1225/codex-mac-worker"
+local_path = "/Users/qiaoz-macmini/codex-mac-worker"
+''',
+        ),
+    ],
+)
+def test_installer_preserves_existing_install_for_invalid_canonical_content(
+    tmp_path: Path, relative: str, replacement: str
+) -> None:
+    env, _ = installed_test_environment(tmp_path)
+    skills_root = Path(env["DUOMAC_SKILLS_ROOT"])
+    installed = skills_root / "dual-mac-collaboration"
+    installed.mkdir(parents=True)
+    sentinel = installed / "sentinel.txt"
+    sentinel.write_text("existing install\n", encoding="utf-8")
+
+    source_root = tmp_path / "source"
+    (source_root / "scripts").mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "install_skill.sh", source_root / "scripts")
+    shutil.copy2(ROOT / "scripts" / "validate_skill.py", source_root / "scripts")
+    copied_skill = source_root / "skills" / "dual-mac-collaboration"
+    shutil.copytree(SKILL_ROOT, copied_skill)
+    (copied_skill / relative).write_text(replacement, encoding="utf-8")
 
     result = subprocess.run(
         ["/bin/zsh", str(source_root / "scripts" / "install_skill.sh")],

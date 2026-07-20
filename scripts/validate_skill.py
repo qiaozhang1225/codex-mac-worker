@@ -31,6 +31,55 @@ EXPECTED_SCRIPTS = {
     "issue_validate.py",
     "scheduled_pick.py",
 }
+EXPECTED_REPOSITORIES = [
+    {
+        "github": "qiaozhang1225/EaseWise",
+        "local_path": "/Users/qiaoz-macmini/EaseWise",
+    },
+    {
+        "github": "qiaozhang1225/codex-mac-worker",
+        "local_path": "/Users/qiaoz-macmini/codex-mac-worker",
+    },
+]
+SCHEDULED_REFERENCE_BOUNDARIES = (
+    "visible Mac mini Codex App Scheduled run",
+    "Dual Mac Slot 1",
+    "Dual Mac Slot 2",
+    "Dual Mac Slot 3",
+    "claim at most one Issue",
+    "same visible Codex App Scheduled task",
+    "checkpoints are not approval gates",
+    "AGENTS.md",
+    "every Issue-declared context file",
+    "frozen context commit",
+    "Mac mini never creates an Issue automatically",
+    "Goal",
+    "codex exec",
+    "LaunchDaemon Worker",
+)
+SCHEDULED_PROMPT_BOUNDARIES = (
+    "$dual-mac-collaboration",
+    "Dual Mac Slot 1",
+    "Dual Mac Slot 2",
+    "Dual Mac Slot 3",
+    "Claim at most one Issue",
+    "same visible Scheduled task",
+    "Checkpoints are evidence, not approval gates",
+    "AGENTS.md",
+    "every Issue-declared context file",
+    "frozen context commit",
+    "Do not create another Issue",
+    "Do not use Goal",
+    "codex exec",
+    "daemon",
+)
+CONTRADICTORY_SCHEDULED_PHRASES = (
+    "Use Goal and",
+    "Use `codex exec`",
+    "Create Issues automatically",
+    "Wait for checkpoint approval",
+    "Another Slot may resume",
+)
 SKILL_DOCUMENT = re.compile(r"---\n(.*?)\n---\n(.*)", re.DOTALL)
 REFERENCE_LINK = re.compile(r"references/([a-z0-9-]+\.md)")
 SCRIPT_HELP = re.compile(r"scripts/([a-z0-9_]+\.py) --help")
@@ -80,22 +129,37 @@ def _validate_repository_example(path: Path) -> None:
         raise SkillValidationError(
             "repositories.toml.example must use the approved Slot limits"
         )
-    repositories = value["repositories"]
-    if not isinstance(repositories, list) or len(repositories) != 2:
+    if value["repositories"] != EXPECTED_REPOSITORIES:
         raise SkillValidationError(
-            "repositories.toml.example must contain two repositories"
+            "repositories.toml.example must contain the exact approved repositories"
         )
-    for repository in repositories:
-        if (
-            not isinstance(repository, dict)
-            or set(repository) != {"github", "local_path"}
-            or not all(
-                isinstance(repository[field], str) and repository[field]
-                for field in ("github", "local_path")
-            )
-        ):
+
+
+def _validate_scheduled_content(skill_root: Path) -> None:
+    reference_path = skill_root / "references" / "scheduled-execution.md"
+    prompt_path = skill_root / "assets" / "scheduled-slot-prompt.md"
+    try:
+        reference = reference_path.read_text(encoding="utf-8")
+        prompt = prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SkillValidationError(f"unable to read Scheduled content: {exc}") from exc
+    for label, text, boundaries in (
+        ("Scheduled reference", reference, SCHEDULED_REFERENCE_BOUNDARIES),
+        ("Scheduled prompt", prompt, SCHEDULED_PROMPT_BOUNDARIES),
+    ):
+        if not text.strip():
+            raise SkillValidationError(f"{label} must be non-empty")
+        missing = [boundary for boundary in boundaries if boundary not in text]
+        if missing:
             raise SkillValidationError(
-                "repositories.toml.example entries must contain github and local_path"
+                f"{label} is missing canonical boundary: {missing[0]}"
+            )
+        contradictory = [
+            phrase for phrase in CONTRADICTORY_SCHEDULED_PHRASES if phrase in text
+        ]
+        if contradictory:
+            raise SkillValidationError(
+                f"{label} contains contradictory instruction: {contradictory[0]}"
             )
 
 
@@ -139,6 +203,7 @@ def validate_skill(root: Path, wrapper_targets: tuple[str, ...]) -> None:
     _validate_repository_example(
         skill_root / "assets" / "repositories.toml.example"
     )
+    _validate_scheduled_content(skill_root)
     for name in sorted(scripts):
         _required_file(skill_root, f"scripts/{name}")
 

@@ -67,17 +67,34 @@ next: publish-a-corrected-schema-v2-revision
 class PickError(RuntimeError):
     """Raised when a claim attempt cannot produce a trustworthy result."""
 
+    def __init__(
+        self, message: str, maintenance_actions: tuple[str, ...] = ()
+    ) -> None:
+        super().__init__(message)
+        self.maintenance_actions = maintenance_actions
+
 
 class JsonArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        print(json.dumps({"claimed": False, "reason": "error"}))
+        print(
+            json.dumps(
+                {
+                    "claimed": False,
+                    "outcome": "error",
+                    "reason": "error",
+                    "maintenance_actions": [],
+                }
+            )
+        )
         self.exit(2)
 
 
 @dataclass(frozen=True, slots=True)
 class PickResult:
     claimed: bool
+    outcome: str
     reason: str
+    maintenance_actions: tuple[str, ...] = ()
     issue_url: str | None = None
     repo: str | None = None
     local_path: str | None = None
@@ -87,6 +104,31 @@ class PickResult:
 
     def json_value(self) -> dict[str, Any]:
         return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+def _unclaimed_result(
+    reason: str, maintenance_actions: list[str] | tuple[str, ...] = ()
+) -> PickResult:
+    actions = tuple(maintenance_actions)
+    return PickResult(
+        claimed=False,
+        outcome="maintenance" if actions else "clean-noop",
+        reason=reason,
+        maintenance_actions=actions,
+    )
+
+
+def _error_value(maintenance_actions: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {
+        "claimed": False,
+        "outcome": "maintenance" if maintenance_actions else "error",
+        "reason": "error",
+        "maintenance_actions": list(maintenance_actions),
+    }
+
+
+def _action(kind: str, issue_url: str) -> str:
+    return f"{kind}:{issue_url}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,14 +241,65 @@ def _blocked_payload(spec: TaskSpec, reason: str) -> dict[str, Any]:
     }
 
 
-def _block_invalid_ready(client: GhClient, invalid: InvalidReady) -> None:
+def _apply_block_event(
+    client: GhClient,
+    ref: IssueRef,
+    spec: TaskSpec,
+    payload: dict[str, Any],
+    *,
+    issue_url: str,
+    prior_labels: tuple[str, ...],
+    action_prefix: str,
+    maintenance_actions: list[str],
+) -> None:
+    prior_events = parse_issue_events(client.issue_comments(ref))
+    payload_existed = any(event.payload == payload for event in prior_events)
+    try:
+        result = apply_event(client, ref, spec, payload)
+    except GhError:
+        try:
+            snapshot = client.issue_snapshot(ref)
+        except GhError:
+            pass
+        else:
+            current_events = parse_issue_events(snapshot.comments)
+            if not payload_existed and any(
+                event.payload == payload for event in current_events
+            ):
+                maintenance_actions.append(
+                    _action(f"{action_prefix}-comment-published", issue_url)
+                )
+            if (
+                "duomac:blocked" not in prior_labels
+                and "duomac:blocked" in snapshot.labels
+            ):
+                maintenance_actions.append(
+                    _action(f"{action_prefix}-label-applied", issue_url)
+                )
+        raise
+    if result["published"]:
+        maintenance_actions.append(
+            _action(f"{action_prefix}-comment-published", issue_url)
+        )
+    maintenance_actions.append(
+        _action(f"{action_prefix}-label-applied", issue_url)
+    )
+
+
+def _block_invalid_ready(
+    client: GhClient, invalid: InvalidReady, maintenance_actions: list[str]
+) -> None:
     ref = IssueRef.parse(invalid.summary.url)
     if invalid.spec is not None:
-        apply_event(
+        _apply_block_event(
             client,
             ref,
             invalid.spec,
             _blocked_payload(invalid.spec, "Scheduled execution requires schema_version 2"),
+            issue_url=invalid.summary.url,
+            prior_labels=invalid.summary.labels,
+            action_prefix="invalid-ready-block",
+            maintenance_actions=maintenance_actions,
         )
         return
     comments = client.issue_comments(ref)
@@ -215,11 +308,19 @@ def _block_invalid_ready(client: GhClient, invalid: InvalidReady) -> None:
         for comment in comments
     ):
         client.comment(ref, _INVALID_CONTRACT_DIAGNOSTIC)
+        maintenance_actions.append(
+            _action("invalid-ready-block-comment-published", invalid.summary.url)
+        )
     client.set_state_label(ref, "duomac:blocked")
+    maintenance_actions.append(
+        _action("invalid-ready-block-label-applied", invalid.summary.url)
+    )
 
 
-def _block_candidate(client: GhClient, candidate: Candidate) -> None:
-    apply_event(
+def _block_candidate(
+    client: GhClient, candidate: Candidate, maintenance_actions: list[str]
+) -> None:
+    _apply_block_event(
         client,
         IssueRef.parse(candidate.issue_url),
         candidate.spec,
@@ -227,6 +328,10 @@ def _block_candidate(client: GhClient, candidate: Candidate) -> None:
             candidate.spec,
             "Scheduled repository or context evidence failed validation",
         ),
+        issue_url=candidate.issue_url,
+        prior_labels=candidate.labels,
+        action_prefix="candidate-block",
+        maintenance_actions=maintenance_actions,
     )
 
 
@@ -318,6 +423,7 @@ def _repair_ready_claims(
     config: ScheduledConfig,
     app_root: Path,
     candidates: tuple[Candidate, ...],
+    maintenance_actions: list[str],
 ) -> bool:
     repaired = False
     for candidate in candidates:
@@ -327,6 +433,9 @@ def _repair_ready_claims(
         payload = start.payload
         target = _target_for(config, candidate.repo)
         client.set_state_label(IssueRef.parse(candidate.issue_url), "duomac:active")
+        maintenance_actions.append(
+            _action("ready-state-label-repaired", candidate.issue_url)
+        )
         if payload["execution_mode"] == "scheduled":
             _write_claim(
                 app_root,
@@ -336,6 +445,9 @@ def _repair_ready_claims(
                     payload=payload,
                 ),
             )
+            maintenance_actions.append(
+                _action("ready-claim-projection-written", candidate.issue_url)
+            )
         repaired = True
     return repaired
 
@@ -344,6 +456,7 @@ def _repair_active_claims(
     config: ScheduledConfig,
     app_root: Path,
     candidates: tuple[Candidate, ...],
+    maintenance_actions: list[str],
 ) -> None:
     for candidate in candidates:
         start = _current_task_start(candidate)
@@ -360,6 +473,22 @@ def _repair_active_claims(
                 payload=payload,
             ),
         )
+        maintenance_actions.append(
+            _action("active-claim-projection-written", candidate.issue_url)
+        )
+
+
+def _state_requires_maintenance(state: GithubState) -> bool:
+    if state.invalid_ready:
+        return True
+    for candidate in state.active_candidates:
+        start = _current_task_start(candidate)
+        if (
+            start is not None
+            and start.payload.get("execution_mode") == "scheduled"
+        ):
+            return True
+    return any(_current_task_start(candidate) is not None for candidate in state.ready)
 
 
 def _claim_is_authoritative(
@@ -430,6 +559,7 @@ def _same_candidate(left: Candidate, right: Candidate) -> bool:
 def _preview_result(candidate: Candidate, target: RepositoryTarget, slot: int) -> PickResult:
     return PickResult(
         claimed=False,
+        outcome="preview",
         reason="preview",
         issue_url=candidate.issue_url,
         repo=candidate.repo,
@@ -449,114 +579,162 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
             state.ready, state.active, config.max_parallel_tasks
         )
         if selection.candidate is None:
-            return PickResult(False, selection.reason)
+            return _unclaimed_result(selection.reason)
         return _preview_result(
             selection.candidate,
             _target_for(config, selection.candidate.repo),
             slot,
         )
 
+    initial_state = _read_github_state(client, config)
+    initial_selection = select_candidate_result(
+        initial_state.ready, initial_state.active, config.max_parallel_tasks
+    )
+    if (
+        initial_selection.candidate is None
+        and not _state_requires_maintenance(initial_state)
+    ):
+        return _unclaimed_result(initial_selection.reason)
+
+    maintenance_actions: list[str] = []
     root = app_root.expanduser().resolve()
     if root.exists() and not root.is_dir():
         raise PickError("application root must be a directory")
+    root_existed = root.exists()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _read_github_state(client, config)
+    if not root_existed:
+        maintenance_actions.append("application-root-created")
 
-    with dispatch_lock(root / "dispatch.lock"):
-        state = _read_github_state(client, config)
-        _repair_active_claims(config, root, state.active_candidates)
-        if _repair_ready_claims(client, config, root, state.ready):
+    try:
+        lock_path = root / "dispatch.lock"
+        lock_existed = lock_path.exists()
+        with dispatch_lock(lock_path):
+            if not lock_existed:
+                maintenance_actions.append("dispatch-lock-file-created")
             state = _read_github_state(client, config)
-
-        blocked_invalid = bool(state.invalid_ready)
-        for invalid in state.invalid_ready:
-            _block_invalid_ready(client, invalid)
-        if blocked_invalid:
-            state = _read_github_state(client, config)
-
-        selection = select_candidate_result(
-            state.ready, state.active, config.max_parallel_tasks
-        )
-        if selection.candidate is None:
-            reason = (
-                "invalid-candidates-blocked"
-                if blocked_invalid and selection.reason == "no-ready"
-                else selection.reason
+            _repair_active_claims(
+                config, root, state.active_candidates, maintenance_actions
             )
-            return PickResult(False, reason)
-        candidate = selection.candidate
-        target = _target_for(config, candidate.repo)
-        try:
-            evidence = validate_repository_target(target, candidate.spec)
-        except (ContractError, RepositoryValidationError):
-            _block_candidate(client, candidate)
-            return PickResult(False, "invalid-candidates-blocked")
+            if _repair_ready_claims(
+                client, config, root, state.ready, maintenance_actions
+            ):
+                state = _read_github_state(client, config)
 
-        skill_commit = _installed_skill_commit()
-        refreshed_state = _read_github_state(client, config)
-        refreshed_selection = select_candidate_result(
-            refreshed_state.ready,
-            refreshed_state.active,
-            config.max_parallel_tasks,
-        )
-        if refreshed_selection.candidate is None:
-            return PickResult(False, refreshed_selection.reason)
-        if not _same_candidate(candidate, refreshed_selection.candidate):
-            return PickResult(False, "invalid-candidates-blocked")
-        candidate = refreshed_selection.candidate
-        fresh = _revalidate_selected(
-            client,
-            candidate,
-            refreshed_state.active,
-            config.max_parallel_tasks,
-        )
-        if fresh is None:
-            return PickResult(False, "invalid-candidates-blocked")
-        candidate = fresh
-        claim_id = secrets.token_hex(20)
-        payload = {
-            "type": "task-start",
-            "revision": candidate.spec.revision,
-            "task_hash": candidate.task_hash,
-            "repository": candidate.repo,
-            "base_branch": evidence.project.default_base_branch,
-            "context_commit": candidate.spec.context_commit,
-            "skill_commit": skill_commit,
-            "base_commit": evidence.base_commit,
-            "plan_summary": [
-                milestone.objective for milestone in candidate.spec.execution_plan
-            ],
-            "execution_mode": "scheduled",
-            "slot": slot,
-            "claim_id": claim_id,
-        }
-        claim = _claim_value(candidate=candidate, target=target, payload=payload)
-        try:
-            apply_event(
+            blocked_invalid = bool(state.invalid_ready)
+            for invalid in state.invalid_ready:
+                _block_invalid_ready(client, invalid, maintenance_actions)
+            if blocked_invalid:
+                state = _read_github_state(client, config)
+
+            selection = select_candidate_result(
+                state.ready, state.active, config.max_parallel_tasks
+            )
+            if selection.candidate is None:
+                reason = (
+                    "invalid-candidates-blocked"
+                    if blocked_invalid and selection.reason == "no-ready"
+                    else selection.reason
+                )
+                return _unclaimed_result(reason, maintenance_actions)
+            candidate = selection.candidate
+            target = _target_for(config, candidate.repo)
+            try:
+                evidence = validate_repository_target(target, candidate.spec)
+            except (ContractError, RepositoryValidationError):
+                _block_candidate(client, candidate, maintenance_actions)
+                return _unclaimed_result(
+                    "invalid-candidates-blocked", maintenance_actions
+                )
+
+            skill_commit = _installed_skill_commit()
+            refreshed_state = _read_github_state(client, config)
+            refreshed_selection = select_candidate_result(
+                refreshed_state.ready,
+                refreshed_state.active,
+                config.max_parallel_tasks,
+            )
+            if refreshed_selection.candidate is None:
+                return _unclaimed_result(
+                    refreshed_selection.reason, maintenance_actions
+                )
+            if not _same_candidate(candidate, refreshed_selection.candidate):
+                return _unclaimed_result(
+                    "invalid-candidates-blocked", maintenance_actions
+                )
+            candidate = refreshed_selection.candidate
+            fresh = _revalidate_selected(
                 client,
-                IssueRef.parse(candidate.issue_url),
-                candidate.spec,
-                payload,
+                candidate,
+                refreshed_state.active,
+                config.max_parallel_tasks,
             )
-        except ContractError:
-            return PickResult(False, "invalid-candidates-blocked")
-        except GhError as exc:
-            if not _claim_is_authoritative(client, candidate, payload):
-                raise PickError("GitHub task-start publication failed") from exc
-        try:
-            _write_claim(root, claim)
-        except OSError:
-            pass
-        return PickResult(
-            claimed=True,
-            reason="selected",
-            issue_url=candidate.issue_url,
-            repo=candidate.repo,
-            local_path=str(target.local_path),
-            slot=slot,
-            claim_id=claim_id,
-            base_commit=evidence.base_commit,
+            if fresh is None:
+                return _unclaimed_result(
+                    "invalid-candidates-blocked", maintenance_actions
+                )
+            candidate = fresh
+            claim_id = secrets.token_hex(20)
+            payload = {
+                "type": "task-start",
+                "revision": candidate.spec.revision,
+                "task_hash": candidate.task_hash,
+                "repository": candidate.repo,
+                "base_branch": evidence.project.default_base_branch,
+                "context_commit": candidate.spec.context_commit,
+                "skill_commit": skill_commit,
+                "base_commit": evidence.base_commit,
+                "plan_summary": [
+                    milestone.objective
+                    for milestone in candidate.spec.execution_plan
+                ],
+                "execution_mode": "scheduled",
+                "slot": slot,
+                "claim_id": claim_id,
+            }
+            claim = _claim_value(
+                candidate=candidate, target=target, payload=payload
+            )
+            try:
+                apply_event(
+                    client,
+                    IssueRef.parse(candidate.issue_url),
+                    candidate.spec,
+                    payload,
+                )
+            except ContractError:
+                return _unclaimed_result(
+                    "invalid-candidates-blocked", maintenance_actions
+                )
+            except GhError as exc:
+                if not _claim_is_authoritative(client, candidate, payload):
+                    raise PickError(
+                        "GitHub task-start publication failed",
+                        tuple(maintenance_actions),
+                    ) from exc
+            try:
+                _write_claim(root, claim)
+            except OSError:
+                pass
+            return PickResult(
+                claimed=True,
+                outcome="claimed",
+                reason="selected",
+                maintenance_actions=tuple(maintenance_actions),
+                issue_url=candidate.issue_url,
+                repo=candidate.repo,
+                local_path=str(target.local_path),
+                slot=slot,
+                claim_id=claim_id,
+                base_commit=evidence.base_commit,
+            )
+    except (ContractError, GhError, OSError, PickError) as exc:
+        existing = (
+            exc.maintenance_actions if isinstance(exc, PickError) else ()
         )
+        combined = tuple(maintenance_actions) + tuple(
+            action for action in existing if action not in maintenance_actions
+        )
+        raise PickError("Scheduled picker failed", combined) from exc
 
 
 def main() -> int:
@@ -571,8 +749,9 @@ def main() -> int:
 
     try:
         result = pick(args.config, args.app_root, args.slot, args.yes)
-    except (ContractError, GhError, OSError, PickError):
-        print(json.dumps({"claimed": False, "reason": "error"}))
+    except (ContractError, GhError, OSError, PickError) as exc:
+        actions = exc.maintenance_actions if isinstance(exc, PickError) else ()
+        print(json.dumps(_error_value(actions), sort_keys=True))
         return 1
     print(json.dumps(result.json_value(), ensure_ascii=False, sort_keys=True))
     return 0

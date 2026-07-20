@@ -920,6 +920,8 @@ def test_picker_preview_has_no_github_writes(scheduled_env: ScheduledEnv) -> Non
     assert result.returncode == 0, result.stderr
     output = json.loads(result.stdout)
     assert output["claimed"] is False
+    assert output["outcome"] == "preview"
+    assert output["maintenance_actions"] == []
     assert output["reason"] == "preview"
     assert not scheduled_env.github_writes()
     after = {
@@ -949,6 +951,8 @@ def test_picker_claims_oldest_eligible_issue_once(scheduled_env: ScheduledEnv) -
     assert first.returncode == 0, first.stderr
     first_output = json.loads(first.stdout)
     assert first_output["claimed"] is True
+    assert first_output["outcome"] == "claimed"
+    assert isinstance(first_output["maintenance_actions"], list)
     assert first_output["slot"] == 1
     assert len(first_output["claim_id"]) == 40
     assert json.loads(second.stdout)["claimed"] is False
@@ -993,7 +997,11 @@ def test_picker_blocks_ready_schema_v1(scheduled_env: ScheduledEnv) -> None:
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["claimed"] is False
+    output = json.loads(result.stdout)
+    assert output["claimed"] is False
+    assert output["outcome"] == "maintenance"
+    assert any("invalid-ready-block-comment" in item for item in output["maintenance_actions"])
+    assert any("invalid-ready-block-label" in item for item in output["maintenance_actions"])
     assert scheduled_env.current_label() == "duomac:blocked"
     assert len(scheduled_env.blocked_comments()) == 1
 
@@ -1009,6 +1017,10 @@ def test_picker_repairs_active_label_after_task_start_comment(
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["outcome"] == "maintenance"
+    assert any("ready-state-label-repaired" in item for item in output["maintenance_actions"])
+    assert any("ready-claim-projection-written" in item for item in output["maintenance_actions"])
     assert scheduled_env.current_label() == "duomac:active"
     assert len(scheduled_env.task_start_comments()) == 1
     assert len(scheduled_env.claim_files()) == 1
@@ -1037,7 +1049,10 @@ def test_picker_repairs_missing_local_claim_for_active_issue(
     second = scheduled_env.run_picker("--slot", "2", "--yes")
 
     assert second.returncode == 0, second.stderr
-    assert json.loads(second.stdout)["claimed"] is False
+    output = json.loads(second.stdout)
+    assert output["claimed"] is False
+    assert output["outcome"] == "maintenance"
+    assert any("active-claim-projection-written" in item for item in output["maintenance_actions"])
     assert len(scheduled_env.claim_files()) == 1
     assert len(scheduled_env.task_start_comments()) == 1
 
@@ -1057,7 +1072,12 @@ def test_picker_counts_interactive_active_issue_without_local_scheduled_claim(
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"claimed": False, "reason": "no-ready"}
+    assert json.loads(result.stdout) == {
+        "claimed": False,
+        "outcome": "clean-noop",
+        "reason": "no-ready",
+        "maintenance_actions": [],
+    }
     assert not scheduled_env.claim_files()
 
 
@@ -1065,7 +1085,12 @@ def test_picker_rejects_invalid_slot_identity(scheduled_env: ScheduledEnv) -> No
     result = scheduled_env.run_picker("--slot", "4", "--yes")
 
     assert result.returncode == 2
-    assert json.loads(result.stdout) == {"claimed": False, "reason": "error"}
+    assert json.loads(result.stdout) == {
+        "claimed": False,
+        "outcome": "error",
+        "reason": "error",
+        "maintenance_actions": [],
+    }
     assert not scheduled_env.github_writes()
 
 
@@ -1080,12 +1105,43 @@ def test_picker_blocks_repository_remote_mismatch(scheduled_env: ScheduledEnv) -
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
-        "claimed": False,
-        "reason": "invalid-candidates-blocked",
-    }
+    output = json.loads(result.stdout)
+    assert output["claimed"] is False
+    assert output["outcome"] == "maintenance"
+    assert output["reason"] == "invalid-candidates-blocked"
+    assert any("candidate-block-comment" in item for item in output["maintenance_actions"])
+    assert any("candidate-block-label" in item for item in output["maintenance_actions"])
     assert scheduled_env.current_label() == "duomac:blocked"
     assert len(scheduled_env.task_start_comments()) == 0
+
+
+def test_picker_reports_block_comment_when_following_label_update_fails(
+    scheduled_env: ScheduledEnv,
+) -> None:
+    _git(
+        scheduled_env.repository_path(),
+        "config",
+        "remote.origin.url",
+        "https://github.com/other/repository.git",
+    )
+    scheduled_env.env["GH_FAKE_FAIL_COMMAND"] = "issue edit"
+
+    result = scheduled_env.run_picker("--slot", "1", "--yes")
+
+    assert result.returncode == 1
+    output = json.loads(result.stdout)
+    assert output["claimed"] is False
+    assert output["outcome"] == "maintenance"
+    assert any(
+        "candidate-block-comment-published" in item
+        for item in output["maintenance_actions"]
+    )
+    assert not any(
+        "candidate-block-label-applied" in item
+        for item in output["maintenance_actions"]
+    )
+    assert scheduled_env.current_label() == "duomac:ready"
+    assert len(scheduled_env.blocked_comments()) == 1
 
 
 def test_comment_failure_is_not_a_claim_and_redacts_error_detail(
@@ -1097,7 +1153,12 @@ def test_comment_failure_is_not_a_claim_and_redacts_error_detail(
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 1
-    assert json.loads(result.stdout) == {"claimed": False, "reason": "error"}
+    assert json.loads(result.stdout) == {
+        "claimed": False,
+        "outcome": "maintenance",
+        "reason": "error",
+        "maintenance_actions": ["dispatch-lock-file-created"],
+    }
     assert "ghp_supersecret" not in result.stdout + result.stderr
     assert scheduled_env.current_label() == "duomac:ready"
     assert not scheduled_env.task_start_comments()
@@ -1121,7 +1182,10 @@ def test_label_failure_after_task_start_preserves_and_repairs_authoritative_clai
     second = scheduled_env.run_picker("--slot", "2", "--yes")
 
     assert second.returncode == 0, second.stderr
-    assert json.loads(second.stdout)["claimed"] is False
+    second_output = json.loads(second.stdout)
+    assert second_output["claimed"] is False
+    assert second_output["outcome"] == "maintenance"
+    assert any("ready-state-label-repaired" in item for item in second_output["maintenance_actions"])
     assert scheduled_env.current_label() == "duomac:active"
     assert len(scheduled_env.task_start_comments()) == 1
     assert len(scheduled_env.claim_files()) == 1
@@ -1190,7 +1254,12 @@ def test_picker_refreshes_global_active_state_after_repository_validation(
     result = scheduled_env.run_picker("--slot", "1", "--yes")
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"claimed": False, "reason": reason}
+    assert json.loads(result.stdout) == {
+        "claimed": False,
+        "outcome": "maintenance",
+        "reason": reason,
+        "maintenance_actions": ["dispatch-lock-file-created"],
+    }
     assert not scheduled_env.task_start_comments()
     assert not scheduled_env.claim_files()
     assert not any(
