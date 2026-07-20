@@ -106,6 +106,29 @@ def test_rejects_nonconsecutive_milestones() -> None:
         parse_issue_body(body)
 
 
+def test_rejects_duplicate_milestone_number() -> None:
+    body = VALID_BODY.replace("milestone: 2", "milestone: 1")
+
+    with pytest.raises(ContractError, match="continuous"):
+        parse_issue_body(body)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    [
+        ("objective: Update the component", 'objective: ""', "objective"),
+        ("steps:\n      - Apply the bounded layout change", "steps: []", "steps"),
+        ("milestone: 1", "milestone: 0", "milestone"),
+        ("milestone: 1", 'milestone: "1"', "milestone"),
+    ],
+)
+def test_rejects_malformed_schema_v2_milestones(
+    old: str, new: str, message: str
+) -> None:
+    with pytest.raises(ContractError, match=message):
+        parse_issue_body(VALID_BODY.replace(old, new))
+
+
 def test_legacy_contract_is_readable_but_not_current() -> None:
     spec = parse_issue_body(LEGACY_BODY)
 
