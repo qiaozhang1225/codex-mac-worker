@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from duomac_contracts import ProjectConfig, TaskSpec, render_issue_body
+from duomac_contracts import Milestone, ProjectConfig, TaskSpec, render_issue_body
 from duomac_git import GitSafetyError, deliver, preflight, validate_scope
 
 
@@ -106,6 +106,7 @@ def repo_fixture(tmp_path: Path) -> RepoFixture:
     git(task_worktree, "commit", "-m", "fix history card")
 
     task = TaskSpec(
+        schema_version=2,
         revision=1,
         dispatcher="macbook",
         executor="mac-mini",
@@ -116,7 +117,10 @@ def repo_fixture(tmp_path: Path) -> RepoFixture:
         acceptance=("The card uses full width",),
         allowed_paths=("product/frontend/src/history",),
         out_of_scope=("Backend",),
-        execution_plan=("Update card", "Verify"),
+        execution_plan=(
+            Milestone(1, "Update card", ("Edit the card",)),
+            Milestone(2, "Verify", ("Run the fast profile",)),
+        ),
         verification_profile="fast",
         delivery_mode="direct-main",
         risk="low",

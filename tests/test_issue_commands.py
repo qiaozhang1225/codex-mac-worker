@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills" / "dual-mac-collaboration" / "scripts"
 VALID_BODY = """<!-- duomac-task:v1 -->
 ```yaml
-schema_version: 1
+schema_version: 2
 revision: 2
 role:
   dispatcher: macbook
@@ -36,8 +36,15 @@ scope:
   out_of_scope:
     - Backend APIs
 execution_plan:
-  - Update the component
-  - Run the fast profile
+  - milestone: 1
+    objective: Update the component
+    steps:
+      - Apply the bounded layout change
+  - milestone: 2
+    objective: Verify and deliver the change
+    steps:
+      - Run the fast profile
+      - Publish delivery evidence
 verification_profile: fast
 delivery_mode: direct-main
 risk: low

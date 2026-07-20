@@ -32,7 +32,15 @@ class ContractError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class Milestone:
+    number: int
+    objective: str
+    steps: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class TaskSpec:
+    schema_version: Literal[1, 2]
     revision: int
     dispatcher: str
     executor: str
@@ -43,7 +51,7 @@ class TaskSpec:
     acceptance: tuple[str, ...]
     allowed_paths: tuple[str, ...]
     out_of_scope: tuple[str, ...]
-    execution_plan: tuple[str, ...]
+    execution_plan: tuple[Milestone, ...]
     verification_profile: str
     delivery_mode: Literal["direct-main", "task-branch"]
     risk: Literal["low", "medium"]
@@ -87,6 +95,34 @@ def _strings(mapping: dict[str, Any], field: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value)
 
 
+def _milestones(task: dict[str, Any], schema_version: int) -> tuple[Milestone, ...]:
+    raw = task.get("execution_plan")
+    if not isinstance(raw, list) or not raw:
+        raise ContractError("execution_plan must be a non-empty list")
+    if schema_version == 1:
+        if not all(isinstance(item, str) and item.strip() for item in raw):
+            raise ContractError("schema v1 execution_plan must be a string list")
+        return tuple(
+            Milestone(index, item.strip(), (item.strip(),))
+            for index, item in enumerate(raw, start=1)
+        )
+    milestones: list[Milestone] = []
+    for expected, item in enumerate(raw, start=1):
+        entry = _mapping(item, f"execution_plan[{expected}]")
+        number = _positive_int(entry, "milestone")
+        if number != expected:
+            raise ContractError("execution_plan milestones must be continuous from 1")
+        milestones.append(
+            Milestone(number, _string(entry, "objective"), _strings(entry, "steps"))
+        )
+    return tuple(milestones)
+
+
+def require_current_schema(spec: TaskSpec) -> None:
+    if spec.schema_version != 2:
+        raise ContractError("scheduled execution requires schema_version 2")
+
+
 def _normalize_path(value: str) -> str:
     candidate = PurePosixPath(value)
     if (
@@ -118,8 +154,13 @@ def parse_issue_body(text: str) -> TaskSpec:
     except yaml.YAMLError as exc:
         raise ContractError(f"unable to parse task YAML: {exc}") from exc
     task = _mapping(raw, "task")
-    if task.get("schema_version") != 1:
-        raise ContractError("schema_version must be 1")
+    schema_version = task.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in {1, 2}
+    ):
+        raise ContractError("schema_version must be 1 or 2")
 
     revision = _positive_int(task, "revision")
     role = _mapping(task.get("role"), "role")
@@ -143,6 +184,7 @@ def parse_issue_body(text: str) -> TaskSpec:
         raise ContractError("risk must be low or medium")
 
     return TaskSpec(
+        schema_version=schema_version,
         revision=revision,
         dispatcher=dispatcher,
         executor=executor,
@@ -155,7 +197,7 @@ def parse_issue_body(text: str) -> TaskSpec:
         acceptance=_strings(task, "acceptance"),
         allowed_paths=allowed_paths,
         out_of_scope=_strings(scope, "out_of_scope"),
-        execution_plan=_strings(task, "execution_plan"),
+        execution_plan=_milestones(task, schema_version),
         verification_profile=_string(task, "verification_profile"),
         delivery_mode=delivery_mode,
         risk=risk,
@@ -164,7 +206,7 @@ def parse_issue_body(text: str) -> TaskSpec:
 
 def render_issue_body(spec: TaskSpec) -> str:
     payload = {
-        "schema_version": 1,
+        "schema_version": spec.schema_version,
         "revision": spec.revision,
         "role": {"dispatcher": spec.dispatcher, "executor": spec.executor},
         "objective": spec.objective,
@@ -178,7 +220,18 @@ def render_issue_body(spec: TaskSpec) -> str:
             "allowed_paths": list(spec.allowed_paths),
             "out_of_scope": list(spec.out_of_scope),
         },
-        "execution_plan": list(spec.execution_plan),
+        "execution_plan": (
+            [milestone.objective for milestone in spec.execution_plan]
+            if spec.schema_version == 1
+            else [
+                {
+                    "milestone": milestone.number,
+                    "objective": milestone.objective,
+                    "steps": list(milestone.steps),
+                }
+                for milestone in spec.execution_plan
+            ]
+        ),
         "verification_profile": spec.verification_profile,
         "delivery_mode": spec.delivery_mode,
         "risk": spec.risk,
@@ -225,8 +278,13 @@ def validate_task(spec: TaskSpec, project: ProjectConfig) -> None:
         raise ContractError(
             f"unknown verification profile: {spec.verification_profile}"
         )
+    milestone_work = tuple(
+        text
+        for milestone in spec.execution_plan
+        for text in (milestone.objective, *milestone.steps)
+    )
     requested_work = "\n".join(
-        (spec.objective, *spec.decisions, *spec.acceptance, *spec.execution_plan)
+        (spec.objective, *spec.decisions, *spec.acceptance, *milestone_work)
     )
     if any(pattern.search(requested_work) for pattern in _FORBIDDEN_OPERATIONS):
         raise ContractError("operational or irreversible objective is not allowed")

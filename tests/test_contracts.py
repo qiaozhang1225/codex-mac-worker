@@ -8,6 +8,7 @@ from duomac_contracts import (
     ContractError,
     load_project_config,
     parse_issue_body,
+    require_current_schema,
     render_issue_body,
     validate_task,
 )
@@ -15,8 +16,8 @@ from duomac_contracts import (
 
 VALID_BODY = """<!-- duomac-task:v1 -->
 ```yaml
-schema_version: 1
-revision: 1
+schema_version: 2
+revision: 2
 role:
   dispatcher: macbook
   executor: mac-mini
@@ -35,13 +36,29 @@ scope:
   out_of_scope:
     - Backend APIs
 execution_plan:
-  - Update the component
-  - Run the fast profile
+  - milestone: 1
+    objective: Update the component
+    steps:
+      - Apply the bounded layout change
+  - milestone: 2
+    objective: Verify and deliver the change
+    steps:
+      - Run the fast profile
+      - Publish delivery evidence
 verification_profile: fast
 delivery_mode: direct-main
 risk: low
 ```
 """
+
+
+LEGACY_BODY = VALID_BODY.replace(
+    "schema_version: 2",
+    "schema_version: 1",
+).replace(
+    "execution_plan:\n  - milestone: 1\n    objective: Update the component\n    steps:\n      - Apply the bounded layout change\n  - milestone: 2\n    objective: Verify and deliver the change\n    steps:\n      - Run the fast profile\n      - Publish delivery evidence",
+    "execution_plan:\n  - Update the component\n  - Run the fast profile",
+)
 
 
 PROJECT_TOML = '''schema_version = 1
@@ -64,11 +81,37 @@ def project_config(tmp_path: Path, text: str = PROJECT_TOML):
 def test_parse_complete_issue_contract() -> None:
     spec = parse_issue_body(VALID_BODY)
 
-    assert spec.revision == 1
+    assert spec.revision == 2
     assert spec.dispatcher == "macbook"
     assert spec.executor == "mac-mini"
     assert spec.delivery_mode == "direct-main"
     assert spec.allowed_paths == ("product/frontend/src/history",)
+
+
+def test_parses_schema_v2_milestones() -> None:
+    spec = parse_issue_body(VALID_BODY)
+
+    assert spec.schema_version == 2
+    assert [item.number for item in spec.execution_plan] == [1, 2]
+    assert spec.execution_plan[1].steps == (
+        "Run the fast profile",
+        "Publish delivery evidence",
+    )
+
+
+def test_rejects_nonconsecutive_milestones() -> None:
+    body = VALID_BODY.replace("milestone: 2", "milestone: 3")
+
+    with pytest.raises(ContractError, match="continuous"):
+        parse_issue_body(body)
+
+
+def test_legacy_contract_is_readable_but_not_current() -> None:
+    spec = parse_issue_body(LEGACY_BODY)
+
+    assert spec.schema_version == 1
+    with pytest.raises(ContractError, match="schema_version 2"):
+        require_current_schema(spec)
 
 
 def test_render_round_trips_complete_contract() -> None:
@@ -93,7 +136,7 @@ def test_rejects_duplicate_machine_blocks() -> None:
 @pytest.mark.parametrize(
     ("old", "new", "message"),
     [
-        ("revision: 1", "revision: 0", "revision"),
+        ("revision: 2", "revision: 0", "revision"),
         ("a" * 40, "abc", "commit"),
         ("risk: low", "risk: high", "risk"),
         ("delivery_mode: direct-main", "delivery_mode: force-main", "delivery_mode"),
