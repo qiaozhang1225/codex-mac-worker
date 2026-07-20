@@ -1291,6 +1291,70 @@ def test_completion_preview_rejects_conflicting_or_malformed_delivery_history(
     )
 
 
+def test_completion_rejects_duplicate_matching_delivery_history(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_delivery()
+    set_issue_fixture(
+        cli_env,
+        comments=completion_comments(
+            event_comment(payload, "IC_delivery_1"),
+            event_comment(payload, "IC_delivery_2"),
+        ),
+    )
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "at most one delivery event" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_completion_rejects_delivery_before_final_checkpoint(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_delivery()
+    set_issue_fixture(
+        cli_env,
+        comments=[
+            event_comment(valid_task_start()),
+            checkpoint_event(1),
+            event_comment(payload, "IC_delivery"),
+            checkpoint_event(2),
+        ],
+    )
+
+    result = run_script(
+        "issue_complete.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        "--state",
+        "completed",
+        "--yes",
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "delivery event must follow the final required checkpoint" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"], ["issue", "close"])
+        for call in gh_calls(cli_env)
+    )
+
+
 def test_completion_first_run_comments_before_label_and_close(
     cli_env: dict[str, str], tmp_path: Path
 ) -> None:

@@ -123,14 +123,28 @@ def validate_delivery_history(
 ) -> bool:
     current = current_revision_events(events, spec.revision)
     deliveries = [
-        event.payload for event in current if event.payload.get("type") == "delivery"
+        event for event in current if event.payload.get("type") == "delivery"
     ]
-    for delivery in deliveries:
-        validate_delivery(delivery, spec, state)
     if not deliveries:
         return False
-    if any(delivery != payload for delivery in deliveries):
+    if len(deliveries) > 1:
+        raise ContractError("current revision must contain at most one delivery event")
+    delivery = deliveries[0]
+    validate_delivery(delivery.payload, spec, state)
+    if delivery.payload != payload:
         raise ContractError("current revision contains a conflicting delivery event")
+    task_start = _require_authoritative_task_start(current)
+    delivery_index = current.index(delivery)
+    final_checkpoint_index = max(
+        index
+        for index, event in enumerate(current)
+        if event.payload.get("type") == "checkpoint"
+    )
+    if (
+        delivery_index <= current.index(task_start)
+        or delivery_index <= final_checkpoint_index
+    ):
+        raise ContractError("delivery event must follow the final required checkpoint")
     return True
 
 
