@@ -1199,6 +1199,27 @@ def test_two_slots_cannot_claim_the_same_issue(scheduled_env: ScheduledEnv) -> N
     assert len(scheduled_env.task_start_comments()) == 1
 
 
+def test_simultaneous_first_run_reports_creation_ownership_once(
+    scheduled_env: ScheduledEnv,
+) -> None:
+    missing_root = scheduled_env.app_root.parent / "simultaneous-first-run"
+    env = replace(scheduled_env, app_root=missing_root)
+
+    results = env.run_two_pickers_concurrently(1, 2)
+
+    assert all(result.returncode == 0 for result in results)
+    outputs = [json.loads(result.stdout) for result in results]
+    assert sum(output["claimed"] for output in outputs) == 1
+    actions = [
+        action
+        for output in outputs
+        for action in output["maintenance_actions"]
+    ]
+    assert actions.count("application-root-created") == 1
+    assert actions.count("dispatch-lock-file-created") == 1
+    assert len(env.task_start_comments()) == 1
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["body", "labels", "state", "cancel", "blocked_label", "claim", "terminal"],

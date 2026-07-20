@@ -481,13 +481,35 @@ def select_candidate(
     return select_candidate_result(ready, active, max_parallel_tasks).candidate
 
 
+def ensure_directory(path: Path, *, mode: int = 0o700) -> bool:
+    """Create a directory and return whether this call created the final path."""
+    try:
+        path.mkdir(parents=True, exist_ok=False, mode=mode)
+    except FileExistsError:
+        if not path.is_dir():
+            raise NotADirectoryError(f"path exists and is not a directory: {path}")
+        return False
+    return True
+
+
 @contextmanager
-def dispatch_lock(path: Path) -> Iterator[None]:
-    """Serialize local Scheduled claim attempts without retaining state."""
+def dispatch_lock(path: Path) -> Iterator[bool]:
+    """Serialize local Scheduled claims and yield lock-file creation ownership."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as stream:
+    while True:
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            try:
+                descriptor = os.open(path, os.O_RDWR)
+            except FileNotFoundError:
+                continue
+            created = False
+        break
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         try:
-            yield
+            yield created
         finally:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)

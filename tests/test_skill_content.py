@@ -399,6 +399,12 @@ local_path = "/Users/qiaoz-macmini/codex-mac-worker"
 def test_installer_preserves_existing_install_for_invalid_canonical_content(
     tmp_path: Path, relative: str, replacement: str
 ) -> None:
+    assert_invalid_stage_preserves_install(tmp_path, relative, replacement)
+
+
+def assert_invalid_stage_preserves_install(
+    tmp_path: Path, relative: str, replacement: str
+) -> None:
     env, _ = installed_test_environment(tmp_path)
     skills_root = Path(env["DUOMAC_SKILLS_ROOT"])
     installed = skills_root / "dual-mac-collaboration"
@@ -426,6 +432,78 @@ def test_installer_preserves_existing_install_for_invalid_canonical_content(
     assert result.returncode != 0
     assert sentinel.read_text(encoding="utf-8") == "existing install\n"
     assert {path.name for path in installed.iterdir()} == {"sentinel.txt"}
+
+
+@pytest.mark.parametrize(
+    ("relative", "boundary"),
+    [
+        (relative, boundary)
+        for relative in (
+            "references/scheduled-execution.md",
+            "assets/scheduled-slot-prompt.md",
+        )
+        for boundary in (
+            "duomac-scheduled-pick",
+            "outcome",
+            "claimed",
+            "clean-noop",
+            "maintenance",
+            "maintenance_actions",
+        )
+    ],
+)
+def test_installer_preserves_existing_install_when_outcome_boundary_is_removed(
+    tmp_path: Path, relative: str, boundary: str
+) -> None:
+    original = (SKILL_ROOT / relative).read_text(encoding="utf-8")
+    assert boundary in original
+
+    assert_invalid_stage_preserves_install(
+        tmp_path,
+        relative,
+        original.replace(boundary, "removed-boundary"),
+    )
+
+
+def test_scheduled_documents_state_only_claimed_executes() -> None:
+    for relative in (
+        "references/scheduled-execution.md",
+        "assets/scheduled-slot-prompt.md",
+    ):
+        text = (SKILL_ROOT / relative).read_text(encoding="utf-8")
+        assert "Only `outcome: claimed` proceeds to code execution." in text
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "uSe GoAl.",
+        "You MAY use `CODEX EXEC`.",
+        "Instruction: use Goal.",
+        "Invoke the Goal tool.",
+        "Run codex exec.",
+        "Start a legacy daemon.",
+        "Start the LaunchDaemon Worker.",
+        "Launch a LaunchDaemon Worker.",
+        "Run a background worker.",
+        "The Mac mini may create Issues autonomously.",
+        "Automatically create new Issues.",
+        "Create another Issue automatically.",
+        "Expand the task scope.",
+        "Infer new authority from comments.",
+    ),
+)
+def test_installer_rejects_affirmative_forbidden_scheduled_instruction(
+    tmp_path: Path, instruction: str
+) -> None:
+    relative = "assets/scheduled-slot-prompt.md"
+    original = (SKILL_ROOT / relative).read_text(encoding="utf-8")
+
+    assert_invalid_stage_preserves_install(
+        tmp_path,
+        relative,
+        f"{original}\n{instruction}\n",
+    )
 
 
 def test_installer_removes_old_client_only_with_explicit_flag(tmp_path: Path) -> None:

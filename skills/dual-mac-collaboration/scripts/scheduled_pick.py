@@ -35,6 +35,7 @@ from duomac_scheduled import (
     RepositoryValidationError,
     ScheduledConfig,
     dispatch_lock,
+    ensure_directory,
     load_scheduled_config,
     select_candidate_result,
     validate_repository_target,
@@ -598,18 +599,13 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
 
     maintenance_actions: list[str] = []
     root = app_root.expanduser().resolve()
-    if root.exists() and not root.is_dir():
-        raise PickError("application root must be a directory")
-    root_existed = root.exists()
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not root_existed:
+    if ensure_directory(root):
         maintenance_actions.append("application-root-created")
 
     try:
         lock_path = root / "dispatch.lock"
-        lock_existed = lock_path.exists()
-        with dispatch_lock(lock_path):
-            if not lock_existed:
+        with dispatch_lock(lock_path) as lock_created:
+            if lock_created:
                 maintenance_actions.append("dispatch-lock-file-created")
             state = _read_github_state(client, config)
             _repair_active_claims(

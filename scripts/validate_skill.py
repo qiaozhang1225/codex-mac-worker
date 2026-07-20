@@ -41,6 +41,15 @@ EXPECTED_REPOSITORIES = [
         "local_path": "/Users/qiaoz-macmini/codex-mac-worker",
     },
 ]
+SCHEDULED_OUTCOME_BOUNDARIES = (
+    "duomac-scheduled-pick",
+    "outcome",
+    "claimed",
+    "clean-noop",
+    "maintenance",
+    "maintenance_actions",
+    "Only `outcome: claimed` proceeds to code execution.",
+)
 SCHEDULED_REFERENCE_BOUNDARIES = (
     "visible Mac mini Codex App Scheduled run",
     "Dual Mac Slot 1",
@@ -56,6 +65,7 @@ SCHEDULED_REFERENCE_BOUNDARIES = (
     "Goal",
     "codex exec",
     "LaunchDaemon Worker",
+    *SCHEDULED_OUTCOME_BOUNDARIES,
 )
 SCHEDULED_PROMPT_BOUNDARIES = (
     "$dual-mac-collaboration",
@@ -72,13 +82,77 @@ SCHEDULED_PROMPT_BOUNDARIES = (
     "Do not use Goal",
     "codex exec",
     "daemon",
+    *SCHEDULED_OUTCOME_BOUNDARIES,
 )
-CONTRADICTORY_SCHEDULED_PHRASES = (
-    "Use Goal and",
-    "Use `codex exec`",
-    "Create Issues automatically",
-    "Wait for checkpoint approval",
-    "Another Slot may resume",
+_INSTRUCTION_START = r"(?:^|[.!?:]\s+)(?:[-*]\s*)?"
+_MODAL_SUBJECT = (
+    r"(?:(?:you|the\s+(?:mac\s+mini|worker|slot))\s+"
+    r"(?:may|must|should|can|will)\s+)?"
+)
+CONTRADICTORY_SCHEDULED_PATTERNS = (
+    (
+        "affirmative Goal or codex exec use",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:use|run|invoke)\s+(?:the\s+)?"
+            r"(?:goal(?:\s+tool)?\b|`?codex\s+exec\b`?)",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "affirmative legacy background execution",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:start|launch|run|use)\s+(?:(?:an?|the)\s+)?(?:legacy\s+)?"
+            r"(?:daemon|launchdaemon(?:\s+worker)?|background\s+worker)\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "affirmative autonomous Issue creation",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:(?:automatically|autonomously)\s+)?"
+            + r"create\s+(?:(?:another|new)\s+)?issues?\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "affirmative scope expansion",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:expand|broaden)\s+"
+            r"(?:(?:the|task|issue|frozen)\s+)*(?:scope|contract)\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "affirmative authority expansion",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"infer\s+new\s+authority\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "checkpoint approval gate",
+        re.compile(
+            _INSTRUCTION_START + r"wait\s+for\s+checkpoint\s+approval\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "cross-Slot resume",
+        re.compile(
+            _INSTRUCTION_START + r"another\s+slot\s+may\s+resume\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
 )
 SKILL_DOCUMENT = re.compile(r"---\n(.*?)\n---\n(.*)", re.DOTALL)
 REFERENCE_LINK = re.compile(r"references/([a-z0-9-]+\.md)")
@@ -154,12 +228,17 @@ def _validate_scheduled_content(skill_root: Path) -> None:
             raise SkillValidationError(
                 f"{label} is missing canonical boundary: {missing[0]}"
             )
-        contradictory = [
-            phrase for phrase in CONTRADICTORY_SCHEDULED_PHRASES if phrase in text
-        ]
-        if contradictory:
+        contradiction = next(
+            (
+                label
+                for label, pattern in CONTRADICTORY_SCHEDULED_PATTERNS
+                if pattern.search(text)
+            ),
+            None,
+        )
+        if contradiction is not None:
             raise SkillValidationError(
-                f"{label} contains contradictory instruction: {contradictory[0]}"
+                f"{label} contains contradictory instruction: {contradiction}"
             )
 
 

@@ -2,7 +2,7 @@ Use $dual-mac-collaboration in Mac mini Codex App Scheduled mode. Read the curre
 
 Read the installed Scheduled execution reference, then run `duomac-scheduled-pick` with that slot number, the configured application root, and the explicit claim flag. Claim at most one Issue.
 
-Branch on the picker JSON `outcome`, not on `reason`. For `clean-noop` (a clean no-candidate no-op), report the exact reason and `maintenance_actions: []`, then stop without code execution. For `maintenance` (a maintenance-only outcome), report the exact reason and every `maintenance_actions` entry exactly, then stop without code execution. For `preview` or `error`, report the result and stop. Archive non-execution runs when the App exposes that action.
+Branch on the picker JSON `outcome`, not on `reason`. For `clean-noop` (a clean no-candidate no-op), report the exact reason and `maintenance_actions: []`, then stop without code execution. For `maintenance` (a maintenance-only outcome), report the exact reason and every `maintenance_actions` entry exactly, then stop without code execution. For `preview` or `error`, report the result and stop. Only `outcome: claimed` proceeds to code execution. Archive non-execution runs when the App exposes that action.
 
 For `outcome: claimed`, report `maintenance_actions` exactly and execute only that Issue's complete current schema v2 contract in this same visible Scheduled task. Before planning or execution, read applicable repository `AGENTS.md` instructions and every Issue-declared context file from the frozen context commit; missing or unreadable context is blocked and no milestone may execute. Publish every milestone checkpoint before delivery. Checkpoints are evidence, not approval gates.
 
