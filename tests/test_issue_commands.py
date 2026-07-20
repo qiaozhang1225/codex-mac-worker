@@ -136,6 +136,13 @@ elif args[:2] == ["issue", "view"] and "--json" in args:
         print(json.dumps({"comments": fixture.get("comments", [])}))
     elif field == "state":
         print(json.dumps({"state": fixture.get("state", "OPEN")}))
+    elif field == "body,state,labels,comments":
+        print(json.dumps({
+            "body": fixture["issue_body"],
+            "state": fixture.get("state", "OPEN"),
+            "labels": [{"name": item} for item in fixture["labels"]],
+            "comments": fixture.get("comments", []),
+        }))
     else:
         print("unsupported fixture field", file=sys.stderr)
         raise SystemExit(2)

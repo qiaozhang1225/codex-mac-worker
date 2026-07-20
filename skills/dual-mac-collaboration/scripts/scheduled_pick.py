@@ -417,6 +417,16 @@ def _revalidate_selected(
     return fresh if result.candidate == fresh else None
 
 
+def _same_candidate(left: Candidate, right: Candidate) -> bool:
+    return (
+        left.repo.casefold() == right.repo.casefold()
+        and left.issue_url == right.issue_url
+        and left.created_at == right.created_at
+        and left.task_hash == right.task_hash
+        and left.spec == right.spec
+    )
+
+
 def _preview_result(candidate: Candidate, target: RepositoryTarget, slot: int) -> PickResult:
     return PickResult(
         claimed=False,
@@ -483,8 +493,22 @@ def pick(config_path: Path, app_root: Path, slot: int, apply: bool) -> PickResul
             return PickResult(False, "invalid-candidates-blocked")
 
         skill_commit = _installed_skill_commit()
+        refreshed_state = _read_github_state(client, config)
+        refreshed_selection = select_candidate_result(
+            refreshed_state.ready,
+            refreshed_state.active,
+            config.max_parallel_tasks,
+        )
+        if refreshed_selection.candidate is None:
+            return PickResult(False, refreshed_selection.reason)
+        if not _same_candidate(candidate, refreshed_selection.candidate):
+            return PickResult(False, "invalid-candidates-blocked")
+        candidate = refreshed_selection.candidate
         fresh = _revalidate_selected(
-            client, candidate, state.active, config.max_parallel_tasks
+            client,
+            candidate,
+            refreshed_state.active,
+            config.max_parallel_tasks,
         )
         if fresh is None:
             return PickResult(False, "invalid-candidates-blocked")

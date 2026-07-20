@@ -706,6 +706,32 @@ elif args[:2] == ["issue", "view"]:
     elif field == "state":
         print(json.dumps({"state": issue["state"]}))
     elif field == "body,state,labels,comments":
+        def authority_mutation(value):
+            value["snapshot_calls"] = value.get("snapshot_calls", 0) + 1
+            mutation = os.environ.get("GH_FAKE_AUTHORITY_MUTATION")
+            if value["snapshot_calls"] != 2 or not mutation:
+                return
+            selected = issue_for(value, args[2])
+            if mutation == "body":
+                selected["body"] += "\\n<!-- authority-window edit -->\\n"
+            elif mutation == "labels":
+                selected["labels"] = []
+            elif mutation == "state":
+                selected["state"] = "CLOSED"
+            elif mutation == "terminal":
+                selected["comments"].append({
+                    "id": "IC_authority_terminal",
+                    "createdAt": "2026-07-20T00:00:02Z",
+                    "body": "<!-- duomac-event:v1 -->\\n```yaml\\ntype: blocked\\nrevision: 2\\nreason: Authority-window terminal event\\ncompleted: []\\nnext:\\n  - Publish a new revision\\n```\\n",
+                })
+            elif mutation == "progress":
+                selected["comments"].append({
+                    "id": "IC_authority_progress",
+                    "createdAt": "2026-07-20T00:00:02Z",
+                    "body": "<!-- duomac-event:v1 -->\\n```yaml\\ntype: checkpoint\\nrevision: 2\\nmilestone: 1\\ncompleted:\\n  - Raced progress\\ncommits:\\n  - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\nverification:\\n  - 'pytest -q: passed'\\nscope_status: within-scope\\nnext:\\n  - Stop stale claim\\nblockers: []\\n```\\n",
+                })
+        value, _ = locked_state(authority_mutation)
+        issue = issue_for(value, args[2])
         print(json.dumps({
             "body": issue["body"],
             "state": issue["state"],
@@ -823,6 +849,43 @@ next:
                     "createdAt": "2026-07-20T00:00:00Z",
                     "body": f"<!-- duomac-event:v1 -->\\n```yaml\\n{{payload}}\\n```\\n",
                 }})
+            elif mutation in {{"capacity", "path_conflict"}}:
+                count = 3 if mutation == "capacity" else 1
+                active_repo = (
+                    "qiaozhang1225/codex-mac-worker"
+                    if mutation == "capacity"
+                    else issue["repo"]
+                )
+                for index in range(count):
+                    active_body = issue["body"]
+                    context = re.search(r"commit:\\s+([0-9a-f]{{40}})", active_body).group(1)
+                    body_hash = hashlib.sha256(active_body.encode("utf-8")).hexdigest()
+                    payload = f"""type: task-start
+revision: 2
+task_hash: {{body_hash}}
+repository: {{active_repo}}
+base_branch: main
+context_commit: {{context}}
+skill_commit: {{'d' * 40}}
+base_commit: {{context}}
+plan_summary:
+  - Concurrent active work
+execution_mode: scheduled
+slot: {{index + 1}}
+claim_id: a{{format(index + 1, '039x')}}"""
+                    value["issues"].append({{
+                        "repo": active_repo,
+                        "url": f"https://github.com/{{active_repo}}/issues/{{100 + index}}",
+                        "createdAt": f"2026-07-20T00:00:0{{index + 1}}Z",
+                        "body": active_body,
+                        "labels": ["duomac:active"],
+                        "comments": [{{
+                            "id": f"IC_active_{{index}}",
+                            "createdAt": "2026-07-20T00:00:01Z",
+                            "body": f"<!-- duomac-event:v1 -->\\n```yaml\\n{{payload}}\\n```\\n",
+                        }}],
+                        "state": "OPEN",
+                    }})
             value["git_mutated"] = True
             temporary = fixture_path.with_suffix(f".tmp.{{os.getpid()}}")
             temporary.write_text(json.dumps(value), encoding="utf-8")
@@ -913,6 +976,15 @@ def test_picker_claims_oldest_eligible_issue_once(scheduled_env: ScheduledEnv) -
         ["issue", "comment"],
         ["issue", "edit"],
     ]
+    all_calls = [
+        json.loads(line) for line in scheduled_env.log.read_text().splitlines()
+    ]
+    comment_index = next(
+        index
+        for index, call in enumerate(all_calls)
+        if call["argv"][:2] == ["issue", "comment"]
+    )
+    assert all_calls[comment_index - 1]["argv"][-1] == "body,state,labels,comments"
 
 
 def test_picker_blocks_ready_schema_v1(scheduled_env: ScheduledEnv) -> None:
@@ -1084,3 +1156,44 @@ def test_picker_revalidates_selected_issue_after_repository_validation(
     assert not scheduled_env.claim_files()
     expected_external_starts = 1 if mutation == "claim" else 0
     assert len(scheduled_env.task_start_comments()) == expected_external_starts
+
+
+@pytest.mark.parametrize(
+    "mutation", ["body", "labels", "state", "terminal", "progress"]
+)
+def test_authority_snapshot_rejects_final_window_issue_races(
+    scheduled_env: ScheduledEnv, mutation: str
+) -> None:
+    scheduled_env.env["GH_FAKE_AUTHORITY_MUTATION"] = mutation
+
+    result = scheduled_env.run_picker("--slot", "1", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["claimed"] is False
+    assert not scheduled_env.task_start_comments()
+    assert not scheduled_env.claim_files()
+    assert not any(
+        call["argv"][:2] == ["issue", "comment"]
+        for call in scheduled_env.github_writes()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [("capacity", "parallel-limit"), ("path_conflict", "path-conflict")],
+)
+def test_picker_refreshes_global_active_state_after_repository_validation(
+    scheduled_env: ScheduledEnv, mutation: str, reason: str
+) -> None:
+    scheduled_env.env["GH_FAKE_GIT_MUTATION"] = mutation
+
+    result = scheduled_env.run_picker("--slot", "1", "--yes")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"claimed": False, "reason": reason}
+    assert not scheduled_env.task_start_comments()
+    assert not scheduled_env.claim_files()
+    assert not any(
+        call["argv"][:2] == ["issue", "comment"]
+        for call in scheduled_env.github_writes()
+    )

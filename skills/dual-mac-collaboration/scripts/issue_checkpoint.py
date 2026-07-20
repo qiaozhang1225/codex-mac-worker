@@ -10,13 +10,20 @@ from typing import Any
 
 import yaml
 
-from duomac_contracts import ContractError, TaskSpec, parse_issue_body
+from duomac_contracts import (
+    ContractError,
+    TaskSpec,
+    parse_issue_body,
+    require_current_schema,
+    task_body_hash,
+)
 from duomac_github import (
     EVENT_MARKER,
     GhClient,
     GhError,
     IssueEvent,
     IssueRef,
+    STATUS_LABELS,
     current_revision_events,
     parse_issue_events,
 )
@@ -259,6 +266,57 @@ def _validate_task_start(
     return True
 
 
+def _scheduled_task_start_events(
+    client: GhClient,
+    ref: IssueRef,
+    spec: TaskSpec,
+    payload: dict[str, Any],
+) -> tuple[IssueEvent, ...]:
+    """Read and validate the final Scheduled publication authority snapshot."""
+    snapshot = client.issue_snapshot(ref)
+    fresh_spec = parse_issue_body(snapshot.body)
+    require_current_schema(fresh_spec)
+    if fresh_spec != spec:
+        raise ContractError("Scheduled task-start Issue contract changed")
+    if task_body_hash(snapshot.body) != payload.get("task_hash"):
+        raise ContractError(
+            "Scheduled task-start task binding hash does not match Issue body"
+        )
+    if payload.get("repository", "").casefold() != ref.repo.casefold():
+        raise ContractError("Scheduled task-start repository does not match Issue")
+    if payload.get("revision") != fresh_spec.revision:
+        raise ContractError("Scheduled task-start revision does not match Issue")
+    if payload.get("context_commit") != fresh_spec.context_commit:
+        raise ContractError("Scheduled task-start context does not match Issue")
+    if snapshot.state != "open":
+        raise ContractError("Scheduled task-start requires an open Issue")
+
+    labels = {label.strip().casefold() for label in snapshot.labels}
+    status_labels = labels & set(STATUS_LABELS)
+    events = current_revision_events(
+        parse_issue_events(snapshot.comments), fresh_spec.revision
+    )
+    starts = [event for event in events if event.payload.get("type") == "task-start"]
+
+    if not starts:
+        if events:
+            raise ContractError(
+                "Scheduled task-start rejects current-revision progress or terminal evidence"
+            )
+        if status_labels != {"duomac:ready"}:
+            raise ContractError("Scheduled task-start requires exactly the ready state")
+        return events
+
+    if len(starts) != 1 or len(events) != 1:
+        raise ContractError(
+            "Scheduled task-start repair requires exactly one task-start event"
+        )
+    if status_labels not in ({"duomac:ready"}, {"duomac:active"}):
+        raise ContractError("Scheduled task-start repair has an invalid Issue state")
+    _validate_task_start(events, payload)
+    return events
+
+
 def _require_authoritative_task_start(events: tuple[IssueEvent, ...]) -> IssueEvent:
     starts = [event for event in events if event.payload.get("type") == "task-start"]
     if len(starts) != 1:
@@ -327,8 +385,11 @@ def apply_event(
             f"payload revision {payload['revision']} does not match Issue revision {spec.revision}"
         )
 
-    events = _current_events(client, ref, spec.revision)
     kind = payload["type"]
+    if kind == "task-start" and payload.get("execution_mode") == "scheduled":
+        events = _scheduled_task_start_events(client, ref, spec, payload)
+    else:
+        events = _current_events(client, ref, spec.revision)
     if kind == "checkpoint":
         _require_authoritative_task_start(events)
     existing_milestones = (
