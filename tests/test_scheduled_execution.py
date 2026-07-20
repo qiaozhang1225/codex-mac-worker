@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -176,6 +177,76 @@ def test_selection_skips_malformed_candidates_without_preventing_a_valid_pick() 
     assert result.candidate == valid
     assert result.reason == "selected"
     assert result.skipped[0].reason == "malformed-candidate"
+
+
+@pytest.mark.parametrize(
+    ("events", "rejection"),
+    [
+        ((IssueEvent("IC_bad", "2026-01-01T00:00:00Z", {"type": "task-start", "revision": "2"}),), "invalid-events"),
+        ((IssueEvent("IC_bad", "2026-01-01T00:00:00Z", {"type": "blocked", "revision": 2}),), "invalid-events"),
+        ((IssueEvent("IC_bad", "2026-01-01T00:00:00Z", {"type": "delivery", "revision": 2}),), "invalid-events"),
+        ((task_start_event(2), task_start_event(2)), "invalid-current-revision-claim"),
+    ],
+)
+def test_selection_fails_closed_for_malformed_or_ambiguous_current_events(
+    events: tuple[IssueEvent, ...], rejection: str
+) -> None:
+    candidate = Candidate(
+        "owner/repo",
+        "https://github.com/owner/repo/issues/1",
+        "2026-01-01T00:00:00Z",
+        parse_issue_body(VALID_BODY),
+        labels=READY_LABELS,
+        events=events,
+    )
+
+    result = select_candidate_result((candidate,), (), 3)
+
+    assert result.candidate is None
+    assert result.skipped[0].reason == rejection
+
+
+def test_selection_rejects_spec_that_cannot_be_rendered() -> None:
+    spec = replace(
+        parse_issue_body(VALID_BODY),
+        decisions=cast(tuple[str, ...], (object(),)),
+    )
+    candidate = Candidate(
+        "owner/repo",
+        "https://github.com/owner/repo/issues/1",
+        "2026-01-01T00:00:00Z",
+        spec,
+        labels=READY_LABELS,
+    )
+
+    result = select_candidate_result((candidate,), (), 3)
+
+    assert result.candidate is None
+    assert result.skipped[0].reason == "invalid-spec"
+
+
+@pytest.mark.parametrize(
+    "active",
+    [
+        (ActiveTask("", ("docs",)),),
+        (ActiveTask("owner/other", ("product//frontend",)),),
+    ],
+)
+def test_selection_rejects_invalid_active_tasks_before_repository_comparison(
+    active: tuple[ActiveTask, ...]
+) -> None:
+    candidate = Candidate(
+        "owner/repo",
+        "https://github.com/owner/repo/issues/1",
+        "2026-01-01T00:00:00Z",
+        parse_issue_body(VALID_BODY),
+        labels=READY_LABELS,
+    )
+
+    result = select_candidate_result((candidate,), active, 3)
+
+    assert result.candidate is None
+    assert result.reason == "invalid-active"
 
 
 def test_selection_uses_creation_time_then_issue_url_order() -> None:

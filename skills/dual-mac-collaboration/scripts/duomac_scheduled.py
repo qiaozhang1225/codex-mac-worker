@@ -16,7 +16,9 @@ from duomac_contracts import (
     require_current_schema,
 )
 from duomac_github import IssueEvent, STATUS_LABELS
+from issue_complete import validate_delivery
 from issue_checkpoint import validate_payload
+from yaml.error import YAMLError
 
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -194,7 +196,7 @@ def _valid_spec(candidate: Candidate) -> str | None:
         return "schema-version"
     try:
         require_current_schema(parse_issue_body(render_issue_body(spec)))
-    except (AttributeError, ContractError, TypeError, ValueError):
+    except (AttributeError, ContractError, TypeError, ValueError, YAMLError):
         return "invalid-spec"
     return None
 
@@ -227,22 +229,62 @@ def _candidate_rejection_reason(candidate: object) -> str | None:
         return "wrong-dispatch-label"
     if not isinstance(candidate.events, tuple):
         return "invalid-events"
+    claims = 0
+    has_terminal_event = False
+    has_unclaimed_progress = False
     for event in candidate.events:
         if not isinstance(event, IssueEvent) or not isinstance(event.payload, dict):
             return "invalid-events"
         payload = event.payload
-        if payload.get("revision") != candidate.spec.revision:
+        event_type = payload.get("type")
+        revision = payload.get("revision")
+        if (
+            not isinstance(event_type, str)
+            or event_type not in {"task-start", "checkpoint", "blocked", "delivery"}
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision <= 0
+        ):
+            return "invalid-events"
+        if revision != candidate.spec.revision:
             continue
-        if payload.get("type") == "task-start":
+        if event_type == "task-start":
             try:
                 validate_payload(payload)
             except ContractError:
                 return "invalid-current-revision-claim"
-            return "already-claimed"
-        if payload.get("type") == "blocked":
-            return "terminal-state"
-        if payload.get("type") == "delivery":
-            return "terminal-state"
+            claims += 1
+        elif event_type == "checkpoint":
+            try:
+                validate_payload(payload)
+            except ContractError:
+                return "invalid-events"
+            has_unclaimed_progress = True
+        elif event_type == "blocked":
+            try:
+                validate_payload(payload)
+            except ContractError:
+                return "invalid-events"
+            has_terminal_event = True
+        else:
+            try:
+                state = (
+                    "completed"
+                    if candidate.spec.delivery_mode == "direct-main"
+                    else "delivered"
+                )
+                validate_delivery(payload, candidate.spec, state)
+            except ContractError:
+                return "invalid-events"
+            has_terminal_event = True
+    if claims > 1:
+        return "invalid-current-revision-claim"
+    if has_terminal_event:
+        return "terminal-state"
+    if claims:
+        return "already-claimed"
+    if has_unclaimed_progress:
+        return "invalid-events"
     return None
 
 
@@ -254,12 +296,30 @@ def _candidate_sort_key(candidate: object, index: int) -> tuple[str, str, int]:
     return "", "", index
 
 
+def _valid_active_tasks(active: object) -> bool:
+    if not isinstance(active, Sequence) or isinstance(active, (str, bytes)):
+        return False
+    for task in active:
+        if (
+            not isinstance(task, ActiveTask)
+            or not isinstance(task.repo, str)
+            or _REPO.fullmatch(task.repo) is None
+            or not isinstance(task.allowed_paths, tuple)
+            or not task.allowed_paths
+            or any(_normalized_allowed_path(path) is None for path in task.allowed_paths)
+        ):
+            return False
+    return True
+
+
 def select_candidate_result(
     ready: Sequence[Candidate],
     active: Sequence[ActiveTask],
     max_parallel_tasks: int,
 ) -> SelectionResult:
     """Evaluate candidates deterministically without reading or mutating GitHub."""
+    if not _valid_active_tasks(active):
+        return SelectionResult(None, "invalid-active", ())
     if (
         not isinstance(max_parallel_tasks, int)
         or isinstance(max_parallel_tasks, bool)
@@ -281,10 +341,7 @@ def select_candidate_result(
             continue
         assert isinstance(candidate, Candidate)
         conflict = any(
-            not isinstance(item, ActiveTask)
-            or not isinstance(item.repo, str)
-            or not isinstance(item.allowed_paths, tuple)
-            or item.repo.casefold() == candidate.repo.casefold()
+            item.repo.casefold() == candidate.repo.casefold()
             and paths_overlap(item.allowed_paths, candidate.spec.allowed_paths)
             for item in active
         )
