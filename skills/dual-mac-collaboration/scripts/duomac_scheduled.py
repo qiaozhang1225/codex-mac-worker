@@ -3,17 +3,22 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import os
 from pathlib import Path
 import re
+import subprocess
 import tomllib
 from typing import Any, Iterator, Sequence
 
 from duomac_contracts import (
     ContractError,
+    ProjectConfig,
     TaskSpec,
+    load_project_config_text,
     parse_issue_body,
     render_issue_body,
     require_current_schema,
+    validate_task,
 )
 from duomac_github import IssueEvent, STATUS_LABELS
 from issue_complete import validate_delivery
@@ -35,12 +40,32 @@ _TERMINAL_LABELS = {
     "duomac:completed",
     "duomac:cancelled",
 }
+_GITHUB_HTTPS_REMOTE = re.compile(
+    r"^https://github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+_GITHUB_SCP_REMOTE = re.compile(
+    r"^git@github\.com:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$"
+)
+_GITHUB_SSH_REMOTE = re.compile(
+    r"^ssh://git@github\.com/(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class RepositoryTarget:
     github: str
     local_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryEvidence:
+    target: RepositoryTarget
+    project: ProjectConfig
+    base_commit: str
+
+
+class RepositoryValidationError(RuntimeError):
+    """Raised when local Git evidence does not authorize a Scheduled claim."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +179,98 @@ def load_scheduled_config(path: Path) -> ScheduledConfig:
         poll_interval_minutes=interval,
         repositories=tuple(repositories),
     )
+
+
+def _git(
+    repo: Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RepositoryValidationError("unable to run non-interactive Git") from exc
+    if check and result.returncode != 0:
+        raise RepositoryValidationError("local Git evidence could not be verified")
+    return result
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    return _git(repo, *args).stdout.strip()
+
+
+def _canonical_github_remote(value: str) -> str | None:
+    for pattern in (
+        _GITHUB_HTTPS_REMOTE,
+        _GITHUB_SCP_REMOTE,
+        _GITHUB_SSH_REMOTE,
+    ):
+        match = pattern.fullmatch(value.strip())
+        if match is not None:
+            return match.group("repo")
+    return None
+
+
+def validate_repository_target(
+    target: RepositoryTarget, spec: TaskSpec
+) -> RepositoryEvidence:
+    """Validate repository identity and context, then return the fetched base."""
+    repo = target.local_path.resolve()
+    if not repo.is_dir():
+        raise RepositoryValidationError("configured local repository is unavailable")
+    top_level = Path(_git_output(repo, "rev-parse", "--show-toplevel")).resolve()
+    if top_level != repo:
+        raise RepositoryValidationError("configured path is not the Git top level")
+    origin = _git_output(repo, "config", "--get", "remote.origin.url")
+    canonical = _canonical_github_remote(origin)
+    if canonical is None or canonical.casefold() != target.github.casefold():
+        raise RepositoryValidationError("configured repository does not match origin")
+
+    if _git(repo, "cat-file", "-e", f"{spec.context_commit}^{{commit}}", check=False).returncode:
+        raise RepositoryValidationError("context commit is unavailable")
+    project_text = _git_output(
+        repo, "show", f"{spec.context_commit}:.duomac/project.toml"
+    )
+    project = load_project_config_text(project_text)
+    for path in spec.context_files:
+        if _git(
+            repo,
+            "cat-file",
+            "-e",
+            f"{spec.context_commit}:{path}",
+            check=False,
+        ).returncode:
+            raise RepositoryValidationError("a declared context file is unavailable")
+
+    branch = project.default_base_branch
+    _git(
+        repo,
+        "fetch",
+        "--no-tags",
+        "origin",
+        f"refs/heads/{branch}:refs/remotes/origin/{branch}",
+    )
+    base_commit = _git_output(repo, "rev-parse", f"refs/remotes/origin/{branch}")
+    ancestry = _git(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        spec.context_commit,
+        base_commit,
+        check=False,
+    )
+    if ancestry.returncode != 0:
+        raise RepositoryValidationError(
+            "context commit is not an ancestor of the fetched base"
+        )
+    validate_task(spec, project)
+    return RepositoryEvidence(target, project, base_commit)
 
 
 def _normalized_allowed_path(path: object) -> tuple[str, ...] | None:

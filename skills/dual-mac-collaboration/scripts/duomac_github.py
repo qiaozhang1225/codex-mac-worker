@@ -62,6 +62,15 @@ class IssueEvent:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class IssueSummary:
+    repo: str
+    url: str
+    created_at: str
+    body: str
+    labels: tuple[str, ...]
+
+
 def parse_issue_events(
     comments: tuple[dict[str, Any], ...],
 ) -> tuple[IssueEvent, ...]:
@@ -142,6 +151,66 @@ class GhClient:
         if not isinstance(body, str):
             raise GhError("GitHub Issue body is missing")
         return body
+
+    def list_issues(self, repo: str, label: str) -> tuple[IssueSummary, ...]:
+        if _REPOSITORY.fullmatch(repo) is None:
+            raise GhError("repository must use OWNER/REPO format")
+        if label not in STATUS_LABELS:
+            raise GhError(f"unknown dual-Mac state label: {label}")
+        raw = self._run(
+            [
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "open",
+                "--label",
+                label,
+                "--limit",
+                "100",
+                "--json",
+                "url,createdAt,body,labels",
+            ]
+        )
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GhError("gh issue list returned invalid JSON") from exc
+        if not isinstance(value, list):
+            raise GhError("gh issue list returned an unexpected value")
+        issues: list[IssueSummary] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise GhError("gh issue list returned an unexpected item")
+            url = item.get("url")
+            created_at = item.get("createdAt")
+            body = item.get("body")
+            labels = item.get("labels")
+            if (
+                not isinstance(url, str)
+                or not isinstance(created_at, str)
+                or not isinstance(body, str)
+                or not isinstance(labels, list)
+                or not all(
+                    isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                    for entry in labels
+                )
+            ):
+                raise GhError("gh issue list returned an unexpected item")
+            ref = IssueRef.parse(url)
+            if ref.repo.casefold() != repo.casefold():
+                raise GhError("gh issue list returned an Issue from another repository")
+            issues.append(
+                IssueSummary(
+                    repo=repo,
+                    url=ref.url,
+                    created_at=created_at,
+                    body=body,
+                    labels=tuple(entry["name"] for entry in labels),
+                )
+            )
+        return tuple(issues)
 
     def issue_comments(self, ref: IssueRef) -> tuple[dict[str, Any], ...]:
         value = self._json(["issue", "view", ref.url, "--json", "comments"])

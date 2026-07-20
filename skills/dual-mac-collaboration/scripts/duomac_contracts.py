@@ -247,8 +247,17 @@ def render_issue_body(spec: TaskSpec) -> str:
 
 def load_project_config(path: Path) -> ProjectConfig:
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ContractError(f"unable to read project config: {exc}") from exc
+    return load_project_config_text(text)
+
+
+def load_project_config_text(text: str) -> ProjectConfig:
+    """Parse project configuration loaded from an authoritative Git object."""
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
         raise ContractError(f"unable to read project config: {exc}") from exc
     if raw.get("schema_version") != 1:
         raise ContractError("project schema_version must be 1")
