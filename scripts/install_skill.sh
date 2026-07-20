@@ -49,6 +49,18 @@ BIN_ROOT="${DUOMAC_BIN_ROOT:-$HOME/.local/bin}"
 VENV="$APP_ROOT/venv"
 TARGET="$SKILLS_ROOT/dual-mac-collaboration"
 
+typeset -A WRAPPERS
+WRAPPERS=(
+  duomac-config-validate config_validate.py
+  duomac-issue-validate issue_validate.py
+  duomac-issue-create issue_create.py
+  duomac-issue-checkpoint issue_checkpoint.py
+  duomac-issue-complete issue_complete.py
+  duomac-git-preflight git_preflight.py
+  duomac-git-deliver git_deliver.py
+  duomac-scheduled-pick scheduled_pick.py
+)
+
 mkdir -p "$APP_ROOT" "$SKILLS_ROOT" "$BIN_ROOT"
 chmod 700 "$APP_ROOT"
 if [[ ! -x "$VENV/bin/python" ]]; then
@@ -64,19 +76,12 @@ cleanup() {
 trap cleanup EXIT
 cp -R "$SOURCE/." "$STAGING/"
 printf '%s\n' "$SOURCE_COMMIT" > "$STAGING/.source-commit"
-for required_file in \
-  "$STAGING/scripts/config_validate.py" \
-  "$STAGING/scripts/scheduled_pick.py" \
-  "$STAGING/assets/repositories.toml.example" \
-  "$STAGING/assets/scheduled-slot-prompt.md" \
-  "$STAGING/references/scheduled-execution.md"; do
-  if [[ ! -f "$required_file" ]]; then
-    print -u2 "installed skill content is missing: $required_file"
-    exit 1
-  fi
+VALIDATE_ARGS=(--skill-root "$STAGING")
+for wrapper script_name in ${(kv)WRAPPERS}; do
+  VALIDATE_ARGS+=(--wrapper-target "$script_name")
 done
-"$VENV/bin/python" "$STAGING/scripts/config_validate.py" \
-  --config "$STAGING/assets/repositories.toml.example" >/dev/null
+"$VENV/bin/python" "$REPO_ROOT/scripts/validate_skill.py" \
+  "${VALIDATE_ARGS[@]}" >/dev/null
 if [[ -e "$TARGET" ]]; then
   mv "$TARGET" "$OLD_TARGET"
 fi
@@ -90,17 +95,6 @@ fi
 rm -rf "$OLD_TARGET"
 trap - EXIT
 
-typeset -A WRAPPERS
-WRAPPERS=(
-  duomac-config-validate config_validate.py
-  duomac-issue-validate issue_validate.py
-  duomac-issue-create issue_create.py
-  duomac-issue-checkpoint issue_checkpoint.py
-  duomac-issue-complete issue_complete.py
-  duomac-git-preflight git_preflight.py
-  duomac-git-deliver git_deliver.py
-  duomac-scheduled-pick scheduled_pick.py
-)
 for wrapper script_name in ${(kv)WRAPPERS}; do
   destination="$BIN_ROOT/$wrapper"
   temporary="$destination.tmp.$$"

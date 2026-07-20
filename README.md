@@ -36,7 +36,9 @@ Interactive Mac mini pickup begins only when the user opens or directs that Code
 
 ## Codex App Scheduled use
 
-Scheduled execution uses three independent tasks named exactly `Dual Mac Slot 1`, `Dual Mac Slot 2`, and `Dual Mac Slot 3`. Each task runs the same tracked prompt in `skills/dual-mac-collaboration/assets/scheduled-slot-prompt.md`; the task name supplies its slot number. A run validates local configuration, atomically claims at most one non-overlapping `duomac:ready` Issue, and continues in that same visible Scheduled task. A no-op creates no task and makes no mutation. Slots never resume one another's failed work.
+Scheduled execution uses three independent tasks named exactly `Dual Mac Slot 1`, `Dual Mac Slot 2`, and `Dual Mac Slot 3`. Each task runs the same tracked prompt in `skills/dual-mac-collaboration/assets/scheduled-slot-prompt.md`; the task name supplies its slot number. A run validates local configuration, atomically claims at most one non-overlapping `duomac:ready` Issue, and continues in that same visible Scheduled task. Before planning, it reads applicable repository `AGENTS.md` instructions and every Issue-declared context file from the frozen context commit; missing or unreadable context blocks all execution. Slots never resume one another's failed work.
+
+For `claimed: false`, a **clean no-candidate no-op** has no GitHub or local mutation. A **maintenance-only** unclaimed outcome may repair a projection or comment/label invalid ready work. In both cases the Scheduled task reports the exact reason, reports any maintenance performed, and must stop without code execution. Do not describe every unclaimed picker result as mutation-free.
 
 Copy the tracked example to `~/Library/Application Support/DualMacCollaboration/repositories.toml`, then keep these two Mac-local entries:
 

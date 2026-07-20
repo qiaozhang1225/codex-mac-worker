@@ -15,6 +15,8 @@ Identify the current device role before acting. If it is unclear, ask whether th
 - On **Mac mini interactive**, read [roles and delegation](references/roles-and-delegation.md) and [the Issue protocol](references/issue-protocol.md) before accepting work. Read [checkpoints](references/checkpoints.md) before starting or reporting work. Read [Git delivery](references/git-delivery.md) before creating a worktree or delivering code.
 - On **Mac mini Codex App Scheduled**, read and follow [Scheduled execution](references/scheduled-execution.md) before running any picker or mutating GitHub. Do not combine that route with interactive pickup.
 
+Before planning or executing any milestone on Mac mini, read the applicable repository `AGENTS.md` instructions and every Issue-declared context file from the frozen context commit. If any required instruction or context file is missing or unreadable at that commit, publish blocked and execute nothing; never substitute current-checkout content or silently skip it.
+
 ## Dispatch from MacBook
 
 1. Decide with the user whether MacBook should implement the work or delegate it. Duration alone is never a delegation reason.
@@ -35,7 +37,7 @@ python scripts/issue_create.py --help
 
 1. Fetch work only after the user opens or directs the visible Codex App. Select a `duomac:ready` Issue; do not poll in the background.
 2. Treat the **Issue body is the only current task contract**. A comment may report evidence or request a revision, but it cannot expand scope. Refuse comment-only additions and request a complete body revision.
-3. Require schema v2, validate the latest body and `.duomac/project.toml`, and stop if the revision, context commit, product decisions, paths, risk, milestones, or verification profile is invalid.
+3. Require schema v2, validate the latest body and `.duomac/project.toml`, and read the frozen repository instructions and context above. Stop blocked before planning if the revision, context commit, product decisions, paths, risk, milestones, verification profile, `AGENTS.md`, or any declared context file is invalid, missing, or unreadable.
 4. Publish `task-start`, create an isolated `codex/*` worktree, and implement only the approved plan.
 5. Execute milestones in declared order. At every milestone, publish its structured checkpoint before starting the next milestone and **continue without MacBook approval** while the current revision remains valid and no hard stop is present.
 6. Re-read the Issue body before every milestone and final delivery. If revision changed, finish the current safe check, validate the complete replacement contract, and never deliver evidence for the old revision.

@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import sys
 
 import yaml
 
@@ -69,6 +71,39 @@ def test_skill_routes_scheduled_runs_to_scheduled_reference() -> None:
     assert "Codex App Scheduled" in body
     assert "Never use this skill to start background execution" not in body
     assert "Goal" in body
+
+
+def test_scheduled_execution_requires_frozen_repository_context() -> None:
+    _, body = skill_parts()
+    scheduled = (
+        SKILL_ROOT / "references" / "scheduled-execution.md"
+    ).read_text(encoding="utf-8")
+
+    for text in (body, scheduled):
+        assert "AGENTS.md" in text
+        assert "every Issue-declared context file" in text
+        assert "frozen context commit" in text
+        assert "blocked" in text
+
+
+def test_scheduled_docs_distinguish_clean_noop_from_maintenance() -> None:
+    texts = [
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (SKILL_ROOT / "references" / "scheduled-execution.md").read_text(
+            encoding="utf-8"
+        ),
+        (SKILL_ROOT / "assets" / "scheduled-slot-prompt.md").read_text(
+            encoding="utf-8"
+        ),
+    ]
+
+    for text in texts:
+        normalized = text.casefold()
+        assert "clean no-candidate no-op" in normalized
+        assert "maintenance-only" in normalized
+        assert "claimed: false" in normalized
+        assert "stop without code execution" in normalized
+        assert "report" in normalized and "maintenance" in normalized
 
 
 def test_references_do_not_chain_to_other_references() -> None:
@@ -156,6 +191,8 @@ if [ "$1" = "--version" ]; then
 elif [ "$1" = "-m" ] && [ "$2" = "venv" ]; then
   mkdir -p "$3/bin"
   cp "$0" "$3/bin/python"
+elif [ "${1##*/}" = "validate_skill.py" ]; then
+  exec "$DUOMAC_REAL_PYTHON" "$@"
 fi
 """,
         encoding="utf-8",
@@ -187,6 +224,7 @@ def installed_test_environment(
         "DUOMAC_SKILLS_ROOT": str(tmp_path / "skills"),
         "DUOMAC_BIN_ROOT": str(tmp_path / "bin"),
         "DUOMAC_TEST_LOG": str(log),
+        "DUOMAC_REAL_PYTHON": sys.executable,
     }
     return env, app_root
 
@@ -246,6 +284,70 @@ def test_installer_preserves_existing_repository_config(tmp_path: Path) -> None:
     assert (app_root / "repositories.toml.example").is_file()
 
 
+def test_repo_skill_validator_accepts_source() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "validate_skill.py"),
+            "--skill-root",
+            str(SKILL_ROOT),
+            *[
+                argument
+                for name in REQUIRED_SCRIPTS
+                for argument in ("--wrapper-target", name)
+            ],
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_installer_rejects_invalid_staged_skill_before_activation(
+    tmp_path: Path,
+) -> None:
+    env, _ = installed_test_environment(tmp_path)
+    skills_root = Path(env["DUOMAC_SKILLS_ROOT"])
+    installed = skills_root / "dual-mac-collaboration"
+    installed.mkdir(parents=True)
+    sentinel = installed / "sentinel.txt"
+    sentinel.write_text("existing install\n", encoding="utf-8")
+
+    source_root = tmp_path / "source"
+    (source_root / "scripts").mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts" / "install_skill.sh", source_root / "scripts")
+    if (ROOT / "scripts" / "validate_skill.py").exists():
+        shutil.copy2(ROOT / "scripts" / "validate_skill.py", source_root / "scripts")
+    shutil.copytree(
+        SKILL_ROOT,
+        source_root / "skills" / "dual-mac-collaboration",
+    )
+    invalid_metadata = (
+        source_root
+        / "skills"
+        / "dual-mac-collaboration"
+        / "agents"
+        / "openai.yaml"
+    )
+    invalid_metadata.write_text("interface: {}\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["/bin/zsh", str(source_root / "scripts" / "install_skill.sh")],
+        cwd=source_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding="utf-8") == "existing install\n"
+    assert {path.name for path in installed.iterdir()} == {"sentinel.txt"}
+
+
 def test_installer_removes_old_client_only_with_explicit_flag(tmp_path: Path) -> None:
     bin_dir, log = _fake_install_tools(tmp_path, "e" * 40)
     skills_root = tmp_path / "skills"
@@ -263,6 +365,7 @@ def test_installer_removes_old_client_only_with_explicit_flag(tmp_path: Path) ->
         "DUOMAC_SKILLS_ROOT": str(skills_root),
         "DUOMAC_BIN_ROOT": str(wrapper_root),
         "DUOMAC_TEST_LOG": str(log),
+        "DUOMAC_REAL_PYTHON": sys.executable,
     }
 
     first = subprocess.run(
