@@ -1476,7 +1476,7 @@ Expected: `claimed: false`, `reason: preview`, and no GitHub label/comment mutat
 Open a visible Mac mini setup task and enter:
 
 ```text
-Use the installed dual-mac-collaboration Scheduled prompt asset to create three independent Codex App Scheduled tasks named Dual Mac Slot 1, Dual Mac Slot 2, and Dual Mac Slot 3. Run each every 10 minutes, stagger their starts by about one minute, use the local codex-mac-worker project, preserve the default model, and give the runs access only to the two configured repository paths plus required GitHub network operations. Substitute the matching slot number into each prompt. Do not create a heartbeat in this setup conversation; create standalone Scheduled tasks whose runs appear in Scheduled.
+Use the installed dual-mac-collaboration Scheduled prompt asset to create three independent Codex App Scheduled tasks named Dual Mac Slot 1, Dual Mac Slot 2, and Dual Mac Slot 3. Run each every 10 minutes, stagger their starts by about one minute, use the local codex-mac-worker project, and give the runs access only to the two configured repository paths plus required GitHub network operations. Save the same explicit model and reasoning-effort values on all three Slots because the current Scheduled create/update interface does not accept inherited or unset values. Substitute the matching slot number into each prompt. Do not create a heartbeat in this setup conversation; create standalone Scheduled tasks whose runs appear in Scheduled. Do not edit Codex App internal files or databases to emulate a default value.
 ```
 
 Expected: three distinct active Scheduled definitions are visible in the App. Do not expose raw recurrence rules to the user.

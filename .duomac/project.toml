@@ -1,0 +1,24 @@
+schema_version = 1
+default_base_branch = "main"
+protected_paths = [
+  ".duomac",
+  ".github/workflows",
+  ".env",
+  ".env.local",
+  "scripts/install_skill.sh",
+  "scripts/retire_legacy_worker.sh",
+]
+max_changed_files = 30
+max_diff_lines = 3000
+
+[verification.fast]
+commands = [
+  '"$HOME/Library/Application Support/DualMacCollaboration/venv/bin/python" scripts/validate_skill.py --skill-root skills/dual-mac-collaboration --wrapper-target scheduled_pick.py',
+]
+
+[verification.full]
+commands = [
+  "python3.12 -m venv .venv",
+  ".venv/bin/pip install -e '.[dev]'",
+  ".venv/bin/pytest -q",
+]

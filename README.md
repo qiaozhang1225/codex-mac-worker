@@ -38,6 +38,8 @@ Interactive Mac mini pickup begins only when the user opens or directs that Code
 
 Scheduled execution uses three independent tasks named exactly `Dual Mac Slot 1`, `Dual Mac Slot 2`, and `Dual Mac Slot 3`. Each task runs the same tracked prompt in `skills/dual-mac-collaboration/assets/scheduled-slot-prompt.md`; the task name supplies its slot number. A run validates local configuration, atomically claims at most one non-overlapping `duomac:ready` Issue, and continues in that same visible Scheduled task. Before planning, it reads applicable repository `AGENTS.md` instructions and every Issue-declared context file from the frozen context commit; missing or unreadable context blocks all execution. Slots never resume one another's failed work.
 
+The current Scheduled create/update interface persists explicit model and reasoning-effort values; it does not accept an inherited or unset value. Treat the values saved on each Scheduled task as authoritative. Keep all execution Slots on the same model and reasoning effort unless a later routing rule deterministically assigns task classes to Slots. Change these values only through supported Scheduled controls. Do not edit Codex App internal files or databases.
+
 The picker JSON is authoritative. Branch on `outcome`, not `reason`: `clean-noop` is a clean no-candidate no-op with `maintenance_actions: []`; `maintenance` is a maintenance-only result whose exact action list may name projection repair or blocked comments/labels; `claimed` authorizes execution of only the returned Issue. Report `reason` and `maintenance_actions` exactly for every outcome. Both unclaimed outcomes must stop without code execution, and `preview` or `error` never executes code.
 
 Copy the tracked example to `~/Library/Application Support/DualMacCollaboration/repositories.toml`, then keep these two Mac-local entries:
@@ -64,6 +66,8 @@ duomac-scheduled-pick --help
 ```
 
 See the official [Codex Scheduled tasks documentation](https://developers.openai.com/codex/app/automations) for task creation, testing, permissions, and run management.
+
+This repository includes `.duomac/project.toml`, so it can also receive bounded dual-Mac tasks. The fast profile validates the installed skill structure using the DualMacCollaboration runtime; the full profile creates a worktree-local development environment and runs the complete test suite.
 
 The helpers are preview-first:
 

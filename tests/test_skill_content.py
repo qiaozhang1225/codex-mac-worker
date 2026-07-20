@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tomllib
 
 import pytest
 import yaml
@@ -668,3 +669,26 @@ def test_main_tree_has_no_legacy_entry_points() -> None:
     assert not (ROOT / "src/codex_mac_worker").exists()
     assert not (ROOT / "skills/dispatch-codex-task").exists()
     assert not (ROOT / "templates").exists()
+
+
+def test_repository_is_ready_for_dual_mac_dispatch() -> None:
+    project_path = ROOT / ".duomac" / "project.toml"
+
+    assert project_path.is_file()
+    project = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    assert project["schema_version"] == 1
+    assert project["default_base_branch"] == "main"
+    assert ".duomac" in project["protected_paths"]
+    assert ".github/workflows" in project["protected_paths"]
+    assert project["max_changed_files"] == 30
+    assert project["max_diff_lines"] == 3000
+    assert project["verification"]["fast"]["commands"]
+    assert project["verification"]["full"]["commands"]
+
+
+def test_readme_documents_explicit_scheduled_model_settings() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "explicit model and reasoning-effort values" in readme
+    assert "Do not edit Codex App internal files or databases" in readme
+    assert "same model and reasoning effort" in readme
