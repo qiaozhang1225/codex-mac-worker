@@ -611,11 +611,23 @@ def test_task_start_rejects_invalid_scheduled_identity(
         ({"commits": []}, "at least one full commit SHA"),
         ({"blockers": ["Waiting on access"]}, "blockers must be empty"),
         ({"verification": ["pytest -q"]}, "explicitly passing"),
-        ({"verification": ["pytest -q: failed"]}, "explicitly passing"),
+        ({"verification": ["pytest -q: failed"]}, "failure or error marker"),
         (
             {"verification": ["pytest -q: passed", "ruff check: failed"]},
-            "explicitly passing",
+            "failure or error marker",
         ),
+        ({"verification": [": passed"]}, "meaningful check description"),
+        ({"verification": ["---: passed"]}, "meaningful check description"),
+        (
+            {"verification": ["pytest failure recovered: passed"]},
+            "failure or error marker",
+        ),
+        (
+            {"verification": ["pytest error recovered: passed"]},
+            "failure or error marker",
+        ),
+        ({"verification": ["pytest -q: 0 passed"]}, "greater than zero"),
+        ({"verification": ["pytest -q: 00 passed"]}, "greater than zero"),
     ],
 )
 def test_checkpoint_rejects_incomplete_or_failing_evidence_without_mutation(
@@ -641,6 +653,36 @@ def test_checkpoint_rejects_incomplete_or_failing_evidence_without_mutation(
         call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
         for call in gh_calls(cli_env)
     )
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [
+        ["pytest -q: passed"],
+        ["pytest -q: 7 passed"],
+        ["ruff check: PASSED", "pytest -q: 92 PASSED"],
+    ],
+)
+def test_checkpoint_accepts_unambiguous_passing_verification(
+    cli_env: dict[str, str], tmp_path: Path, verification: list[str]
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(valid_task_start())]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+    payload = valid_checkpoint()
+    payload["verification"] = verification
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["published"] is True
 
 
 def test_checkpoint_ignores_events_from_previous_revision(
@@ -722,6 +764,42 @@ def test_checkpoint_rejects_after_all_declared_milestones(
 
     assert result.returncode != 0
     assert "all declared milestones" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_matching_out_of_plan_checkpoint_cannot_trigger_label_repair(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    checkpoints: list[dict[str, object]] = []
+    for milestone in (1, 2, 3):
+        checkpoint = valid_checkpoint()
+        checkpoint["milestone"] = milestone
+        checkpoints.append(checkpoint)
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        event_comment(valid_task_start(), "IC_start"),
+        *(
+            event_comment(checkpoint, f"IC_{checkpoint['milestone']}")
+            for checkpoint in checkpoints
+        ),
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, checkpoints[-1]),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "milestone 3" in result.stderr
+    assert "not declared" in result.stderr
     assert not any(
         call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
         for call in gh_calls(cli_env)

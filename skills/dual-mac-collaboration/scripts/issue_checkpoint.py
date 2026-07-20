@@ -24,7 +24,10 @@ from duomac_github import (
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _CLAIM_ID = re.compile(r"^[0-9a-f]{40}$")
-_PASSING_VERIFICATION = re.compile(r":\s*(?:[0-9]+\s+)?passed\s*$", re.IGNORECASE)
+_PASSING_RESULT = re.compile(r"(?:(?P<count>[0-9]+)\s+)?passed", re.IGNORECASE)
+_FAILURE_MARKER = re.compile(
+    r"\b(?:fail(?:s|ed|ing|ure|ures)?|error(?:s|ed|ing)?)\b", re.IGNORECASE
+)
 
 
 def _mapping(path: Path) -> dict[str, Any]:
@@ -58,6 +61,33 @@ def _string_list(payload: dict[str, Any], field: str) -> None:
         isinstance(item, str) and item.strip() for item in value
     ):
         raise ContractError(f"checkpoint {field} must be a string list")
+
+
+def _validate_verification_evidence(items: list[str]) -> None:
+    for item in items:
+        if _FAILURE_MARKER.search(item) is not None:
+            raise ContractError(
+                "checkpoint verification must not contain a failure or error marker"
+            )
+        description, delimiter, result = item.rpartition(":")
+        if not delimiter:
+            raise ContractError(
+                "checkpoint verification must contain explicitly passing results"
+            )
+        if not any(character.isalpha() for character in description):
+            raise ContractError(
+                "checkpoint verification requires a meaningful check description"
+            )
+        match = _PASSING_RESULT.fullmatch(result.strip())
+        if match is None:
+            raise ContractError(
+                "checkpoint verification must contain explicitly passing results"
+            )
+        count = match.group("count")
+        if count is not None and not count.strip("0"):
+            raise ContractError(
+                "checkpoint verification passing count must be greater than zero"
+            )
 
 
 def validate_payload(payload: dict[str, Any]) -> str:
@@ -103,13 +133,7 @@ def validate_payload(payload: dict[str, Any]) -> str:
                 "checkpoint commits must contain at least one full commit SHA"
             )
         _nonempty_strings(payload, "verification")
-        if any(
-            _PASSING_VERIFICATION.search(item) is None
-            for item in payload["verification"]
-        ):
-            raise ContractError(
-                "checkpoint verification must contain explicitly passing results"
-            )
+        _validate_verification_evidence(payload["verification"])
         if payload.get("scope_status") != "within-scope":
             raise ContractError("checkpoint scope_status must be within-scope")
         _nonempty_strings(payload, "next")
@@ -185,7 +209,9 @@ def _require_authoritative_task_start(events: tuple[IssueEvent, ...]) -> IssueEv
     return starts[0]
 
 
-def _checkpoint_milestones(events: tuple[IssueEvent, ...]) -> list[Any]:
+def _checkpoint_milestones(
+    events: tuple[IssueEvent, ...], spec: TaskSpec
+) -> list[Any]:
     checkpoints = [
         event for event in events if event.payload.get("type") == "checkpoint"
     ]
@@ -201,6 +227,13 @@ def _checkpoint_milestones(events: tuple[IssueEvent, ...]) -> list[Any]:
         raise ContractError("existing checkpoint milestone must be a positive integer")
     if existing_milestones != list(range(1, len(existing_milestones) + 1)):
         raise ContractError("existing checkpoint milestones must be continuous from 1")
+    declared_milestones = {milestone.number for milestone in spec.execution_plan}
+    for milestone in existing_milestones:
+        if milestone not in declared_milestones:
+            raise ContractError(
+                f"historical checkpoint milestone {milestone} is not declared "
+                "by the current execution plan"
+            )
     return existing_milestones
 
 
@@ -231,7 +264,7 @@ def apply_event(
     if kind == "checkpoint":
         _require_authoritative_task_start(events)
     existing_milestones = (
-        _checkpoint_milestones(events) if kind == "checkpoint" else []
+        _checkpoint_milestones(events, spec) if kind == "checkpoint" else []
     )
     if kind == "task-start":
         repaired = _validate_task_start(events, payload)
