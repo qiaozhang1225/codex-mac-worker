@@ -71,10 +71,14 @@ def parse_issue_events(
         if not isinstance(body, str) or EVENT_MARKER not in body:
             continue
         if body.count(EVENT_MARKER) != 1:
-            raise GhError("duomac event marker must be followed by one YAML block")
-        match = _EVENT_BLOCK.search(body)
+            raise GhError(
+                "duomac event marker must be followed by one YAML block and no other content"
+            )
+        match = _EVENT_BLOCK.fullmatch(body.strip())
         if match is None:
-            raise GhError("duomac event marker must be followed by one YAML block")
+            raise GhError(
+                "duomac event marker must be followed by one YAML block and no other content"
+            )
         try:
             payload = yaml.safe_load(match.group("yaml"))
         except yaml.YAMLError as exc:

@@ -24,6 +24,7 @@ from duomac_github import (
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _CLAIM_ID = re.compile(r"^[0-9a-f]{40}$")
+_PASSING_VERIFICATION = re.compile(r":\s*(?:[0-9]+\s+)?passed\s*$", re.IGNORECASE)
 
 
 def _mapping(path: Path) -> dict[str, Any]:
@@ -95,13 +96,26 @@ def validate_payload(payload: dict[str, Any]) -> str:
             raise ContractError("checkpoint milestone must be a positive integer")
         _nonempty_strings(payload, "completed")
         _string_list(payload, "commits")
-        if any(_FULL_SHA.fullmatch(item) is None for item in payload["commits"]):
-            raise ContractError("checkpoint commits must contain full commit SHAs")
+        if not payload["commits"] or any(
+            _FULL_SHA.fullmatch(item) is None for item in payload["commits"]
+        ):
+            raise ContractError(
+                "checkpoint commits must contain at least one full commit SHA"
+            )
         _nonempty_strings(payload, "verification")
+        if any(
+            _PASSING_VERIFICATION.search(item) is None
+            for item in payload["verification"]
+        ):
+            raise ContractError(
+                "checkpoint verification must contain explicitly passing results"
+            )
         if payload.get("scope_status") != "within-scope":
             raise ContractError("checkpoint scope_status must be within-scope")
         _nonempty_strings(payload, "next")
         _string_list(payload, "blockers")
+        if payload["blockers"]:
+            raise ContractError("checkpoint blockers must be empty")
         return "duomac:active"
     if kind == "blocked":
         reason = payload.get("reason")
@@ -153,6 +167,24 @@ def _validate_task_start(
     return True
 
 
+def _require_authoritative_task_start(events: tuple[IssueEvent, ...]) -> IssueEvent:
+    starts = [event for event in events if event.payload.get("type") == "task-start"]
+    if len(starts) != 1:
+        raise ContractError(
+            "checkpoint requires exactly one current-revision task-start"
+        )
+    validate_payload(starts[0].payload)
+    start_index = next(
+        index for index, event in enumerate(events) if event is starts[0]
+    )
+    if any(
+        event.payload.get("type") == "checkpoint"
+        for event in events[:start_index]
+    ):
+        raise ContractError("task-start must precede checkpoint history")
+    return starts[0]
+
+
 def _checkpoint_milestones(events: tuple[IssueEvent, ...]) -> list[Any]:
     checkpoints = [
         event for event in events if event.payload.get("type") == "checkpoint"
@@ -196,6 +228,8 @@ def apply_event(
 
     events = _current_events(client, ref, spec.revision)
     kind = payload["type"]
+    if kind == "checkpoint":
+        _require_authoritative_task_start(events)
     existing_milestones = (
         _checkpoint_milestones(events) if kind == "checkpoint" else []
     )
