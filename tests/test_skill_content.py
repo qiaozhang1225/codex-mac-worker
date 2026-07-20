@@ -678,12 +678,26 @@ def test_repository_is_ready_for_dual_mac_dispatch() -> None:
     project = tomllib.loads(project_path.read_text(encoding="utf-8"))
     assert project["schema_version"] == 1
     assert project["default_base_branch"] == "main"
-    assert ".duomac" in project["protected_paths"]
-    assert ".github/workflows" in project["protected_paths"]
+    assert set(project["protected_paths"]) == {
+        ".duomac",
+        ".github/workflows",
+        ".env",
+        ".env.local",
+        "scripts",
+        "skills/dual-mac-collaboration",
+    }
     assert project["max_changed_files"] == 30
     assert project["max_diff_lines"] == 3000
-    assert project["verification"]["fast"]["commands"]
-    assert project["verification"]["full"]["commands"]
+    assert project["verification"]["fast"]["commands"] == [
+        '"$HOME/Library/Application Support/DualMacCollaboration/venv/bin/python" '
+        "scripts/validate_skill.py --skill-root skills/dual-mac-collaboration "
+        "--wrapper-target scheduled_pick.py"
+    ]
+    assert project["verification"]["full"]["commands"] == [
+        "python3.12 -m venv .venv",
+        ".venv/bin/pip install -e '.[dev]'",
+        ".venv/bin/pytest -q",
+    ]
 
 
 def test_readme_documents_explicit_scheduled_model_settings() -> None:

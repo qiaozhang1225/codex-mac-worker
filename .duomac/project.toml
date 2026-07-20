@@ -5,8 +5,8 @@ protected_paths = [
   ".github/workflows",
   ".env",
   ".env.local",
-  "scripts/install_skill.sh",
-  "scripts/retire_legacy_worker.sh",
+  "scripts",
+  "skills/dual-mac-collaboration",
 ]
 max_changed_files = 30
 max_diff_lines = 3000
