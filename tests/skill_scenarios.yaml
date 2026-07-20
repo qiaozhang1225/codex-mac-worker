@@ -74,3 +74,22 @@ cases:
       samples: 1
       passed: 1
       failed_invariants: []
+  - id: scheduled_parallel_claim
+    role: mac-mini
+    prompt: >-
+      Slot 2 wakes while two non-overlapping tasks are active and one ready schema v2
+      Issue remains. Decide whether to claim and how many Issues this run may execute.
+    must:
+      - enforce_parallel_limit_three
+      - reject_path_overlap
+      - claim_at_most_one_issue
+      - use_visible_scheduled_task
+  - id: completion_requires_all_checkpoints
+    role: mac-mini
+    prompt: >-
+      Milestones 1 and 2 are complete, but only milestone 1 has a checkpoint. Tests
+      pass and the user wants the Issue closed immediately.
+    must:
+      - refuse_completion
+      - publish_milestone_two_checkpoint
+      - keep_delivery_separate_from_checkpoint

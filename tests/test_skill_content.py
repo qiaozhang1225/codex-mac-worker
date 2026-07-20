@@ -16,22 +16,23 @@ REQUIRED_REFERENCES = (
     "issue-protocol.md",
     "checkpoints.md",
     "git-delivery.md",
+    "scheduled-execution.md",
 )
 REQUIRED_SCRIPTS = (
+    "config_validate.py",
     "issue_validate.py",
     "issue_create.py",
     "issue_checkpoint.py",
     "issue_complete.py",
     "git_preflight.py",
     "git_deliver.py",
+    "scheduled_pick.py",
 )
 FORBIDDEN_ACTIVE = (
     "worker_github_app" + "_id",
     "readiness attestation",
     "merge_" + "mode",
     "approval fingerprint",
-    "codex exec",
-    "LaunchDaemon",
 )
 
 
@@ -59,6 +60,15 @@ def test_skill_routes_to_all_required_references() -> None:
     for name in REQUIRED_REFERENCES:
         assert f"references/{name}" in body
         assert (SKILL_ROOT / "references" / name).is_file()
+
+
+def test_skill_routes_scheduled_runs_to_scheduled_reference() -> None:
+    _, body = skill_parts()
+
+    assert "references/scheduled-execution.md" in body
+    assert "Codex App Scheduled" in body
+    assert "Never use this skill to start background execution" not in body
+    assert "Goal" in body
 
 
 def test_references_do_not_chain_to_other_references() -> None:
@@ -116,6 +126,23 @@ def test_openai_metadata_names_the_skill() -> None:
     assert "$dual-mac-collaboration" in metadata["interface"]["default_prompt"]
 
 
+def test_scheduled_prompt_has_required_boundaries() -> None:
+    prompt = (SKILL_ROOT / "assets" / "scheduled-slot-prompt.md").read_text(
+        encoding="utf-8"
+    )
+
+    for phrase in (
+        "$dual-mac-collaboration",
+        "duomac-scheduled-pick",
+        "one Issue",
+        "no-op",
+        "Never deploy",
+        "Never force push",
+        "Do not use Goal",
+    ):
+        assert phrase in prompt
+
+
 def _fake_install_tools(tmp_path: Path, head: str) -> tuple[Path, Path]:
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir()
@@ -146,25 +173,26 @@ fi
     return bin_dir, log
 
 
-def test_installer_copies_skill_and_records_source_commit(tmp_path: Path) -> None:
-    head = "d" * 40
+def installed_test_environment(
+    tmp_path: Path, head: str = "d" * 40
+) -> tuple[dict[str, str], Path]:
     bin_dir, log = _fake_install_tools(tmp_path, head)
-    home = tmp_path / "home"
     app_root = tmp_path / "app"
-    skills_root = tmp_path / "skills"
-    wrapper_root = tmp_path / "bin"
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:/usr/bin:/bin",
-        "HOME": str(home),
+        "HOME": str(tmp_path / "home"),
         "CODEX_HOME": str(tmp_path / "codex-home"),
         "DUOMAC_APP_ROOT": str(app_root),
-        "DUOMAC_SKILLS_ROOT": str(skills_root),
-        "DUOMAC_BIN_ROOT": str(wrapper_root),
+        "DUOMAC_SKILLS_ROOT": str(tmp_path / "skills"),
+        "DUOMAC_BIN_ROOT": str(tmp_path / "bin"),
         "DUOMAC_TEST_LOG": str(log),
     }
+    return env, app_root
 
-    result = subprocess.run(
+
+def run_installer(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["/bin/zsh", str(ROOT / "scripts/install_skill.sh")],
         cwd=ROOT,
         env=env,
@@ -173,23 +201,49 @@ def test_installer_copies_skill_and_records_source_commit(tmp_path: Path) -> Non
         check=False,
     )
 
+
+def test_installer_copies_skill_and_records_source_commit(tmp_path: Path) -> None:
+    head = "d" * 40
+    env, app_root = installed_test_environment(tmp_path, head)
+    skills_root = Path(env["DUOMAC_SKILLS_ROOT"])
+    wrapper_root = Path(env["DUOMAC_BIN_ROOT"])
+    log = Path(env["DUOMAC_TEST_LOG"])
+
+    result = run_installer(env)
+
     assert result.returncode == 0, result.stderr
     installed = skills_root / "dual-mac-collaboration"
     assert (installed / "SKILL.md").is_file()
     assert (installed / ".source-commit").read_text(encoding="utf-8").strip() == head
     assert "-m pip install PyYAML>=6,<7" in log.read_text(encoding="utf-8")
     wrapper_names = (
+        "duomac-config-validate",
         "duomac-issue-validate",
         "duomac-issue-create",
         "duomac-issue-checkpoint",
         "duomac-issue-complete",
         "duomac-git-preflight",
         "duomac-git-deliver",
+        "duomac-scheduled-pick",
     )
     for name in wrapper_names:
         wrapper = wrapper_root / name
         assert wrapper.is_file()
         assert os.access(wrapper, os.X_OK)
+    assert (app_root / "repositories.toml.example").is_file()
+
+
+def test_installer_preserves_existing_repository_config(tmp_path: Path) -> None:
+    env, app_root = installed_test_environment(tmp_path)
+    config = app_root / "repositories.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("sentinel = true\n", encoding="utf-8")
+
+    result = run_installer(env)
+
+    assert result.returncode == 0, result.stderr
+    assert config.read_text(encoding="utf-8") == "sentinel = true\n"
+    assert (app_root / "repositories.toml.example").is_file()
 
 
 def test_installer_removes_old_client_only_with_explicit_flag(tmp_path: Path) -> None:

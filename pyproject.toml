@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dual-mac-collaboration-skill"
-version = "1.0.0"
+version = "1.1.0"
 description = "Codex skill resources for GitHub Issue coordination across two Macs"
 requires-python = ">=3.12"
 dependencies = ["PyYAML>=6,<7"]

@@ -1,18 +1,19 @@
 ---
 name: dual-mac-collaboration
-description: Use when deciding whether MacBook work should be delegated, publishing or revising a GitHub Issue for Mac mini, executing a dispatched task in the visible Mac mini Codex App, recording long-task checkpoints, or delivering code through direct-main or task-branch.
+description: Use when deciding whether MacBook work should be delegated, publishing or revising a GitHub Issue for Mac mini, executing a dispatched task interactively or with Codex App Scheduled, recording checkpoints, or delivering code through direct-main or task-branch.
 ---
 
 # Dual-Mac Collaboration
 
-Coordinate visible Codex App work through one versioned GitHub Issue contract. Never use this skill to start background execution or silently publish a task.
+Coordinate visible interactive or Codex App Scheduled work through one versioned GitHub Issue contract. Never use an external daemon, `codex exec`, LaunchDaemon, or Goal mode to execute tasks.
 
 ## Detect the role
 
 Identify the current device role before acting. If it is unclear, ask whether this conversation is on the MacBook or Mac mini.
 
 - On **MacBook**, read [roles and delegation](references/roles-and-delegation.md) before deciding whether to keep or delegate work. Read [the Issue protocol](references/issue-protocol.md) before drafting, publishing, or revising a task.
-- On **Mac mini**, read [roles and delegation](references/roles-and-delegation.md) and [the Issue protocol](references/issue-protocol.md) before accepting work. Read [checkpoints](references/checkpoints.md) before starting or reporting work. Read [Git delivery](references/git-delivery.md) before creating a worktree or delivering code.
+- On **Mac mini interactive**, read [roles and delegation](references/roles-and-delegation.md) and [the Issue protocol](references/issue-protocol.md) before accepting work. Read [checkpoints](references/checkpoints.md) before starting or reporting work. Read [Git delivery](references/git-delivery.md) before creating a worktree or delivering code.
+- On **Mac mini Codex App Scheduled**, read and follow [Scheduled execution](references/scheduled-execution.md) before running any picker or mutating GitHub. Do not combine that route with interactive pickup.
 
 ## Dispatch from MacBook
 
@@ -34,9 +35,9 @@ python scripts/issue_create.py --help
 
 1. Fetch work only after the user opens or directs the visible Codex App. Select a `duomac:ready` Issue; do not poll in the background.
 2. Treat the **Issue body is the only current task contract**. A comment may report evidence or request a revision, but it cannot expand scope. Refuse comment-only additions and request a complete body revision.
-3. Validate the latest body and `.duomac/project.toml`. Stop if the revision, context commit, product decisions, paths, risk, or verification profile is invalid.
+3. Require schema v2, validate the latest body and `.duomac/project.toml`, and stop if the revision, context commit, product decisions, paths, risk, milestones, or verification profile is invalid.
 4. Publish `task-start`, create an isolated `codex/*` worktree, and implement only the approved plan.
-5. At every milestone, publish a structured checkpoint and **continue without MacBook approval** while the current revision remains valid and no hard stop is present.
+5. Execute milestones in declared order. At every milestone, publish its structured checkpoint before starting the next milestone and **continue without MacBook approval** while the current revision remains valid and no hard stop is present.
 6. Re-read the Issue body before every milestone and final delivery. If revision changed, finish the current safe check, validate the complete replacement contract, and never deliver evidence for the old revision.
 7. Preflight, run the configured verification profile, and deliver with the selected mode. Discover exact helper interfaces when needed:
 
@@ -45,10 +46,14 @@ python scripts/issue_checkpoint.py --help
 python scripts/git_preflight.py --help
 python scripts/git_deliver.py --help
 python scripts/issue_complete.py --help
+python scripts/config_validate.py --help
+python scripts/scheduled_pick.py --help
 ```
+
+The final declared milestone checkpoint must exist before delivery evidence. Use `issue_complete.py --help` to discover the completion gate; checkpoints are evidence, not approval gates.
 
 ## Stop conditions
 
-Stop and mark the Issue blocked when execution requires a product decision, exceeds allowed paths or limits, touches protected or operational systems, encounters overlapping remote changes, cannot validate the current revision, or would change the delivery mode. Do not deploy, use production data, or delegate the task again.
+Stop and mark the Issue blocked when execution requires a product decision, exceeds allowed paths or limits, touches protected or operational systems, encounters overlapping remote changes, cannot validate the current revision, or would change the delivery mode. Do not deploy, use production data, delegate the task again, expand scope, or create a new task Issue from Mac mini.
 
 For `direct-main`, permit at most one non-conflicting rebase and rerun the full selected verification profile afterward. For `task-branch`, push only the task branch and leave the Issue delivered for later integration. **Never force push.**

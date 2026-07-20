@@ -1,11 +1,11 @@
 # Dual-Mac Codex Collaboration
 
-This repository provides one versioned Codex skill for coordinating development between two visible Codex App sessions through GitHub Issues. It is designed for a single owner who wants the MacBook to remain the principal development device while using an always-available Mac mini for complete, bounded tasks.
+This repository provides one versioned Codex skill for coordinating development between MacBook and Mac mini through GitHub Issues. MacBook remains the principal development device and sole dispatcher. Mac mini may execute a complete, bounded task in an interactive Codex App conversation or an independent Codex App Scheduled run.
 
 ## Roles
 
 - **MacBook** develops directly, explores product and technical decisions, prepares PRD/Project Card/Spec context, decides with the user whether to delegate, and is the only device that formally publishes task Issues.
-- **Mac mini** visibly fetches a confirmed Issue in Codex App, executes its complete plan, records structured checkpoints, and delivers within the approved Git and path boundaries.
+- **Mac mini** claims at most one confirmed Issue per run, executes its frozen schema v2 contract, records every milestone checkpoint, and delivers within the approved Git and path boundaries. It never creates task Issues or expands scope.
 
 Task duration does not determine delegation. Delegate when product decisions are closed, context is committed and pushed, acceptance and paths are explicit, and the execution plan can continue without repeated product judgment. Every formal Issue creation still requires explicit user confirmation after the final contract is shown.
 
@@ -20,9 +20,9 @@ git checkout <approved-full-commit-sha>
 ./scripts/install_skill.sh --remove-legacy-client
 ```
 
-The installer creates a small Python 3.12 environment, installs PyYAML, atomically installs `dual-mac-collaboration` into Codex skills, writes `.source-commit`, and adds `duomac-*` command wrappers under `~/.local/bin`. It requires authenticated `gh` and does not start a background service.
+The installer creates a small Python 3.12 environment, installs PyYAML, validates and atomically installs `dual-mac-collaboration` into Codex skills, writes `.source-commit`, and adds `duomac-*` command wrappers under `~/.local/bin`. It installs the approved example as `~/Library/Application Support/DualMacCollaboration/repositories.toml.example`; it never creates or overwrites `repositories.toml`. It requires authenticated `gh` and does not start a daemon.
 
-## Visible use
+## Interactive use
 
 On MacBook, ask Codex App:
 
@@ -31,6 +31,37 @@ On MacBook, ask Codex App:
 On Mac mini, ask Codex App:
 
 > 使用 dual-mac-collaboration，从指定仓库读取一个 duomac:ready 任务，校验后在可见对话中开始执行。
+
+Interactive Mac mini pickup begins only when the user opens or directs that Codex App conversation. Each schema v2 milestone gets a checkpoint before the next milestone; checkpoints are evidence and do not require MacBook approval. The final milestone checkpoint must precede delivery.
+
+## Codex App Scheduled use
+
+Scheduled execution uses three independent tasks named exactly `Dual Mac Slot 1`, `Dual Mac Slot 2`, and `Dual Mac Slot 3`. Each task runs the same tracked prompt in `skills/dual-mac-collaboration/assets/scheduled-slot-prompt.md`; the task name supplies its slot number. A run validates local configuration, atomically claims at most one non-overlapping `duomac:ready` Issue, and continues in that same visible Scheduled task. A no-op creates no task and makes no mutation. Slots never resume one another's failed work.
+
+Copy the tracked example to `~/Library/Application Support/DualMacCollaboration/repositories.toml`, then keep these two Mac-local entries:
+
+```toml
+schema_version = 1
+max_parallel_tasks = 3
+poll_interval_minutes = 10
+
+[[repositories]]
+github = "qiaozhang1225/EaseWise"
+local_path = "/Users/qiaoz-macmini/EaseWise"
+
+[[repositories]]
+github = "qiaozhang1225/codex-mac-worker"
+local_path = "/Users/qiaoz-macmini/codex-mac-worker"
+```
+
+Validate configuration and preview selection before enabling the production claim flag:
+
+```bash
+duomac-config-validate --config "$HOME/Library/Application Support/DualMacCollaboration/repositories.toml"
+duomac-scheduled-pick --help
+```
+
+See the official [Codex Scheduled tasks documentation](https://developers.openai.com/codex/app/automations) for task creation, testing, permissions, and run management.
 
 The helpers are preview-first:
 
@@ -47,7 +78,7 @@ duomac-git-deliver --help
 
 ## Deliberate exclusions
 
-The active design has no Goal mode, unattended daemon, GitHub App identity gate, mandatory pull request, mandatory approval, or Ruleset gate. It does not poll Issues, run silently, deploy production, or let Mac mini expand scope. GitHub Issues preserve the current contract and evidence; the Codex App conversations remain visible to the user.
+The active design has no Goal mode, `codex exec`, external daemon or LaunchDaemon Worker, GitHub App identity gate, mandatory pull request, mandatory approval, or Ruleset gate. Only Codex App Scheduled owns recurring pickup. It does not deploy production, force push, let Mac mini expand scope, or let Mac mini create Issues. GitHub Issues preserve the current contract and evidence; interactive conversations and Scheduled runs remain visible to the user.
 
 The final unattended implementation is preserved at Git tag `legacy-worker-v0.1.0`. Historical source and operating documents can be inspected from that tag without keeping two runnable protocols on the default branch.
 

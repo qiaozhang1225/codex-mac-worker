@@ -1,4 +1,4 @@
 interface:
   display_name: "双 Mac Codex 协作"
-  short_description: "用 GitHub Issue 协调双端 Codex App 开发"
-  default_prompt: "Use $dual-mac-collaboration to coordinate one development task between the MacBook and Mac mini through GitHub Issues."
+  short_description: "用 GitHub Issue 协调交互式或 Scheduled 双 Mac 开发"
+  default_prompt: "Use $dual-mac-collaboration to coordinate one bounded GitHub Issue between MacBook and Mac mini in interactive or Codex App Scheduled mode."

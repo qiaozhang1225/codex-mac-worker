@@ -1,0 +1,11 @@
+schema_version = 1
+max_parallel_tasks = 3
+poll_interval_minutes = 10
+
+[[repositories]]
+github = "qiaozhang1225/EaseWise"
+local_path = "/Users/qiaoz-macmini/EaseWise"
+
+[[repositories]]
+github = "qiaozhang1225/codex-mac-worker"
+local_path = "/Users/qiaoz-macmini/codex-mac-worker"

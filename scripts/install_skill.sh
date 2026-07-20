@@ -64,6 +64,19 @@ cleanup() {
 trap cleanup EXIT
 cp -R "$SOURCE/." "$STAGING/"
 printf '%s\n' "$SOURCE_COMMIT" > "$STAGING/.source-commit"
+for required_file in \
+  "$STAGING/scripts/config_validate.py" \
+  "$STAGING/scripts/scheduled_pick.py" \
+  "$STAGING/assets/repositories.toml.example" \
+  "$STAGING/assets/scheduled-slot-prompt.md" \
+  "$STAGING/references/scheduled-execution.md"; do
+  if [[ ! -f "$required_file" ]]; then
+    print -u2 "installed skill content is missing: $required_file"
+    exit 1
+  fi
+done
+"$VENV/bin/python" "$STAGING/scripts/config_validate.py" \
+  --config "$STAGING/assets/repositories.toml.example" >/dev/null
 if [[ -e "$TARGET" ]]; then
   mv "$TARGET" "$OLD_TARGET"
 fi
@@ -79,12 +92,14 @@ trap - EXIT
 
 typeset -A WRAPPERS
 WRAPPERS=(
+  duomac-config-validate config_validate.py
   duomac-issue-validate issue_validate.py
   duomac-issue-create issue_create.py
   duomac-issue-checkpoint issue_checkpoint.py
   duomac-issue-complete issue_complete.py
   duomac-git-preflight git_preflight.py
   duomac-git-deliver git_deliver.py
+  duomac-scheduled-pick scheduled_pick.py
 )
 for wrapper script_name in ${(kv)WRAPPERS}; do
   destination="$BIN_ROOT/$wrapper"
@@ -94,6 +109,15 @@ for wrapper script_name in ${(kv)WRAPPERS}; do
   chmod 755 "$temporary"
   mv "$temporary" "$destination"
 done
+
+EXAMPLE_SOURCE="$TARGET/assets/repositories.toml.example"
+EXAMPLE_TARGET="$APP_ROOT/repositories.toml.example"
+if [[ ! -f "$EXAMPLE_TARGET" ]] || ! cmp -s "$EXAMPLE_SOURCE" "$EXAMPLE_TARGET"; then
+  EXAMPLE_TEMPORARY="$EXAMPLE_TARGET.tmp.$$"
+  cp "$EXAMPLE_SOURCE" "$EXAMPLE_TEMPORARY"
+  chmod 600 "$EXAMPLE_TEMPORARY"
+  mv "$EXAMPLE_TEMPORARY" "$EXAMPLE_TARGET"
+fi
 
 if (( REMOVE_LEGACY_CLIENT )); then
   rm -rf "$SKILLS_ROOT/dispatch-codex-task"
