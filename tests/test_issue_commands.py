@@ -99,6 +99,7 @@ def cli_env(tmp_path: Path) -> dict[str, str]:
                 "issue_body": VALID_BODY,
                 "issue_url": ISSUE_URL,
                 "labels": ["bug", "duomac:ready"],
+                "comments": [],
             }
         ),
         encoding="utf-8",
@@ -127,6 +128,8 @@ elif args[:2] == ["issue", "view"] and "--json" in args:
         print(json.dumps({"body": fixture["issue_body"]}))
     elif field == "labels":
         print(json.dumps({"labels": [{"name": item} for item in fixture["labels"]]}))
+    elif field == "comments":
+        print(json.dumps({"comments": fixture.get("comments", [])}))
     else:
         print("unsupported fixture field", file=sys.stderr)
         raise SystemExit(2)
@@ -159,6 +162,30 @@ def write_payload(tmp_path: Path, payload: dict[str, object]) -> Path:
     path = tmp_path / "payload.yaml"
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return path
+
+
+def event_comment(
+    payload: dict[str, object], comment_id: str = "IC_1"
+) -> dict[str, object]:
+    rendered = yaml.safe_dump(payload, sort_keys=False).rstrip()
+    return {
+        "id": comment_id,
+        "createdAt": "2026-07-20T00:00:00Z",
+        "body": f"<!-- duomac-event:v1 -->\n```yaml\n{rendered}\n```\n",
+    }
+
+
+def valid_task_start(*, claim_id: str = "c" * 40) -> dict[str, object]:
+    return {
+        "type": "task-start",
+        "revision": 2,
+        "skill_commit": "d" * 40,
+        "base_commit": "a" * 40,
+        "plan_summary": ["Execute two milestones"],
+        "execution_mode": "scheduled",
+        "slot": 1,
+        "claim_id": claim_id,
+    }
 
 
 def valid_checkpoint() -> dict[str, object]:
@@ -362,6 +389,368 @@ def test_checkpoint_rejects_revision_mismatch(
     assert result.returncode != 0
     assert "revision" in result.stderr
     assert not any(call["argv"][:2] == ["issue", "comment"] for call in gh_calls(cli_env))
+
+
+def test_checkpoint_rejects_gap_after_task_start(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(valid_task_start())]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+    payload = valid_checkpoint()
+    payload["milestone"] = 2
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "milestone 1" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_task_start_is_idempotent_for_same_claim(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    payload = valid_task_start()
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(payload)]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["repaired"] is True
+    assert not any(
+        call["argv"][:2] == ["issue", "comment"] for call in gh_calls(cli_env)
+    )
+
+
+def test_task_start_rejects_different_claim_without_mutation(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(valid_task_start())]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_task_start(claim_id="e" * 40)),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "different claim" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"execution_mode": "automatic"}, "execution_mode"),
+        ({"slot": 0}, "slot"),
+        ({"slot": True}, "slot"),
+        ({"claim_id": "C" * 40}, "claim_id"),
+    ],
+)
+def test_task_start_rejects_invalid_scheduled_identity(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    payload = valid_task_start()
+    payload.update(updates)
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_checkpoint_ignores_events_from_previous_revision(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    old_checkpoint = valid_checkpoint()
+    old_checkpoint["revision"] = 1
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        event_comment(old_checkpoint, "IC_old"),
+        event_comment(valid_task_start(), "IC_start"),
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_checkpoint()),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["published"] is True
+
+
+def test_checkpoint_rerun_repairs_label_without_duplicate_comment(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    checkpoint = valid_checkpoint()
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        event_comment(valid_task_start(), "IC_start"),
+        event_comment(checkpoint, "IC_checkpoint"),
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, checkpoint),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["repaired"] is True
+    calls = gh_calls(cli_env)
+    assert not any(call["argv"][:2] == ["issue", "comment"] for call in calls)
+    assert any(call["argv"][:2] == ["issue", "edit"] for call in calls)
+
+
+def test_checkpoint_rejects_after_all_declared_milestones(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    first = valid_checkpoint()
+    second = valid_checkpoint()
+    second["milestone"] = 2
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        event_comment(valid_task_start(), "IC_start"),
+        event_comment(first, "IC_1"),
+        event_comment(second, "IC_2"),
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+    payload = valid_checkpoint()
+    payload["milestone"] = 3
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "all declared milestones" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_malformed_marked_comment_rejects_without_mutation(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [
+        {
+            "id": "IC_bad",
+            "createdAt": "2026-07-20T00:00:00Z",
+            "body": "<!-- duomac-event:v1 -->\n```yaml\n[unterminated\n```\n",
+        }
+    ]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_checkpoint()),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "invalid YAML" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_comment_with_multiple_event_markers_rejects_without_mutation(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    comment = event_comment(valid_task_start())
+    comment["body"] += "<!-- duomac-event:v1 -->\n"
+    value["comments"] = [comment]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_checkpoint()),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "one YAML block" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_spoofed_out_of_order_checkpoint_cannot_trigger_label_repair(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    checkpoint = valid_checkpoint()
+    checkpoint["milestone"] = 2
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(checkpoint)]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, checkpoint),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "continuous from 1" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"scope_status": "outside-scope"}, "scope_status"),
+        ({"blockers": [1]}, "blockers"),
+        ({"commits": ["short"]}, "commit SHAs"),
+        ({"verification": []}, "verification"),
+    ],
+)
+def test_malformed_existing_checkpoint_evidence_cannot_advance_sequence(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    checkpoint = valid_checkpoint()
+    checkpoint.update(updates)
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(checkpoint)]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+    payload = valid_checkpoint()
+    payload["milestone"] = 2
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, payload),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_malformed_existing_task_start_cannot_repair_claim(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    task_start = valid_task_start()
+    task_start["plan_summary"] = []
+    fixture = Path(cli_env["GH_FAKE_FIXTURE"])
+    value = json.loads(fixture.read_text())
+    value["comments"] = [event_comment(task_start)]
+    fixture.write_text(json.dumps(value), encoding="utf-8")
+
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_task_start()),
+        env=cli_env,
+    )
+
+    assert result.returncode != 0
+    assert "plan_summary" in result.stderr
+    assert not any(
+        call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+        for call in gh_calls(cli_env)
+    )
+
+
+def test_successful_event_is_commented_before_label_update(
+    cli_env: dict[str, str], tmp_path: Path
+) -> None:
+    result = run_script(
+        "issue_checkpoint.py",
+        ISSUE_URL,
+        "--payload",
+        write_payload(tmp_path, valid_checkpoint()),
+        env=cli_env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    mutations = [
+        call["argv"][:2]
+        for call in gh_calls(cli_env)
+        if call["argv"][:2] in (["issue", "comment"], ["issue", "edit"])
+    ]
+    assert mutations == [["issue", "comment"], ["issue", "edit"]]
 
 
 def test_delivered_task_branch_stays_open(cli_env: dict[str, str], tmp_path: Path) -> None:

@@ -10,11 +10,20 @@ from typing import Any
 
 import yaml
 
-from duomac_contracts import ContractError, parse_issue_body
-from duomac_github import EVENT_MARKER, GhClient, GhError, IssueRef
+from duomac_contracts import ContractError, TaskSpec, parse_issue_body
+from duomac_github import (
+    EVENT_MARKER,
+    GhClient,
+    GhError,
+    IssueEvent,
+    IssueRef,
+    current_revision_events,
+    parse_issue_events,
+)
 
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_CLAIM_ID = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _mapping(path: Path) -> dict[str, Any]:
@@ -59,6 +68,26 @@ def validate_payload(payload: dict[str, Any]) -> str:
             if not isinstance(value, str) or _FULL_SHA.fullmatch(value) is None:
                 raise ContractError(f"task-start {field} must be a full commit SHA")
         _nonempty_strings(payload, "plan_summary")
+        if payload.get("execution_mode") not in {"scheduled", "interactive"}:
+            raise ContractError(
+                "task-start execution_mode must be scheduled or interactive"
+            )
+        if payload["execution_mode"] == "scheduled":
+            slot = payload.get("slot")
+            claim_id = payload.get("claim_id")
+            if (
+                not isinstance(slot, int)
+                or isinstance(slot, bool)
+                or not 1 <= slot <= 3
+            ):
+                raise ContractError("scheduled task-start slot must be 1, 2, or 3")
+            if (
+                not isinstance(claim_id, str)
+                or _CLAIM_ID.fullmatch(claim_id) is None
+            ):
+                raise ContractError(
+                    "scheduled task-start claim_id must be 40 lowercase hex characters"
+                )
         return "duomac:active"
     if kind == "checkpoint":
         milestone = payload.get("milestone")
@@ -89,6 +118,104 @@ def render_event(payload: dict[str, Any]) -> str:
     return f"{EVENT_MARKER}\n```yaml\n{rendered}\n```\n"
 
 
+def _result(
+    payload: dict[str, Any], target_label: str, *, published: bool, repaired: bool
+) -> dict[str, Any]:
+    return {
+        "published": published,
+        "repaired": repaired,
+        "type": payload["type"],
+        "revision": payload["revision"],
+        "state_label": target_label,
+    }
+
+
+def _current_events(
+    client: GhClient, ref: IssueRef, revision: int
+) -> tuple[IssueEvent, ...]:
+    events = parse_issue_events(client.issue_comments(ref))
+    return current_revision_events(events, revision)
+
+
+def _validate_task_start(
+    events: tuple[IssueEvent, ...], payload: dict[str, Any]
+) -> bool:
+    starts = [event for event in events if event.payload.get("type") == "task-start"]
+    if not starts:
+        return False
+    for event in starts:
+        validate_payload(event.payload)
+    claim_id = payload.get("claim_id")
+    if any(event.payload.get("claim_id") != claim_id for event in starts):
+        raise ContractError(
+            "current Issue revision already has a task-start from a different claim"
+        )
+    return True
+
+
+def _checkpoint_milestones(events: tuple[IssueEvent, ...]) -> list[Any]:
+    checkpoints = [
+        event for event in events if event.payload.get("type") == "checkpoint"
+    ]
+    for event in checkpoints:
+        validate_payload(event.payload)
+    existing_milestones = [event.payload.get("milestone") for event in checkpoints]
+    if any(
+        not isinstance(milestone, int)
+        or isinstance(milestone, bool)
+        or milestone <= 0
+        for milestone in existing_milestones
+    ):
+        raise ContractError("existing checkpoint milestone must be a positive integer")
+    if existing_milestones != list(range(1, len(existing_milestones) + 1)):
+        raise ContractError("existing checkpoint milestones must be continuous from 1")
+    return existing_milestones
+
+
+def _validate_checkpoint_order(
+    existing_milestones: list[Any], spec: TaskSpec, payload: dict[str, Any]
+) -> None:
+    expected = len(existing_milestones) + 1
+    if payload["milestone"] != expected:
+        raise ContractError(f"next checkpoint must be milestone {expected}")
+    if expected > len(spec.execution_plan):
+        raise ContractError("all declared milestones already have checkpoints")
+
+
+def apply_event(
+    client: GhClient,
+    ref: IssueRef,
+    spec: TaskSpec,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    target_label = validate_payload(payload)
+    if payload["revision"] != spec.revision:
+        raise ContractError(
+            f"payload revision {payload['revision']} does not match Issue revision {spec.revision}"
+        )
+
+    events = _current_events(client, ref, spec.revision)
+    kind = payload["type"]
+    existing_milestones = (
+        _checkpoint_milestones(events) if kind == "checkpoint" else []
+    )
+    if kind == "task-start":
+        repaired = _validate_task_start(events, payload)
+    else:
+        repaired = any(event.payload == payload for event in events)
+
+    if repaired:
+        client.set_state_label(ref, target_label)
+        return _result(payload, target_label, published=False, repaired=True)
+
+    if kind == "checkpoint":
+        _validate_checkpoint_order(existing_milestones, spec, payload)
+
+    client.comment(ref, render_event(payload))
+    client.set_state_label(ref, target_label)
+    return _result(payload, target_label, published=True, repaired=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Publish dual-Mac task evidence")
     parser.add_argument("issue_url")
@@ -98,33 +225,16 @@ def main() -> int:
     try:
         ref = IssueRef.parse(args.issue_url)
         payload = _mapping(args.payload)
-        target_label = validate_payload(payload)
         client = GhClient()
         spec = parse_issue_body(client.issue_body(ref))
-        if payload["revision"] != spec.revision:
-            raise ContractError(
-                f"payload revision {payload['revision']} does not match Issue revision {spec.revision}"
-            )
-        client.set_state_label(ref, target_label)
-        client.comment(ref, render_event(payload))
+        result = apply_event(client, ref, spec, payload)
     except (ContractError, GhError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    print(
-        json.dumps(
-            {
-                "published": True,
-                "type": payload["type"],
-                "revision": payload["revision"],
-                "state_label": target_label,
-            },
-            ensure_ascii=False,
-        )
-    )
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

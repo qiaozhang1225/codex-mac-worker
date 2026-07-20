@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from typing import Any
 
+import yaml
+
 
 STATUS_LABELS = (
     "duomac:ready",
@@ -18,6 +20,10 @@ STATUS_LABELS = (
     "duomac:cancelled",
 )
 EVENT_MARKER = "<!-- duomac-event:v1 -->"
+_EVENT_BLOCK = re.compile(
+    re.escape(EVENT_MARKER) + r"\s*```yaml\s*\n(?P<yaml>.*?)\n```",
+    re.DOTALL,
+)
 _ISSUE_URL = re.compile(
     r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
     r"(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)/?$"
@@ -47,6 +53,48 @@ class IssueRef:
     @property
     def url(self) -> str:
         return f"https://github.com/{self.repo}/issues/{self.number}"
+
+
+@dataclass(frozen=True, slots=True)
+class IssueEvent:
+    comment_id: str
+    created_at: str
+    payload: dict[str, Any]
+
+
+def parse_issue_events(
+    comments: tuple[dict[str, Any], ...],
+) -> tuple[IssueEvent, ...]:
+    events: list[IssueEvent] = []
+    for comment in comments:
+        body = comment.get("body")
+        if not isinstance(body, str) or EVENT_MARKER not in body:
+            continue
+        if body.count(EVENT_MARKER) != 1:
+            raise GhError("duomac event marker must be followed by one YAML block")
+        match = _EVENT_BLOCK.search(body)
+        if match is None:
+            raise GhError("duomac event marker must be followed by one YAML block")
+        try:
+            payload = yaml.safe_load(match.group("yaml"))
+        except yaml.YAMLError as exc:
+            raise GhError(f"duomac event payload contains invalid YAML: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise GhError("duomac event payload must be a mapping")
+        events.append(
+            IssueEvent(
+                str(comment.get("id", "")),
+                str(comment.get("createdAt", "")),
+                payload,
+            )
+        )
+    return tuple(events)
+
+
+def current_revision_events(
+    events: tuple[IssueEvent, ...], revision: int
+) -> tuple[IssueEvent, ...]:
+    return tuple(event for event in events if event.payload.get("revision") == revision)
 
 
 class GhClient:
@@ -90,6 +138,15 @@ class GhClient:
         if not isinstance(body, str):
             raise GhError("GitHub Issue body is missing")
         return body
+
+    def issue_comments(self, ref: IssueRef) -> tuple[dict[str, Any], ...]:
+        value = self._json(["issue", "view", ref.url, "--json", "comments"])
+        comments = value.get("comments")
+        if not isinstance(comments, list) or not all(
+            isinstance(item, dict) for item in comments
+        ):
+            raise GhError("GitHub Issue comments have an unexpected shape")
+        return tuple(comments)
 
     def create_issue(self, repo: str, title: str, body: str) -> str:
         if _REPOSITORY.fullmatch(repo) is None:
@@ -140,4 +197,3 @@ class GhClient:
 
     def close(self, ref: IssueRef) -> None:
         self._run(["issue", "close", ref.url])
-
