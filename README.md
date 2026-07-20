@@ -42,6 +42,8 @@ The current Scheduled create/update interface persists explicit model and reason
 
 The picker JSON is authoritative. Branch on `outcome`, not `reason`: `clean-noop` is a clean no-candidate no-op with `maintenance_actions: []`; `maintenance` is a maintenance-only result whose exact action list may name projection repair or blocked comments/labels; `claimed` authorizes execution of only the returned Issue. Report `reason` and `maintenance_actions` exactly for every outcome. Both unclaimed outcomes must stop without code execution, and `preview` or `error` never executes code.
 
+Automatically archive only a valid `clean-noop`: after reporting its exact `reason` and `maintenance_actions: []`, call `set_thread_archived` with `archived: true` and no `threadId`, then stop. Keep `maintenance`, `preview`, `error`, `claimed`, and blocked runs visible; never auto-archive them. This keeps empty ten-minute polling runs out of the active chat list without hiding work or exceptions.
+
 Copy the tracked example to `~/Library/Application Support/DualMacCollaboration/repositories.toml`, then keep these two Mac-local entries:
 
 ```toml

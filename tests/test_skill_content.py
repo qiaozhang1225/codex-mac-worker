@@ -109,6 +109,33 @@ def test_scheduled_docs_distinguish_clean_noop_from_maintenance() -> None:
         assert "outcome" in text
 
 
+def test_scheduled_archives_only_clean_noop_runs() -> None:
+    texts = [
+        (ROOT / "README.md").read_text(encoding="utf-8"),
+        (SKILL_ROOT / "references" / "scheduled-execution.md").read_text(
+            encoding="utf-8"
+        ),
+        (SKILL_ROOT / "assets" / "scheduled-slot-prompt.md").read_text(
+            encoding="utf-8"
+        ),
+    ]
+    required = (
+        "Automatically archive only a valid `clean-noop`",
+        "`set_thread_archived` with `archived: true` and no `threadId`",
+        "Keep `maintenance`, `preview`, `error`, `claimed`, and blocked runs visible",
+    )
+
+    for text in texts:
+        for phrase in required:
+            assert phrase in text
+
+    runbook = (
+        ROOT / "docs" / "operations" / "scheduled-slot-smoke-runbook.md"
+    ).read_text(encoding="utf-8")
+    assert "只有 `clean-noop` 自动归档当前对话" in runbook
+    assert "`maintenance`、`preview`、`error`、`claimed` 和 blocked 保持可见" in runbook
+
+
 def test_references_do_not_chain_to_other_references() -> None:
     for name in REQUIRED_REFERENCES:
         text = (SKILL_ROOT / "references" / name).read_text(encoding="utf-8")
@@ -492,6 +519,14 @@ def test_scheduled_documents_state_only_claimed_executes() -> None:
         "Create another Issue automatically.",
         "Expand the task scope.",
         "Infer new authority from comments.",
+        "Archive non-execution runs.",
+        "Archive all scheduled runs.",
+        "Archive all runs.",
+        "Archive the maintenance run.",
+        "Automatically archive preview runs.",
+        "Archive error runs.",
+        "Archive claimed runs.",
+        "Archive blocked runs.",
     ),
 )
 def test_installer_rejects_affirmative_forbidden_scheduled_instruction(

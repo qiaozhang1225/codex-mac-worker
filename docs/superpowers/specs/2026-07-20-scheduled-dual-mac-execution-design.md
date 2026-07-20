@@ -177,7 +177,7 @@ claim_id: 40-character-lowercase-hex-id
 - task-start 之后执行失败：当前对话保存安全现场并写 blocked；其他 Slot 不接管 active Issue。
 - active 任务长期没有进展：其他 Slot 可报告异常，但不得自动 resume、retry 或复制执行。
 - Codex App 是否在当前版本同时调度三个 Scheduled 任务必须通过 Mac mini 实测。若 App 将它们串行化，安全规则仍成立，实际并发量只是低于三。
-- no-op 运行应在能力可用时归档；若 Scheduled 环境不能归档当前运行，则保留简短 no-op 结果，不伪造任务进展。
+- 只有确认 `maintenance_actions: []` 的 `clean-noop` 运行自动归档当前对话；`maintenance`、`preview`、`error`、`claimed` 和 blocked 运行全部保留可见。归档使用 Codex App 支持的当前对话归档操作，不修改内部文件或数据库。
 
 ## 技能与仓库改动
 

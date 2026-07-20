@@ -21,10 +21,12 @@ Scheduled 运行应先校验本机配置，再用任务名尾部的 `1` 作为 s
 
 ## Picker 结果分支
 
-- `clean-noop`：报告原样 `reason` 和 `maintenance_actions: []`，不执行代码，并在 Codex App 支持时归档本次非执行运行。
-- `maintenance`：报告原样 `reason` 及每一项 `maintenance_actions`，不执行代码，并在 Codex App 支持时归档本次非执行运行。
-- `preview` 或 `error`：报告结果并停止，不执行代码。
-- `claimed`：报告原样 `maintenance_actions`，只执行返回 Issue 的当前完整 schema v2 合同。只有这个结果允许进入代码执行。
+- `clean-noop`：报告原样 `reason` 和 `maintenance_actions: []`，不执行代码，然后通过 Codex App 支持的当前对话归档操作结束本次空运行。只有 `clean-noop` 自动归档当前对话。
+- `maintenance`：报告原样 `reason` 及每一项 `maintenance_actions`，不执行代码并保留当前对话。
+- `preview` 或 `error`：报告结果并停止，不执行代码并保留当前对话。
+- `claimed`：报告原样 `maintenance_actions`，只执行返回 Issue 的当前完整 schema v2 合同并保留全过程。只有这个结果允许进入代码执行。
+
+`maintenance`、`preview`、`error`、`claimed` 和 blocked 保持可见，不得自动归档。归档不得通过修改 Codex App 内部文件或数据库实现。
 
 ## `claimed` 的证据链
 

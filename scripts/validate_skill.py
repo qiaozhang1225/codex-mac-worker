@@ -50,6 +50,11 @@ SCHEDULED_OUTCOME_BOUNDARIES = (
     "maintenance_actions",
     "Only `outcome: claimed` proceeds to code execution.",
 )
+SCHEDULED_ARCHIVE_BOUNDARIES = (
+    "Automatically archive only a valid `clean-noop`",
+    "`set_thread_archived` with `archived: true` and no `threadId`",
+    "Keep `maintenance`, `preview`, `error`, `claimed`, and blocked runs visible",
+)
 SCHEDULED_REFERENCE_BOUNDARIES = (
     "visible Mac mini Codex App Scheduled run",
     "Dual Mac Slot 1",
@@ -66,6 +71,7 @@ SCHEDULED_REFERENCE_BOUNDARIES = (
     "codex exec",
     "LaunchDaemon Worker",
     *SCHEDULED_OUTCOME_BOUNDARIES,
+    *SCHEDULED_ARCHIVE_BOUNDARIES,
 )
 SCHEDULED_PROMPT_BOUNDARIES = (
     "$dual-mac-collaboration",
@@ -83,6 +89,7 @@ SCHEDULED_PROMPT_BOUNDARIES = (
     "codex exec",
     "daemon",
     *SCHEDULED_OUTCOME_BOUNDARIES,
+    *SCHEDULED_ARCHIVE_BOUNDARIES,
 )
 _INSTRUCTION_START = r"(?:^|[.!?:]\s+)(?:[-*]\s*)?"
 _MODAL_SUBJECT = (
@@ -90,6 +97,38 @@ _MODAL_SUBJECT = (
     r"(?:may|must|should|can|will)\s+)?"
 )
 CONTRADICTORY_SCHEDULED_PATTERNS = (
+    (
+        "archiving all scheduled runs",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:automatically\s+)?archive\s+all\s+"
+            + r"(?:(?:scheduled|slot)\s+)?runs?\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "broad scheduled-run archiving",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:automatically\s+)?archive\s+"
+            + r"(?:(?:all|the)\s+)?non[- ]execution\s+runs?\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
+    (
+        "archiving visible scheduled outcomes",
+        re.compile(
+            _INSTRUCTION_START
+            + _MODAL_SUBJECT
+            + r"(?:automatically\s+)?archive\s+"
+            + r"(?:(?:the|this)\s+)?`?"
+            + r"(?:maintenance|preview|error|claimed|blocked)`?"
+            + r"(?:\s+(?:outcome|runs?))?\b",
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    ),
     (
         "affirmative Goal or codex exec use",
         re.compile(
